@@ -20,6 +20,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   hand edit cannot launder a derived page out of the purge's reach. Managed
   workstreams are explicitly out of scope: their `native_session_id` has no
   foreign key to `sessions.id` and is never matched by coincidence (#387).
+- Hook ingest for a purged session is now refused as terminal with
+  `410 {"code":"session_purged","terminal":true}`, so an event spooled by a
+  client that was offline during the purge cannot resurrect it. The native
+  drainer treats that response as terminal — the entry is dropped without
+  spending a retry attempt — and `purge-session` additionally sweeps the local
+  `hook-spool` by exact session identity. Spools on other hosts cannot be
+  reached by the CLI; the server-side tombstone is what refuses them (#387).
+- Monthly log entries now record which session produced them, so
+  `purge-session` removes exactly that session's lines and leaves every other
+  session's intact. Entries written before this cannot be attributed to any
+  session: they are reported as a structured block rather than matched by text
+  search, and `--force` removes that month's log as the whole retention
+  unit (#387).
 - Added `[routing] mid_session` to choose how a mid-session event is attributed
   once the agent's cwd has moved. `follow-cwd` (default) keeps the historical
   per-event resolution; `sticky` keeps the session's project wherever the agent

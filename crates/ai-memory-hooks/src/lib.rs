@@ -50,6 +50,7 @@ pub use router::{
     DEFAULT_HOOK_INGEST_MAX_IN_FLIGHT, DEFAULT_INGEST_GATE_MAX_ENTRIES,
     DEFAULT_PROJECT_CACHE_MAX_ENTRIES, HookState, IngestGates, IngestRateLimiter, ProjectCache,
     ProjectCacheStore, SubagentSessionSet, SubagentSessions, hook_router,
+    resolve_native_session_id,
 };
 pub use synth::synthesize_session_page;
 pub use workstream::{WorkstreamState, workstream_router};

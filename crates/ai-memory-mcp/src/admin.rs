@@ -5485,6 +5485,29 @@ async fn handle_purge_session(
         }
     }
 
+    // Monthly log entries are attributed per line. Entries written before that
+    // provenance existed cannot be assigned to any session, so they are
+    // reported rather than guessed at — matching log text would delete other
+    // sessions' entries and still miss this one's.
+    match ai_memory_wiki::log_purge::purge_session_lines(
+        &state.wiki,
+        ws_id,
+        proj_id,
+        session_id,
+        req.force,
+    ) {
+        Ok(outcome) => {
+            for file in outcome.unattributed_files {
+                warnings.push(format!(
+                    "{file} still holds log entries written before per-entry provenance; \
+                     they cannot be attributed to a session. Re-run with force=true to remove \
+                     that month's log entirely."
+                ));
+            }
+        }
+        Err(e) => warnings.push(format!("could not purge monthly log entries: {e}")),
+    }
+
     (
         StatusCode::OK,
         Json(

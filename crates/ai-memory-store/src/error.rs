@@ -58,6 +58,12 @@ pub enum StoreError {
     #[error("session collision")]
     SessionCollision,
 
+    /// A hook named a session that was purged (#387). Terminal, not transient:
+    /// the event can never become deliverable, so a client must drop it rather
+    /// than retry. Deliberately carries no row details.
+    #[error("session purged")]
+    SessionPurged,
+
     /// A `spawn_blocking` task panicked or was cancelled.
     #[error("reader pool task did not complete: {0}")]
     PoolPanic(String),

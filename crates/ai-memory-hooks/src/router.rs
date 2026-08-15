@@ -588,7 +588,7 @@ async fn handle_hook(
     level_ext: Option<axum::Extension<ai_memory_core::AuthLevel>>,
     headers: HeaderMap,
     Json(mut body): Json<serde_json::Value>,
-) -> impl IntoResponse {
+) -> axum::response::Response {
     // Unconditional backstop (#196): drop any raw assistant-message field on the
     // `Value` before it becomes a `HookEnvelope`, so the field can never reach
     // `body_excerpt`, tracing, or the store — regardless of client version.
@@ -599,7 +599,7 @@ async fn handle_hook(
     // Any gate failure leaves an empty Stop with the same 202 "queued" response.
     crate::assistant_capture::apply_assistant_backstop(&mut env, state.capture_assistant_enabled);
     let Some(env) = inspect_capture_envelope(env) else {
-        return (StatusCode::ACCEPTED, "capture policy dropped");
+        return (StatusCode::ACCEPTED, "capture policy dropped").into_response();
     };
     // Accept-but-drop subagent captures (incl. the unmarked tail of tracked
     // subagent sessions) when the operator opts in. Returning 202 (not an error)
@@ -616,11 +616,27 @@ async fn handle_hook(
     let skip_webhooks = admission_skips(level_ext, &headers);
     let actor_storage_key = actor.as_ref().map(IdentityKey::storage_key);
     if should_drop_subagent(&state, &env).await {
-        return (StatusCode::ACCEPTED, "subagent capture dropped");
+        return (StatusCode::ACCEPTED, "subagent capture dropped").into_response();
+    }
+    // A purged session is terminal for every later delivery, including one
+    // spooled by a client that was offline during the purge. Checked here,
+    // before the semaphore, so a replay of purged content consumes no ingest
+    // capacity. `resolve_native_session_id` (not a bare parse) because an agent
+    // whose session id is an opaque string is stored under its v5 hash, and a
+    // tombstone must match the same key its session was purged under.
+    if let Some(session_id) = env.session_id.as_deref().map(resolve_native_session_id)
+        && state
+            .reader
+            .is_session_tombstoned(session_id)
+            .await
+            .unwrap_or(false)
+    {
+        info!(session = %session_id, "refusing hook event for a purged session");
+        return session_purged_response();
     }
     let Ok(permit) = state.ingest_semaphore.clone().try_acquire_owned() else {
         warn!("hook ingest saturated; dropping event with 429");
-        return (StatusCode::TOO_MANY_REQUESTS, "hook queue full");
+        return (StatusCode::TOO_MANY_REQUESTS, "hook queue full").into_response();
     };
     let rate_key = ingest_rate_key(&env, actor_storage_key.as_deref());
     if !state
@@ -630,7 +646,7 @@ async fn handle_hook(
         .try_take(&rate_key, std::time::Instant::now())
     {
         warn!(source = %log_rate_key(&rate_key), "hook ingest rate limit exceeded for source; dropping event with 429");
-        return (StatusCode::TOO_MANY_REQUESTS, "hook source rate limited");
+        return (StatusCode::TOO_MANY_REQUESTS, "hook source rate limited").into_response();
     }
     tokio::spawn(async move {
         let _permit = permit;
@@ -643,7 +659,21 @@ async fn handle_hook(
         )
         .await;
     });
-    (StatusCode::ACCEPTED, "queued")
+    (StatusCode::ACCEPTED, "queued").into_response()
+}
+
+/// The terminal response for an event naming a purged session (#387).
+///
+/// `410` rather than an error status: the event will never become deliverable,
+/// so a spooling client must drop it instead of retrying until its horizon
+/// expires. `terminal: true` says so explicitly, for drainers that would
+/// otherwise treat any 4xx as retryable.
+fn session_purged_response() -> axum::response::Response {
+    (
+        StatusCode::GONE,
+        Json(serde_json::json!({ "code": "session_purged", "terminal": true })),
+    )
+        .into_response()
 }
 
 /// One event in a `POST /hook/batch` request — the same `{url, body}` pair a
@@ -785,6 +815,22 @@ async fn handle_hook_batch(
             accepted_indices.push(idx);
             continue;
         }
+        // A purged session is terminal (#387). Counting the item as ACCEPTED is
+        // what makes it terminal for the client: the drainer clears committed
+        // items from its spool, so the event is dropped rather than retried
+        // until its horizon expires. Failing the batch here would instead stall
+        // every later item behind an event that can never be delivered.
+        if let Some(session_id) = env.session_id.as_deref().map(resolve_native_session_id)
+            && state
+                .reader
+                .is_session_tombstoned(session_id)
+                .await
+                .unwrap_or(false)
+        {
+            info!(session = %session_id, "dropping batched hook event for a purged session");
+            accepted_indices.push(idx);
+            continue;
+        }
         let Ok(permit) = state.ingest_semaphore.clone().try_acquire_owned() else {
             warn!(
                 accepted = accepted_indices.len(),
@@ -818,9 +864,9 @@ async fn handle_hook_batch(
         {
             if matches!(
                 e.downcast_ref::<StoreError>(),
-                Some(StoreError::SessionCollision)
+                Some(StoreError::SessionCollision | StoreError::SessionPurged)
             ) {
-                warn!("hook batch session collision/recovery rejection dropped");
+                warn!("hook batch session collision/purge rejection dropped");
                 accepted_indices.push(idx);
                 continue;
             }
@@ -2182,6 +2228,11 @@ async fn process_envelope(
     if let Err(e) = process_authorized(&state, env, actor, level, skip_webhooks).await {
         if matches!(
             e.downcast_ref::<StoreError>(),
+            Some(StoreError::SessionPurged)
+        ) {
+            info!("hook event for a purged session dropped");
+        } else if matches!(
+            e.downcast_ref::<StoreError>(),
             Some(StoreError::SessionCollision)
         ) {
             warn!("hook session collision dropped");
@@ -2266,12 +2317,13 @@ async fn process(
     )
     .await
     {
-        // Match the asynchronous hook envelope: collisions are terminal
-        // rejections, but fire-and-forget ingress acknowledges the delivery.
+        // Match the asynchronous hook envelope: collisions and purged sessions
+        // are terminal rejections, but fire-and-forget ingress acknowledges the
+        // delivery.
         Err(error)
             if matches!(
                 error.downcast_ref::<StoreError>(),
-                Some(StoreError::SessionCollision)
+                Some(StoreError::SessionCollision | StoreError::SessionPurged)
             ) =>
         {
             Ok(())
@@ -2364,6 +2416,21 @@ async fn process_authorized(
             .await?
         }
     };
+
+    // Authoritative purge guard (#387). The HTTP edge refuses a purged session
+    // early so the client gets a terminal 410, but that check runs before scope
+    // resolution and outside this transaction's view. Re-checking here on the
+    // RESOLVED scope is what actually stops a resurrection: it also covers the
+    // batch path, any in-process caller, and a purge that lands between the
+    // edge check and admission.
+    if state
+        .reader
+        .is_session_purged(ws, proj, session_id)
+        .await
+        .unwrap_or(false)
+    {
+        return Err(StoreError::SessionPurged.into());
+    }
 
     // Hooks are fire-and-forget and may arrive out of order. Begin the
     // session idempotently before every observation so a resumed agent
@@ -2575,6 +2642,7 @@ async fn process_authorized(
         Timestamp::now(),
         env.event,
         log_title.as_str(),
+        session_id,
     ) {
         warn!(error = %e, "log.md append failed");
     }
@@ -2842,7 +2910,13 @@ fn resolve_session_id(env: &HookEnvelope) -> anyhow::Result<SessionId> {
     anyhow::bail!("hook payload missing session_id and event is not session-start")
 }
 
-fn resolve_native_session_id(raw: &str) -> SessionId {
+/// Map a raw wire session id to its durable [`SessionId`].
+///
+/// Public because the spool sweep must key on the SAME value the ingest path
+/// stored: an agent whose session id is an opaque string lives under its v5
+/// hash, so a sweep comparing raw strings would silently miss its entries.
+#[must_use]
+pub fn resolve_native_session_id(raw: &str) -> SessionId {
     // Accept either a UUID (canonical) or any string, hashing the latter to a
     // deterministic UUID v5 so hook POSTs and startup GETs share one key.
     SessionId::from_str(raw)
@@ -4239,6 +4313,81 @@ mod tests {
                 .unwrap()
                 .is_some(),
             "an untagged override must stay authoritative under sticky"
+        );
+    }
+
+    /// A purged session is terminal for every later delivery, including one
+    /// spooled by a client that was offline during the purge (#387). The
+    /// response has to be distinguishable from an error so the drainer drops
+    /// the entry instead of retrying it until its horizon expires.
+    #[tokio::test]
+    async fn hook_for_a_purged_session_is_refused_as_terminal() {
+        let tmp = TempDir::new().unwrap();
+        let state = make_state(&tmp).await;
+        let sid = "cccccccc-cccc-4ccc-8ccc-cccccccccccc";
+        let session_id: SessionId = sid.parse().unwrap();
+        let cwd = tmp.path().join("proj");
+        std::fs::create_dir_all(&cwd).unwrap();
+        let fire = |event: &str| {
+            HookEnvelope::from_query_and_body(
+                HookQuery {
+                    event: event.into(),
+                    agent: Some("claude-code".into()),
+                    cwd: Some(cwd.to_string_lossy().into_owned()),
+                    ..Default::default()
+                },
+                serde_json::json!({
+                    "session_id": sid,
+                    "cwd": cwd.to_string_lossy(),
+                    "tool_name": "Bash",
+                }),
+            )
+        };
+        process(&state, fire("session-start"), None, Vec::new())
+            .await
+            .unwrap();
+
+        let (ws, proj, _) = state
+            .reader
+            .find_session_scope(session_id)
+            .await
+            .unwrap()
+            .expect("session exists");
+        assert!(
+            !state
+                .reader
+                .is_session_tombstoned(session_id)
+                .await
+                .unwrap()
+        );
+
+        state
+            .writer
+            .purge_session(ws, proj, session_id)
+            .await
+            .unwrap();
+
+        assert!(
+            state
+                .reader
+                .is_session_tombstoned(session_id)
+                .await
+                .unwrap(),
+            "the tombstone is what refuses a late replay"
+        );
+        // The observations are gone, and a replayed event must not recreate
+        // them by re-opening the session.
+        process(&state, fire("post-tool-use"), None, Vec::new())
+            .await
+            .unwrap_or(());
+        assert!(
+            state
+                .reader
+                .observations_for_session(session_id)
+                .await
+                .unwrap()
+                .is_empty(),
+            "a replay must not resurrect a purged session"
         );
     }
 

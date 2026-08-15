@@ -65,7 +65,20 @@ pub async fn run(config: &Config, args: PurgeSessionArgs) -> Result<()> {
     )
     .await?;
 
+    // The server's tombstone already refuses these events with 410, so a drain
+    // would discard them eventually. Sweeping now means the content is not
+    // still sitting in a plaintext spool file on this host while the operator
+    // believes the deletion is done. Spools on OTHER hosts cannot be reached
+    // from here — the tombstone is what protects those.
+    let sweep = crate::commands::hook_spool::sweep_session(&config.data_dir, session_id)?;
+
     if args.json {
+        let mut receipt = receipt;
+        receipt["local_spool"] = serde_json::json!({
+            "removed": sweep.removed,
+            "kept": sweep.kept,
+            "unreadable": sweep.unreadable,
+        });
         println!("{}", serde_json::to_string_pretty(&receipt)?);
         return Ok(());
     }
@@ -87,9 +100,21 @@ pub async fn run(config: &Config, args: PurgeSessionArgs) -> Result<()> {
             }
         }
     }
+    if sweep.removed > 0 {
+        println!("  local spool: {} queued events removed", sweep.removed);
+    }
+    if sweep.unreadable > 0 {
+        eprintln!(
+            "  warning: {} local spool entries could not be read or removed",
+            sweep.unreadable
+        );
+    }
     if let Some(cutoff) = receipt["backup_cutoff"].as_str() {
         println!("  backups taken before {cutoff} still contain this session");
     }
+    println!(
+        "  spools on other hosts are not reachable from here; the server tombstone refuses them with 410"
+    );
     for warning in receipt["warnings"].as_array().into_iter().flatten() {
         if let Some(text) = warning.as_str() {
             eprintln!("  warning: {text}");

@@ -22,7 +22,7 @@
 
 use std::io::Write;
 
-use ai_memory_core::{ProjectId, WorkspaceId};
+use ai_memory_core::{ProjectId, SessionId, WorkspaceId};
 use ai_memory_wiki::Wiki;
 use jiff::{Timestamp, tz::TimeZone};
 use tracing::debug;
@@ -51,11 +51,12 @@ pub fn append_event(
     when: Timestamp,
     event: HookEvent,
     title: &str,
+    session_id: SessionId,
 ) -> std::io::Result<()> {
     let log_path = wiki
         .project_root(workspace_id, project_id)
         .join(log_filename_for(when));
-    let line = format_line(when, event, title);
+    let line = format_line(when, event, title, session_id);
     debug!(path = %log_path.display(), bytes = line.len(), "appending log entry");
 
     if let Some(parent) = log_path.parent()
@@ -81,7 +82,11 @@ pub(crate) fn log_filename_for(when: Timestamp) -> String {
         .to_string()
 }
 
-fn format_line(when: Timestamp, event: HookEvent, title: &str) -> String {
+/// Re-exported so the appender and the purge cannot drift apart: the wiki crate
+/// owns both the marker format and the removal that keys on it (#387).
+use ai_memory_wiki::log_purge::session_marker;
+
+fn format_line(when: Timestamp, event: HookEvent, title: &str, session_id: SessionId) -> String {
     let stamp = when.to_zoned(TimeZone::UTC).strftime("%Y-%m-%dT%H:%M:%SZ");
     let kind = match event {
         HookEvent::SessionStart => "session-start",
@@ -102,7 +107,10 @@ fn format_line(when: Timestamp, event: HookEvent, title: &str) -> String {
         .map(|c| if c == '\n' || c == '\r' { ' ' } else { c })
         .take(120)
         .collect();
-    format!("## [{stamp}] {kind} | {one_line}\n")
+    format!(
+        "## [{stamp}] {kind} | {one_line} {}\n",
+        session_marker(session_id)
+    )
 }
 
 #[cfg(test)]
@@ -120,10 +128,12 @@ mod tests {
             .to_zoned(TimeZone::UTC)
             .unwrap()
             .timestamp();
-        let line = format_line(when, HookEvent::SessionStart, "hello world");
+        let session_id: SessionId = "11111111-1111-4111-8111-111111111111".parse().unwrap();
+        let line = format_line(when, HookEvent::SessionStart, "hello world", session_id);
         assert_eq!(
             line,
-            "## [2026-05-21T12:34:56Z] session-start | hello world\n",
+            "## [2026-05-21T12:34:56Z] session-start | hello world \
+             <!-- ai-memory:session=11111111-1111-4111-8111-111111111111 -->\n",
         );
     }
 
@@ -143,8 +153,27 @@ mod tests {
             .await
             .unwrap();
         let now = Timestamp::now();
-        append_event(&wiki, ws, proj, now, HookEvent::SessionStart, "first").unwrap();
-        append_event(&wiki, ws, proj, now, HookEvent::UserPrompt, "second").unwrap();
+        let session_id = SessionId::new();
+        append_event(
+            &wiki,
+            ws,
+            proj,
+            now,
+            HookEvent::SessionStart,
+            "first",
+            session_id,
+        )
+        .unwrap();
+        append_event(
+            &wiki,
+            ws,
+            proj,
+            now,
+            HookEvent::UserPrompt,
+            "second",
+            session_id,
+        )
+        .unwrap();
         let log_path = wiki.project_root(ws, proj).join(log_filename_for(now));
         let contents = std::fs::read_to_string(&log_path).unwrap();
         assert!(contents.contains("session-start | first"));
@@ -178,8 +207,27 @@ mod tests {
             .to_zoned(TimeZone::UTC)
             .unwrap()
             .timestamp();
-        append_event(&wiki, ws, proj, may, HookEvent::SessionStart, "may-evt").unwrap();
-        append_event(&wiki, ws, proj, june, HookEvent::UserPrompt, "june-evt").unwrap();
+        let session_id = SessionId::new();
+        append_event(
+            &wiki,
+            ws,
+            proj,
+            may,
+            HookEvent::SessionStart,
+            "may-evt",
+            session_id,
+        )
+        .unwrap();
+        append_event(
+            &wiki,
+            ws,
+            proj,
+            june,
+            HookEvent::UserPrompt,
+            "june-evt",
+            session_id,
+        )
+        .unwrap();
 
         let root = wiki.project_root(ws, proj);
         let may_log = std::fs::read_to_string(root.join("log-2026-05.md")).unwrap();
@@ -188,6 +236,115 @@ mod tests {
         assert!(!may_log.contains("june-evt"));
         assert!(june_log.contains("june-evt"));
         assert!(!june_log.contains("may-evt"));
+    }
+
+    /// The purge removes a session's entries by their provenance marker, and
+    /// leaves every other session's entries in the same file intact.
+    #[tokio::test]
+    async fn purge_removes_only_the_named_sessions_entries() {
+        let tmp = TempDir::new().unwrap();
+        let store = Store::open(tmp.path()).unwrap();
+        let wiki = Wiki::new(tmp.path(), store.writer.clone()).unwrap();
+        let ws = store
+            .writer
+            .get_or_create_workspace("default")
+            .await
+            .unwrap();
+        let proj = store
+            .writer
+            .get_or_create_project(ws, "scratch", None)
+            .await
+            .unwrap();
+        let now = Timestamp::now();
+        let doomed = SessionId::new();
+        let kept = SessionId::new();
+        append_event(
+            &wiki,
+            ws,
+            proj,
+            now,
+            HookEvent::UserPrompt,
+            "doomed-canary",
+            doomed,
+        )
+        .unwrap();
+        append_event(
+            &wiki,
+            ws,
+            proj,
+            now,
+            HookEvent::UserPrompt,
+            "kept-canary",
+            kept,
+        )
+        .unwrap();
+
+        let outcome =
+            ai_memory_wiki::log_purge::purge_session_lines(&wiki, ws, proj, doomed, false).unwrap();
+        assert_eq!(outcome.removed, 1);
+        assert!(outcome.unattributed_files.is_empty());
+
+        let body = std::fs::read_to_string(wiki.project_root(ws, proj).join(log_filename_for(now)))
+            .unwrap();
+        assert!(!body.contains("doomed-canary"), "{body}");
+        assert!(body.contains("kept-canary"), "{body}");
+    }
+
+    /// Entries written before per-entry provenance existed cannot be attributed
+    /// to any session. They are reported rather than removed by inference —
+    /// matching log text would delete other sessions' entries and still miss
+    /// this one's.
+    #[tokio::test]
+    async fn legacy_entries_block_instead_of_being_guessed_at() {
+        let tmp = TempDir::new().unwrap();
+        let store = Store::open(tmp.path()).unwrap();
+        let wiki = Wiki::new(tmp.path(), store.writer.clone()).unwrap();
+        let ws = store
+            .writer
+            .get_or_create_workspace("default")
+            .await
+            .unwrap();
+        let proj = store
+            .writer
+            .get_or_create_project(ws, "scratch", None)
+            .await
+            .unwrap();
+        let now = Timestamp::now();
+        let doomed = SessionId::new();
+        append_event(
+            &wiki,
+            ws,
+            proj,
+            now,
+            HookEvent::UserPrompt,
+            "new-entry",
+            doomed,
+        )
+        .unwrap();
+
+        // A pre-#387 line: no marker, so no session owns it.
+        let log_path = wiki.project_root(ws, proj).join(log_filename_for(now));
+        let mut existing = std::fs::read_to_string(&log_path).unwrap();
+        existing.push_str("## [2026-01-01T00:00:00Z] user-prompt | legacy-canary\n");
+        std::fs::write(&log_path, &existing).unwrap();
+
+        let outcome =
+            ai_memory_wiki::log_purge::purge_session_lines(&wiki, ws, proj, doomed, false).unwrap();
+        assert_eq!(outcome.removed, 1, "attributed entries still go");
+        assert_eq!(
+            outcome.unattributed_files,
+            vec![log_filename_for(now)],
+            "the operator must be told the month is not provably clean"
+        );
+        let body = std::fs::read_to_string(&log_path).unwrap();
+        assert!(body.contains("legacy-canary"), "legacy lines are preserved");
+
+        // `--force` removes the whole retention unit: the only way to guarantee
+        // nothing of the session survives, at the cost of that month.
+        let outcome =
+            ai_memory_wiki::log_purge::purge_session_lines(&wiki, ws, proj, doomed, true).unwrap();
+        assert!(outcome.unattributed_files.is_empty());
+        assert!(!log_path.exists(), "forced purge removes the monthly log");
     }
 
     #[test]

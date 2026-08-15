@@ -2020,6 +2020,24 @@ impl ReaderPool {
         .await
     }
 
+    /// Whether any tombstone covers this session id, regardless of scope
+    /// (#387).
+    ///
+    /// The hook edge uses this rather than the scoped
+    /// [`Self::is_session_purged`] because it runs before scope resolution,
+    /// and because a durable `SessionId` is globally unique: once purged, that
+    /// id is dead everywhere, and a later event carrying it is a replay of the
+    /// purged session rather than a new one.
+    ///
+    /// # Errors
+    /// Returns [`StoreError`] on pool or SQLite failure.
+    pub async fn is_session_tombstoned(&self, session_id: SessionId) -> StoreResult<bool> {
+        self.with_conn(move |conn| {
+            Ok(crate::session_purge::find_session_tombstone(conn, session_id)?.is_some())
+        })
+        .await
+    }
+
     /// Whether ingest for this exact `(workspace, project, session)` must be
     /// refused as terminal because the session was purged (#387).
     ///

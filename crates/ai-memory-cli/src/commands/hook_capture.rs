@@ -334,6 +334,16 @@ pub enum PostOutcome {
     /// backpressure, the event was never processed. Keep it queued WITHOUT
     /// bumping attempts so saturation never burns the entry's retry budget.
     Saturated,
+    /// Server answered `410 Gone`: the session this event belongs to was
+    /// purged (#387). The event can never become deliverable, so the entry is
+    /// removed WITHOUT counting an attempt and without retrying — retrying
+    /// until the spool horizon expires would just delay the drain.
+    ///
+    /// This outcome deletes local data on the server's say-so, so it is only
+    /// safe because a non-loopback server cannot serve unauthenticated plain
+    /// HTTP: an injected `410` would otherwise let a network attacker discard
+    /// a client's pending observations.
+    Terminal,
     /// Any other non-2xx, or a transport error: a genuine miss that should
     /// count against `MAX_ATTEMPTS`.
     Failed,
@@ -364,6 +374,7 @@ pub async fn post_hook(
         Ok(resp) if resp.status() == reqwest::StatusCode::TOO_MANY_REQUESTS => {
             PostOutcome::Saturated
         }
+        Ok(resp) if resp.status() == reqwest::StatusCode::GONE => PostOutcome::Terminal,
         Ok(_) => PostOutcome::Failed,
         Err(_) => PostOutcome::Failed,
     }
@@ -621,6 +632,16 @@ mod tests {
         let url = serve_once("429 Too Many Requests", "hook queue full").await;
         let outcome = post_hook(&build_client(), &url, "{}", None, Duration::from_secs(1)).await;
         assert_eq!(outcome, PostOutcome::Saturated);
+    }
+
+    #[tokio::test]
+    async fn post_hook_terminal_on_410_purged_session() {
+        // 410 = the session was purged, so this event can never be delivered.
+        // Distinct from Failed: the entry is dropped WITHOUT spending a retry
+        // attempt, instead of being retried until the spool horizon expires.
+        let url = serve_once("410 Gone", r#"{"code":"session_purged","terminal":true}"#).await;
+        let outcome = post_hook(&build_client(), &url, "{}", None, Duration::from_secs(1)).await;
+        assert_eq!(outcome, PostOutcome::Terminal);
     }
 
     #[tokio::test]

@@ -25,6 +25,9 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+use ai_memory_core::SessionId;
+use ai_memory_hooks::resolve_native_session_id;
+use anyhow::Result;
 use fs2::FileExt as _;
 use serde::{Deserialize, Serialize};
 
@@ -87,6 +90,134 @@ pub struct SpoolEntry {
     /// (with `created_ms`) to drop a permanently-undeliverable event.
     #[serde(default)]
     pub attempts: u32,
+}
+
+/// Remove every spooled entry belonging to `session_id`, by exact identity.
+///
+/// The server's tombstone already refuses these events with `410`, so the
+/// drain would eventually discard them anyway. This exists because a purge is
+/// a promise: an operator should not have to wait for a drain — or leave the
+/// content sitting in a plaintext spool file — before the deletion is real on
+/// this host.
+///
+/// Entries are matched by resolving each one's raw wire id through the SAME
+/// [`resolve_native_session_id`] the ingest path uses, so a session whose
+/// agent used an opaque string id (stored under its v5 hash) is still matched
+/// by its UUID. Comparing raw strings would silently miss exactly those.
+///
+/// Spools on OTHER hosts cannot be reached from here; the server-side
+/// tombstone is what stops those from resurrecting the session.
+///
+/// # Errors
+/// Returns an error only if the spool directory cannot be read. A file that
+/// cannot be parsed or removed is counted and skipped rather than aborting the
+/// sweep, so one bad entry cannot block the rest.
+pub fn sweep_session(data_dir: &Path, session_id: SessionId) -> Result<SpoolSweepResult> {
+    let dir = spool_dir(data_dir);
+    let mut result = SpoolSweepResult::default();
+    let entries = match std::fs::read_dir(&dir) {
+        Ok(entries) => entries,
+        // No spool at all is a successful sweep of nothing.
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(result),
+        Err(e) => {
+            return Err(anyhow::anyhow!(
+                "reading spool directory {}: {e}",
+                dir.display()
+            ));
+        }
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.extension().and_then(|e| e.to_str()) != Some("json") {
+            continue;
+        }
+        let Ok(raw) = std::fs::read_to_string(&path) else {
+            result.unreadable += 1;
+            continue;
+        };
+        let Ok(spooled) = serde_json::from_str::<SpoolEntry>(&raw) else {
+            result.unreadable += 1;
+            continue;
+        };
+        if spool_entry_session(&spooled).is_some_and(|id| id == session_id) {
+            if std::fs::remove_file(&path).is_ok() {
+                result.removed += 1;
+            } else {
+                result.unreadable += 1;
+            }
+        } else {
+            result.kept += 1;
+        }
+    }
+    Ok(result)
+}
+
+/// The durable session id a spooled entry belongs to, if it names one.
+///
+/// The body is the agent's own payload, so `session_id` is read from there
+/// first; the URL query is the bridge fallback used when a harness could not
+/// put it in the body.
+fn spool_entry_session(entry: &SpoolEntry) -> Option<SessionId> {
+    let from_body = serde_json::from_str::<serde_json::Value>(&entry.body)
+        .ok()
+        .and_then(|body| {
+            body.get("session_id")
+                .or_else(|| body.get("sessionId"))
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_owned)
+        });
+    let raw = from_body.or_else(|| {
+        entry.url.split('?').nth(1).and_then(|query| {
+            query.split('&').find_map(|pair| {
+                let (key, value) = pair.split_once('=')?;
+                (key == "session_id").then(|| percent_decode(value))
+            })
+        })
+    })?;
+    let trimmed = raw.trim();
+    (!trimmed.is_empty()).then(|| resolve_native_session_id(trimmed))
+}
+
+/// Minimal `%XX` decoder for the one query value this module reads back.
+fn percent_decode(raw: &str) -> String {
+    let bytes = raw.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'%' if i + 2 < bytes.len() => match u8::from_str_radix(&raw[i + 1..i + 3], 16) {
+                Ok(byte) => {
+                    out.push(byte);
+                    i += 3;
+                }
+                Err(_) => {
+                    out.push(bytes[i]);
+                    i += 1;
+                }
+            },
+            b'+' => {
+                out.push(b' ');
+                i += 1;
+            }
+            byte => {
+                out.push(byte);
+                i += 1;
+            }
+        }
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+/// Outcome of [`sweep_session`].
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct SpoolSweepResult {
+    /// Entries removed because they belonged to the purged session.
+    pub removed: usize,
+    /// Entries left alone because they belong to other sessions.
+    pub kept: usize,
+    /// Entries that could not be read, parsed, or removed. Counted rather than
+    /// fatal: one corrupt file must not block the rest of the sweep.
+    pub unreadable: usize,
 }
 
 /// `<data_dir>/hook-spool` — the spool directory.
@@ -584,6 +715,13 @@ pub async fn drain(
                             PostOutcome::Saturated => {
                                 result.remaining += 1;
                             }
+                            PostOutcome::Terminal => {
+                                // The session was purged: drop the entry
+                                // instead of retrying an event that can never
+                                // be delivered (#387).
+                                let _ = std::fs::remove_file(path);
+                                result.dropped += 1;
+                            }
                             PostOutcome::Failed => {
                                 bump_or_drop(path, entry, &mut result);
                             }
@@ -621,6 +759,12 @@ pub async fn drain(
                 }
                 PostOutcome::Saturated => {
                     result.remaining += 1;
+                }
+                PostOutcome::Terminal => {
+                    // Purged session: terminal, so the entry goes without
+                    // spending a retry attempt (#387).
+                    let _ = std::fs::remove_file(&path);
+                    result.dropped += 1;
                 }
                 PostOutcome::Failed => {
                     bump_or_drop(&path, &entry, &mut result);
@@ -839,6 +983,112 @@ fn list_entries(spool: &Path) -> Option<Vec<PathBuf>> {
 
 #[cfg(test)]
 mod tests {
+
+    /// The sweep must key on the durable id, not the raw string: a session
+    /// whose agent used an opaque id is stored (and tombstoned) under its v5
+    /// hash, so a raw-string comparison would silently leave its spooled
+    /// events on disk after a purge claimed to have removed them.
+    #[test]
+    fn sweep_matches_opaque_session_ids_through_the_same_resolution() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let dir = spool_dir(tmp.path());
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let opaque = "agent-run-1234";
+        let durable = resolve_native_session_id(opaque);
+        let write = |name: &str, body: serde_json::Value| {
+            let entry = SpoolEntry {
+                url: "http://127.0.0.1:49374/hook?event=user-prompt-submit&agent=codex".into(),
+                body: body.to_string(),
+                created_ms: 1,
+                auth_mode: AuthMode::Anonymous,
+                token: None,
+                attempts: 0,
+            };
+            std::fs::write(
+                dir.join(format!("{name}.json")),
+                serde_json::to_string(&entry).unwrap(),
+            )
+            .unwrap();
+        };
+        write(
+            "a",
+            serde_json::json!({ "session_id": opaque, "body": "canary" }),
+        );
+        write("b", serde_json::json!({ "session_id": "other-session" }));
+
+        let result = sweep_session(tmp.path(), durable).unwrap();
+        assert_eq!(result.removed, 1, "the opaque-id entry must be matched");
+        assert_eq!(result.kept, 1, "an unrelated session must be left alone");
+        assert!(!dir.join("a.json").exists());
+        assert!(dir.join("b.json").exists());
+    }
+
+    /// Some harnesses can only put the session id in the query string, so the
+    /// URL is the documented fallback. It arrives percent-encoded.
+    #[test]
+    fn sweep_falls_back_to_the_url_query_when_the_body_has_no_session() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let dir = spool_dir(tmp.path());
+        std::fs::create_dir_all(&dir).unwrap();
+        let session_id = SessionId::new();
+        let entry = SpoolEntry {
+            url: format!(
+                "http://127.0.0.1:49374/hook?event=stop&agent=codex&session_id={session_id}"
+            ),
+            body: serde_json::json!({ "tool_name": "Bash" }).to_string(),
+            created_ms: 1,
+            auth_mode: AuthMode::Anonymous,
+            token: None,
+            attempts: 0,
+        };
+        std::fs::write(dir.join("q.json"), serde_json::to_string(&entry).unwrap()).unwrap();
+
+        let result = sweep_session(tmp.path(), session_id).unwrap();
+        assert_eq!(result.removed, 1);
+        assert!(!dir.join("q.json").exists());
+    }
+
+    /// One corrupt file must not abort the sweep and leave later entries for
+    /// the purged session on disk.
+    #[test]
+    fn sweep_counts_unreadable_entries_and_keeps_going() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let dir = spool_dir(tmp.path());
+        std::fs::create_dir_all(&dir).unwrap();
+        let session_id = SessionId::new();
+        std::fs::write(dir.join("aaa-corrupt.json"), "{ not json").unwrap();
+        let entry = SpoolEntry {
+            url: "http://127.0.0.1:49374/hook?event=stop&agent=codex".into(),
+            body: serde_json::json!({ "session_id": session_id.to_string() }).to_string(),
+            created_ms: 1,
+            auth_mode: AuthMode::Anonymous,
+            token: None,
+            attempts: 0,
+        };
+        std::fs::write(
+            dir.join("zzz-target.json"),
+            serde_json::to_string(&entry).unwrap(),
+        )
+        .unwrap();
+
+        let result = sweep_session(tmp.path(), session_id).unwrap();
+        assert_eq!(result.unreadable, 1);
+        assert_eq!(
+            result.removed, 1,
+            "the corrupt file must not block the sweep"
+        );
+        assert!(!dir.join("zzz-target.json").exists());
+    }
+
+    /// A missing spool directory is a successful sweep of nothing, so
+    /// `purge-session` works on a host that has never spooled.
+    #[test]
+    fn sweep_of_a_missing_spool_directory_succeeds() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let result = sweep_session(tmp.path(), SessionId::new()).unwrap();
+        assert_eq!(result, SpoolSweepResult::default());
+    }
     use super::*;
 
     #[test]
