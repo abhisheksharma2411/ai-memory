@@ -24,6 +24,7 @@ mod ops;
 mod reader;
 mod scope;
 mod session_consolidation;
+pub mod session_purge;
 pub mod users;
 mod workstream;
 mod writer;
@@ -202,6 +203,7 @@ mod tests {
 
     fn sample_page(ws: WorkspaceId, proj: ProjectId, path: &str, body: &str) -> NewPage {
         NewPage {
+            source_session_id: None,
             workspace_id: ws,
             project_id: proj,
             path: PagePath::new(path).unwrap(),
@@ -3968,6 +3970,7 @@ mod tests {
             .await
             .unwrap();
         let page = NewPage {
+            source_session_id: None,
             workspace_id: ws,
             project_id: proj,
             path: PagePath::new("decisions/d1.md").unwrap(),

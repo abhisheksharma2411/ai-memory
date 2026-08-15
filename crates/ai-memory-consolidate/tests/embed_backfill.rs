@@ -51,6 +51,7 @@ impl Fixture {
     async fn write_page(&self, path: &str, body: &str) {
         self.wiki
             .write_page(WritePageRequest {
+                source_session_id: None,
                 workspace_id: self.ws,
                 project_id: self.proj,
                 path: PagePath::new(path.to_string()).expect("path"),

@@ -375,6 +375,7 @@ mod tests {
     ) -> PageId {
         fx.wiki
             .write_page(WritePageRequest {
+                source_session_id: None,
                 workspace_id: fx.ws,
                 project_id: fx.proj,
                 path: PagePath::new(path).unwrap(),
@@ -539,6 +540,7 @@ mod tests {
             .store
             .writer
             .upsert_page(NewPage {
+                source_session_id: None,
                 workspace_id: fx.ws,
                 project_id: fx.proj,
                 path: PagePath::new("notes/fm-pinned.md").unwrap(),

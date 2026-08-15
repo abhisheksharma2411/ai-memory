@@ -192,6 +192,9 @@ impl Consolidator {
         let id = self
             .wiki
             .write_page(WritePageRequest {
+                // `build_frontmatter` omits `session_id`, so the relational
+                // link is the only provenance this rewrite carries (#387).
+                source_session_id: Some(session_id),
                 workspace_id: ws,
                 project_id: proj,
                 path: path.clone(),
@@ -476,7 +479,8 @@ impl Consolidator {
         let mut requests = Vec::with_capacity(batch.updates.len());
         let mut outcomes_preview = Vec::with_capacity(batch.updates.len());
         for upd in &batch.updates {
-            let (mut req, mut outcome) = build_update(ws, proj, upd, false, &actor, author_id)?;
+            let (mut req, mut outcome) =
+                build_update(ws, proj, Some(session_id), upd, false, &actor, author_id)?;
             // A slot the engine writes belongs to the operator whose session
             // produced it, and `build_update` keeps the model's path verbatim
             // for every non-Rule kind — so the path here is attacker-reachable
@@ -582,6 +586,7 @@ impl Consolidator {
 fn build_update(
     ws: WorkspaceId,
     proj: ProjectId,
+    source_session_id: Option<ai_memory_core::SessionId>,
     upd: &crate::types::ConsolidatedPageUpdate,
     dry_run: bool,
     actor: &ai_memory_core::ActorContext,
@@ -643,6 +648,7 @@ fn build_update(
     fm.insert("consolidated".into(), serde_json::Value::Bool(true));
 
     let req = WritePageRequest {
+        source_session_id,
         workspace_id: ws,
         project_id: proj,
         path: path.clone(),
@@ -1597,6 +1603,7 @@ mod tests {
         let (req, _) = build_update(
             WorkspaceId::new(),
             ProjectId::new(),
+            None,
             &update,
             true,
             &ai_memory_core::ActorContext::anonymous(),
@@ -1626,6 +1633,7 @@ mod tests {
         let (req, _) = build_update(
             WorkspaceId::new(),
             ProjectId::new(),
+            None,
             &update,
             false,
             &actor,
@@ -1664,6 +1672,7 @@ mod tests {
         let (req, _) = build_update(
             WorkspaceId::new(),
             ProjectId::new(),
+            None,
             &update,
             false,
             &ai_memory_core::ActorContext::anonymous(),
@@ -1693,6 +1702,7 @@ mod tests {
         let (req, _) = build_update(
             WorkspaceId::new(),
             ProjectId::new(),
+            None,
             &update,
             true,
             &ai_memory_core::ActorContext::anonymous(),
@@ -1942,6 +1952,7 @@ mod tests {
 
     async fn write_slot(wiki: &Wiki, ws: WorkspaceId, proj: ProjectId, path: &str, body: &str) {
         wiki.write_page(WritePageRequest {
+            source_session_id: None,
             workspace_id: ws,
             project_id: proj,
             path: PagePath::new(path).unwrap(),
@@ -2608,6 +2619,7 @@ mod tests {
         consolidator
             .wiki
             .write_page(WritePageRequest {
+                source_session_id: None,
                 workspace_id: ws,
                 project_id: proj,
                 path: PagePath::new(PROJECT_INSTRUCTIONS_PATH).unwrap(),
@@ -2647,6 +2659,7 @@ mod tests {
         consolidator
             .wiki
             .write_page(WritePageRequest {
+                source_session_id: None,
                 workspace_id: ws,
                 project_id: other,
                 path: PagePath::new(PROJECT_INSTRUCTIONS_PATH).unwrap(),
@@ -2679,6 +2692,7 @@ mod tests {
         consolidator
             .wiki
             .write_page(WritePageRequest {
+                source_session_id: None,
                 workspace_id: ws,
                 project_id: proj,
                 path: PagePath::new(PROJECT_INSTRUCTIONS_PATH).unwrap(),

@@ -9,6 +9,7 @@ on a homelab box where mistakes are harder to undo.
 | Command | Safe with server **running**? | Wipes data? | Reversible? | Notes |
 |---|---|---|---|---|
 | `purge-project --confirm` | ✅ yes | the one project's data | no | Deletes the UUID-namespaced wiki root and raw workstream segments; sibling projects remain untouched. Refuses with `409` while a managed workstream under the project holds a live run lease — `--force` overrides. |
+| `purge-session --session-id --confirm` | ✅ yes | one session and everything derived from it | no | Removes the session, its observations and both FTS indexes, its handoffs, queued consolidation, auto-improvement runs/proposals/events/rejections, every version of its derived pages, and the wiki files. Leaves only a content-free tombstone. Refuses with `409` while the session is open or has work in flight — `--force` overrides. |
 | `rename-project --from --to` | ✅ yes | no | yes (rename back) | Column-only update on `projects.name`. The on-disk dir is keyed by `project_id` (UUID), so the rename never moves a file. |
 | `/admin/rename-workspace` | ✅ yes | no | yes (rename back) | Column-only update on `workspaces.name`; refreshes `_meta.md` scope manifests and checkpoints the wiki tree. |
 | `/admin/delete-workspace` | ✅ yes | the workspace and every child project | no | Runs `purge_workspace` admission first, deletes SQLite rows in one cascade, removes the UUID-keyed workspace directory and managed-workstream raw segments, reports filesystem partial failures, and dispatches mirror notification after durable work. |
@@ -125,6 +126,70 @@ Why this is safe with the server running:
   watcher even mid-write - at worst the watcher emits delete
   events for files we just removed, which it ignores (no DB row
   to reindex).
+
+### `purge-session`
+
+```bash
+ai-memory purge-session \
+    --workspace default --project acme-api \
+    --session-id 11111111-1111-4111-8111-111111111111 \
+    --confirm
+```
+
+Strong deletion of **one** session, for when an application has promised
+"forget this conversation" and has to be able to keep that promise. Where
+`purge-project` is too broad and `delete-page` removes only one wiki path, this
+removes a session across every layer ai-memory administers.
+
+**What it removes**
+
+- the `sessions` row, its `observations`, and both external-content FTS indexes
+- handoffs the session produced *or* accepted (both links are `ON DELETE SET
+  NULL`, so the rows are deleted explicitly rather than orphaned)
+- queued SessionEnd consolidation jobs and auto-improvement scheduler claims
+- auto-improvement runs, proposals, proposal events, and rejections derived
+  from it, including their reasons, summaries, and evidence
+- every version of each derived page — the heuristic `sessions/<uuid>.md`, its
+  LLM rewrites, and multi-page consolidation output — plus the wiki files
+- entities left with no remaining page links
+
+**How targets are chosen.** Only by identity: the session UUID, a foreign key,
+or the deterministic `sessions/<uuid>.md` path. Never by searching page text —
+a deletion that guessed would both miss content and remove innocent pages. Page
+provenance is structural (`pages.source_session_id`) and sticky: a rewrite that
+declares no provenance inherits the superseded version's, so an LLM rewrite or
+a hand edit cannot launder a page out of the purge's reach.
+
+**Safety rules**
+
+- Root-only, like every `/admin/*` route once the first user exists.
+- `--confirm` is mandatory.
+- The full UUID is required. A prefix of a real session id is refused with
+  `422`, because this operation is irreversible and must never guess.
+- A session id that exists in a *different* project reads exactly like "no such
+  session" (`404`), so the response cannot be used to probe another project.
+- Idempotent: a second call returns `already_purged` with the original
+  tombstone and zero counts, and does not fail on the absence of what the first
+  call removed.
+- Refuses with `409` while the session is open, a consolidation is queued or
+  running, or an auto-improvement claim is outstanding. `--force` overrides.
+
+**The tombstone.** The only permitted residue: scope, session UUID, purge time,
+schema version, and an audit-log id. No title, path, body, or count — a
+tombstone that quoted the session would defeat the deletion it records. It is
+what stops a late spooled event from a client that was offline during the purge
+from recreating the session.
+
+**`backup_cutoff`.** The receipt reports the purge instant. Snapshots taken
+before it still contain the purged content and should be invalidated by
+whatever rotates your backups; ai-memory does not operate that system.
+
+**Out of scope.** Managed workstreams are not touched. Their
+`native_session_id` columns are free text with no foreign key to `sessions.id`,
+so matching a purge against them by coincidence of value would delete unrelated
+history. That needs the composite `(workstream_id, agent_kind,
+native_session_id)` identity and a separate API. Histories kept by Claude Code,
+Codex, OpenCode, or any other harness are likewise outside ai-memory's control.
 
 ### `rename-project`
 

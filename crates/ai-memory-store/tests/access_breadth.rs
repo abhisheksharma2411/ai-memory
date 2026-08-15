@@ -113,6 +113,7 @@ async fn per_actor_rows_accumulate_without_replacing_the_scalar() {
     let page = store
         .writer
         .upsert_page(NewPage {
+            source_session_id: None,
             workspace_id: ws,
             project_id: proj,
             path: PagePath::new("notes/x.md").unwrap(),
@@ -212,6 +213,7 @@ async fn a_stale_page_id_does_not_cost_the_rest_of_the_batch_its_bump() {
             store
                 .writer
                 .upsert_page(NewPage {
+                    source_session_id: None,
                     workspace_id: ws,
                     project_id: proj,
                     path: PagePath::new(path).unwrap(),

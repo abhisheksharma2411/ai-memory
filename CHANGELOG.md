@@ -8,6 +8,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- Added `ai-memory purge-session` and `POST /admin/purge-session` for strong
+  per-session deletion, so an application that promises "forget this
+  conversation" can keep that promise. Removes the session, its observations
+  and both FTS indexes, handoffs it produced or accepted, queued consolidation
+  and auto-improvement claims, derived auto-improvement runs/proposals/events/
+  rejections, every version of its derived pages, and the wiki files — leaving
+  only a content-free tombstone. Root-only, `--confirm` required, full UUID
+  only, idempotent, and `409` while the session is still in flight unless
+  `--force`. Page provenance is now structural and sticky, so an LLM rewrite or
+  hand edit cannot launder a derived page out of the purge's reach. Managed
+  workstreams are explicitly out of scope: their `native_session_id` has no
+  foreign key to `sessions.id` and is never matched by coincidence (#387).
 - Added `[routing] mid_session` to choose how a mid-session event is attributed
   once the agent's cwd has moved. `follow-cwd` (default) keeps the historical
   per-event resolution; `sticky` keeps the session's project wherever the agent

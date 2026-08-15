@@ -93,6 +93,7 @@ async fn seed_two_projects(store: &Store, wiki: &Wiki) -> (WorkspaceId, ProjectI
 
     // Write pages through the wiki so they land on disk in per-project dirs.
     wiki.write_page(WritePageRequest {
+        source_session_id: None,
         workspace_id: ws,
         project_id: keep,
         path: PagePath::new("notes/keep.md").unwrap(),
@@ -109,6 +110,7 @@ async fn seed_two_projects(store: &Store, wiki: &Wiki) -> (WorkspaceId, ProjectI
     .unwrap();
 
     wiki.write_page(WritePageRequest {
+        source_session_id: None,
         workspace_id: ws,
         project_id: doomed,
         path: PagePath::new("notes/doomed.md").unwrap(),

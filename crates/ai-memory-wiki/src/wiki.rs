@@ -408,6 +408,7 @@ impl Wiki {
         let id = self
             .writer
             .upsert_page(NewPage {
+                source_session_id: None,
                 workspace_id,
                 project_id,
                 path,
@@ -1033,6 +1034,7 @@ impl Wiki {
         let entities = parse_entities(&path, &markdown.frontmatter)?;
         let emitted = emit(&markdown)?;
         let page = NewPage {
+            source_session_id: None,
             workspace_id,
             project_id,
             path: path.clone(),
@@ -1145,6 +1147,7 @@ impl Wiki {
         let id = self
             .writer
             .upsert_page(NewPage {
+                source_session_id: None,
                 workspace_id,
                 project_id,
                 path,
@@ -1423,6 +1426,7 @@ impl Wiki {
                 .iter()
                 .map(|(req, _, _, _)| {
                     Ok(ai_memory_core::NewPage {
+                        source_session_id: req.source_session_id,
                         workspace_id: req.workspace_id,
                         project_id: req.project_id,
                         path: req.path.clone(),
@@ -1490,6 +1494,7 @@ impl Wiki {
     /// Returns [`WikiError`] for any filesystem, parsing, or store error.
     pub async fn write_page(&self, req: WritePageRequest) -> WikiResult<PageId> {
         let WritePageRequest {
+            source_session_id,
             workspace_id,
             project_id,
             path,
@@ -1586,6 +1591,7 @@ impl Wiki {
             match self
                 .writer
                 .upsert_page(NewPage {
+                    source_session_id,
                     workspace_id,
                     project_id,
                     path,
@@ -1651,6 +1657,15 @@ impl Wiki {
 /// identity (`workspace_id`, `project_id`, `path`) plus body & metadata.
 #[derive(Debug, Clone)]
 pub struct WritePageRequest {
+    /// Session this page's content was derived from, when it was derived from
+    /// exactly one (#387). Propagates to `pages.source_session_id` so
+    /// `purge-session` can find multi-page consolidation output, whose paths
+    /// are arbitrary and therefore not resolvable by identity any other way.
+    ///
+    /// `None` means "not declared by this write": the store carries an existing
+    /// page's provenance forward, so the many internal callers that leave this
+    /// unset (lint rewriters, hand edits, the watcher) cannot strip it.
+    pub source_session_id: Option<ai_memory_core::SessionId>,
     /// Owning workspace.
     pub workspace_id: WorkspaceId,
     /// Owning project.
@@ -2187,6 +2202,7 @@ mod tests {
         fm: serde_json::Value,
     ) -> WritePageRequest {
         WritePageRequest {
+            source_session_id: None,
             workspace_id: ws,
             project_id: proj,
             path: PagePath::new(path).unwrap(),
@@ -3145,6 +3161,7 @@ mod tests {
         let wiki = Wiki::new(tmp.path(), store.writer.clone()).unwrap();
         let batch: Vec<_> = (0..5)
             .map(|i| WritePageRequest {
+                source_session_id: None,
                 workspace_id: ws,
                 project_id: proj,
                 path: PagePath::new(format!("batch/{i}.md")).unwrap(),
@@ -3308,6 +3325,7 @@ mod tests {
 
         let ids = wiki
             .apply_batch(vec![WritePageRequest {
+                source_session_id: None,
                 workspace_id: ws,
                 project_id: proj,
                 path: PagePath::new("batch/admitted.md").unwrap(),
@@ -3465,6 +3483,7 @@ mod tests {
         let wiki = Wiki::new(tmp.path(), store.writer.clone()).unwrap();
 
         wiki.write_page(WritePageRequest {
+            source_session_id: None,
             workspace_id: ws,
             project_id: proj_a,
             path: PagePath::new("decisions/foo.md").unwrap(),
@@ -3481,6 +3500,7 @@ mod tests {
         .unwrap();
 
         wiki.write_page(WritePageRequest {
+            source_session_id: None,
             workspace_id: ws,
             project_id: proj_b,
             path: PagePath::new("decisions/foo.md").unwrap(),
@@ -3601,6 +3621,7 @@ mod tests {
             .with_store_reader(store.reader.clone());
 
         wiki.write_page(WritePageRequest {
+            source_session_id: None,
             workspace_id: ws,
             project_id: proj,
             path: PagePath::new("notes/x.md").unwrap(),
@@ -3751,6 +3772,7 @@ mod tests {
             .unwrap();
 
         wiki.write_page(WritePageRequest {
+            source_session_id: None,
             workspace_id: ws,
             project_id: proj,
             path: PagePath::new("notes/note.md").unwrap(),
@@ -3807,6 +3829,7 @@ mod tests {
             .unwrap();
 
         wiki.write_page(WritePageRequest {
+            source_session_id: None,
             workspace_id: ws,
             project_id: proj,
             path: PagePath::new("notes/anon.md").unwrap(),

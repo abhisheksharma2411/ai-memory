@@ -645,12 +645,27 @@ pub(crate) fn upsert_page_in_tx(
             "UPDATE pages SET is_latest = 0 WHERE id = ?1",
             params![&existing.id],
         )?;
+        // Session provenance is sticky across versions (#387): a rewrite that
+        // does not declare one inherits the superseded version's, so an LLM
+        // rewrite or a hand edit of a session-derived page cannot launder it
+        // into a page `purge-session` no longer recognizes as derived.
+        let source_session_id: Option<Vec<u8>> = match page.source_session_id {
+            Some(session_id) => Some(session_id.as_bytes().to_vec()),
+            None => tx
+                .query_row(
+                    "SELECT source_session_id FROM pages WHERE id = ?1",
+                    params![&existing.id],
+                    |row| row.get::<_, Option<Vec<u8>>>(0),
+                )
+                .optional()?
+                .flatten(),
+        };
         tx.execute(
             "INSERT INTO pages \
              (id, workspace_id, project_id, path, path_search, title, tier, body, body_sha256, \
               frontmatter_json, is_latest, supersedes, pinned, author_id, \
-              created_at, updated_at, expires_at) \
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, 1, ?11, ?12, ?13, ?14, ?14, ?15)",
+              created_at, updated_at, expires_at, source_session_id) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, 1, ?11, ?12, ?13, ?14, ?14, ?15, ?16)",
             params![
                 new_id.as_bytes(),
                 page.workspace_id.as_bytes(),
@@ -667,6 +682,7 @@ pub(crate) fn upsert_page_in_tx(
                 page.author_id.map(|id| id.as_bytes().to_vec()),
                 now,
                 page.expires_at.map(|ts| ts.as_microsecond()),
+                source_session_id,
             ],
         )?;
         replace_links_in_tx(tx, &new_id, page)?;
@@ -689,8 +705,9 @@ pub(crate) fn upsert_page_in_tx(
     tx.execute(
         "INSERT INTO pages \
          (id, workspace_id, project_id, path, path_search, title, tier, body, body_sha256, \
-          frontmatter_json, is_latest, pinned, author_id, created_at, updated_at, expires_at) \
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, 1, ?11, ?12, ?13, ?13, ?14)",
+          frontmatter_json, is_latest, pinned, author_id, created_at, updated_at, expires_at, \
+          source_session_id) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, 1, ?11, ?12, ?13, ?13, ?14, ?15)",
         params![
             new_id.as_bytes(),
             page.workspace_id.as_bytes(),
@@ -706,6 +723,7 @@ pub(crate) fn upsert_page_in_tx(
             page.author_id.map(|id| id.as_bytes().to_vec()),
             now,
             page.expires_at.map(|ts| ts.as_microsecond()),
+            page.source_session_id.map(|id| id.as_bytes().to_vec()),
         ],
     )?;
     replace_links_in_tx(tx, &new_id, page)?;
@@ -2450,7 +2468,7 @@ fn observation_kind_as_str(kind: ObservationKind) -> &'static str {
     kind.as_str()
 }
 
-fn audit(
+pub(crate) fn audit(
     tx: &rusqlite::Transaction<'_>,
     op: &str,
     workspace_id: Option<&[u8; 16]>,
@@ -3503,6 +3521,7 @@ pub(crate) mod tests {
         body: &str,
     ) -> NewPage {
         NewPage {
+            source_session_id: None,
             workspace_id: ws,
             project_id: proj,
             path: PagePath::new(path).unwrap(),

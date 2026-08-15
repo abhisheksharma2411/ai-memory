@@ -152,6 +152,7 @@ async fn seed_page_with_metadata(
         .await
         .unwrap();
     wiki.write_page(WritePageRequest {
+        source_session_id: None,
         workspace_id: ws_id,
         project_id: proj,
         path: PagePath::new(path.to_string()).unwrap(),
@@ -675,6 +676,7 @@ async fn true_move_stale_source_write_fails_before_creating_file() {
     let stale_path = PagePath::new("notes/stale.md".to_string()).unwrap();
     let err = stale_wiki
         .write_page(WritePageRequest {
+            source_session_id: None,
             workspace_id: src_ws,
             project_id: src_proj,
             path: stale_path.clone(),

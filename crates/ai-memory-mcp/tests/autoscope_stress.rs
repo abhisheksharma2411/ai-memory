@@ -111,6 +111,7 @@ impl Harness {
             store
                 .writer
                 .upsert_page(ai_memory_core::NewPage {
+                    source_session_id: None,
                     workspace_id: ws,
                     project_id: proj,
                     path: ai_memory_core::PagePath::new("marker.md").expect("path"),

@@ -57,6 +57,7 @@ async fn m9_embeddings_roundtrip_via_synthetic() {
 
     for (path, body) in pages {
         wiki.write_page(WritePageRequest {
+            source_session_id: None,
             workspace_id: ws,
             project_id: proj,
             path: PagePath::new(path.to_string()).expect("path"),
@@ -179,6 +180,7 @@ async fn m9_embeddings_roundtrip_via_synthetic() {
     // 5. Re-writing a page produces a fresh embedding row (the
     //    ON CONFLICT in store_embedding does the replace).
     wiki.write_page(WritePageRequest {
+        source_session_id: None,
         workspace_id: ws,
         project_id: proj,
         path: PagePath::new("notes/karpathy.md".to_string()).expect("path"),

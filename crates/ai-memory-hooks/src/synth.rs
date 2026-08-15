@@ -33,6 +33,9 @@ pub fn synthesize_session_page(
     let path = PagePath::new(format!("sessions/{session_id}.md"))
         .expect("hard-coded sessions/<uuid>.md is always valid");
     NewPage {
+        // The heuristic session page is derived from exactly this session, and
+        // every later version of the path inherits the link (#387).
+        source_session_id: Some(session_id),
         workspace_id,
         project_id,
         path,

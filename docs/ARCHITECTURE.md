@@ -425,9 +425,9 @@ lint                 curator              auto-improve-report
 auto-improve         finalize-session     pending-writes
 embed                generate-auth-token  setup-agent
 bootstrap            install-instructions install-skills
-reorg                purge-project        rename-project
-move-project         uninstall            auth
-user                 completions
+reorg                purge-project        purge-session
+rename-project       move-project         uninstall
+auth                 user                 completions
 ```
 
 Run `ai-memory --help` for the full tree.

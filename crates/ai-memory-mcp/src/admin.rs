@@ -21,6 +21,7 @@
 //! - `GET  /admin/checkpoints`    — list recent wiki git checkpoints.
 //! - `POST /admin/restore-page`   — restore one page from a checkpoint.
 //! - `POST /admin/purge-project`  — delete a project and all its data.
+//! - `POST /admin/purge-session`  — strong per-session deletion (#387).
 //! - `POST /admin/rename-project` — rename a project (column-only; no files move).
 //! - `POST /admin/rename-workspace` — rename a workspace and refresh scope manifests.
 //! - `POST /admin/delete-workspace` — delete a workspace and all of its projects.
@@ -581,6 +582,7 @@ pub fn admin_router_with_decay_breadth(state: AdminState, breadth_weight: f64) -
         .route("/admin/checkpoints", get(handle_checkpoints))
         .route("/admin/restore-page", post(handle_restore_page))
         .route("/admin/purge-project", post(handle_purge_project))
+        .route("/admin/purge-session", post(handle_purge_session))
         .route("/admin/rename-project", post(handle_rename_project))
         .route("/admin/move-project", post(handle_move_project))
         .route("/admin/delete-workspace", post(handle_delete_workspace))
@@ -4430,6 +4432,7 @@ async fn copy_purge_merge(
         used_dest_paths.insert(dest_path.as_str().to_string());
         let new_page_id = match copy_wiki
             .write_page(WritePageRequest {
+                source_session_id: None,
                 workspace_id: dst_ws,
                 project_id: dst_proj,
                 path: dest_path.clone(),
@@ -4916,6 +4919,7 @@ async fn handle_write_page(
     let page_id = state
         .wiki
         .write_page(WritePageRequest {
+            source_session_id: None,
             workspace_id: ws,
             project_id: proj,
             path: path.clone(),
@@ -5339,6 +5343,178 @@ fn map_user_store_err(e: ai_memory_store::StoreError) -> (StatusCode, Json<serde
         }
         other => internal_err(other.to_string()),
     }
+}
+
+// ---------------------------------------------------------------------
+// purge-session (#387)
+// ---------------------------------------------------------------------
+
+/// JSON request body for `POST /admin/purge-session`.
+#[derive(Deserialize)]
+struct PurgeSessionRequest {
+    /// Workspace name. Must already exist.
+    workspace: String,
+    /// Project name. Must already exist.
+    project: String,
+    /// The session's complete, validated UUID. Never a prefix, title, or path:
+    /// a deletion that guessed its target would be worse than no deletion.
+    session_id: String,
+    /// Mandatory confirmation. Without `confirm: true` the server returns 400.
+    confirm: bool,
+    /// Purge even when the session is still open, a consolidation is queued,
+    /// or an auto-improvement claim is outstanding. Off by default: those
+    /// would otherwise be cut off mid-flight.
+    #[serde(default)]
+    force: bool,
+}
+
+/// Receipt returned by `POST /admin/purge-session`.
+///
+/// Deliberately echoes no deleted content — only identity, counts, and the
+/// cutoff an operator needs to invalidate older snapshots.
+#[derive(Debug, Serialize)]
+pub struct PurgeSessionReceipt {
+    /// Contract version of this receipt.
+    pub schema_version: i64,
+    /// `purged` or `already_purged`.
+    pub status: String,
+    /// Workspace name as requested.
+    pub workspace: String,
+    /// Project name as requested.
+    pub project: String,
+    /// The purged session's UUID.
+    pub session_id: String,
+    /// Which identity space this session belongs to. Managed workstreams are
+    /// out of scope for this API and are never matched by coincidence.
+    pub session_kind: String,
+    /// Stable id of the tombstone covering this session.
+    pub tombstone_id: String,
+    /// RFC3339 instant the session was purged.
+    pub purged_at: String,
+    /// Rows removed per layer.
+    pub counts: serde_json::Value,
+    /// Snapshots older than this may still contain the purged content.
+    pub backup_cutoff: String,
+    /// Non-fatal conditions, e.g. a wiki file that could not be removed.
+    pub warnings: Vec<String>,
+}
+
+async fn handle_purge_session(
+    State(state): State<Arc<AdminState>>,
+    author_ext: Option<axum::Extension<ai_memory_core::UserId>>,
+    Json(req): Json<PurgeSessionRequest>,
+) -> impl IntoResponse {
+    let author_id = author_ext.map(|axum::Extension(u)| u);
+    if !req.confirm {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "error": "destructive operation requires confirm=true"
+            })),
+        );
+    }
+    // Full UUID only. A prefix or a free-form label could resolve to more than
+    // one session, and this operation is irreversible.
+    let Ok(session_id) = req.session_id.parse::<ai_memory_core::SessionId>() else {
+        return (
+            StatusCode::UNPROCESSABLE_ENTITY,
+            Json(serde_json::json!({
+                "error": "session_id must be a complete session UUID"
+            })),
+        );
+    };
+
+    let (ws_id, proj_id) =
+        match lookup_ws_proj_no_create(&state, &req.workspace, &req.project).await {
+            Ok(ids) => ids,
+            Err(e) => return e,
+        };
+
+    if !req.force {
+        match state.reader.session_purge_is_busy(session_id).await {
+            Ok(Some(reason)) => {
+                return (
+                    StatusCode::CONFLICT,
+                    Json(serde_json::json!({
+                        "error": format!("session is busy: {reason}"),
+                        "hint": "retry with force=true to cancel and purge anyway",
+                    })),
+                );
+            }
+            Ok(None) => {}
+            Err(e) => return internal_err(e.to_string()),
+        }
+    }
+
+    let receipt = match state.writer.purge_session(ws_id, proj_id, session_id).await {
+        Ok(receipt) => receipt,
+        Err(ai_memory_store::StoreError::NotFound(_)) => {
+            return (
+                StatusCode::NOT_FOUND,
+                Json(serde_json::json!({
+                    "error": "no such session in this workspace and project"
+                })),
+            );
+        }
+        Err(ai_memory_store::StoreError::InvalidState(msg))
+            if msg.contains("different workspace or project") =>
+        {
+            // Deliberately indistinguishable from "not found": confirming that
+            // the id exists elsewhere would leak another project's session.
+            return (
+                StatusCode::NOT_FOUND,
+                Json(serde_json::json!({
+                    "error": "no such session in this workspace and project"
+                })),
+            );
+        }
+        Err(e) => return internal_err(e.to_string()),
+    };
+
+    // The index is clean; the working tree is not. Remove the authoritative
+    // markdown for every page whose versions were all derived from this
+    // session. Git history is rewritten separately.
+    let mut warnings = receipt.warnings.clone();
+    for path in &receipt.removed_pages {
+        if let Err(e) = state
+            .wiki
+            .delete_page(ws_id, proj_id, path, None, author_id)
+            .await
+        {
+            warnings.push(format!("could not remove wiki file {}: {e}", path.as_str()));
+        }
+    }
+
+    (
+        StatusCode::OK,
+        Json(
+            serde_json::to_value(PurgeSessionReceipt {
+                schema_version: ai_memory_store::session_purge::SESSION_PURGE_SCHEMA_VERSION,
+                status: receipt.status.as_str().to_string(),
+                workspace: req.workspace,
+                project: req.project,
+                session_id: session_id.to_string(),
+                session_kind: "native_lifecycle".to_string(),
+                tombstone_id: receipt.tombstone_id.to_string(),
+                purged_at: receipt.purged_at.to_string(),
+                counts: serde_json::json!({
+                    "sessions": receipt.counts.sessions,
+                    "observations": receipt.counts.observations,
+                    "handoffs": receipt.counts.handoffs,
+                    "consolidation_jobs": receipt.counts.consolidation_jobs,
+                    "auto_improve_scheduler_claims": receipt.counts.auto_improve_scheduler_claims,
+                    "auto_improve_runs": receipt.counts.auto_improve_runs,
+                    "auto_improve_proposals": receipt.counts.auto_improve_proposals,
+                    "auto_improve_proposal_events": receipt.counts.auto_improve_proposal_events,
+                    "auto_improve_rejections": receipt.counts.auto_improve_rejections,
+                    "page_versions": receipt.counts.page_versions,
+                }),
+                backup_cutoff: receipt.backup_cutoff.to_string(),
+                warnings,
+            })
+            .unwrap_or_else(|e| serde_json::json!({ "error": e.to_string() })),
+        ),
+    )
 }
 
 #[cfg(test)]
@@ -6197,6 +6373,38 @@ mod tests {
         assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
     }
 
+    /// Like [`read_page_test_router`] but also hands back the writer, so a test
+    /// can seed real sessions before exercising the route.
+    fn purge_session_test_router() -> (TempDir, Router, WriterHandle) {
+        let tmp = TempDir::new().unwrap();
+        let store = Store::open(tmp.path()).unwrap();
+        let wiki = Wiki::new(tmp.path(), store.writer.clone())
+            .unwrap()
+            .with_store_reader(store.reader.clone());
+        let writer = store.writer.clone();
+        let router = admin_router(AdminState {
+            writer: store.writer.clone(),
+            reader: store.reader.clone(),
+            wiki,
+            llm: None,
+            auto_improve_require_approval: false,
+            auto_improve_review_config: Default::default(),
+            embedder: None,
+            provider_health: ProviderHealth::default(),
+            decay_params: DecayParams::default(),
+            data_dir: tmp.path().to_path_buf(),
+            db_path: store.db_path().to_path_buf(),
+            bind: "127.0.0.1:49374".to_string(),
+            home_dir: None,
+            bootstrap_lock: Arc::new(tokio::sync::Mutex::new(())),
+            token_pepper: None,
+            active_project: ai_memory_core::ActiveProject::new(),
+            scope_invalidator: None,
+            trusted_proxy_identity: false,
+        });
+        (tmp, router, writer)
+    }
+
     fn read_page_test_router() -> (TempDir, Router) {
         let tmp = TempDir::new().unwrap();
         let store = Store::open(tmp.path()).unwrap();
@@ -6502,6 +6710,7 @@ mod tests {
             .unwrap();
 
         wiki.write_page(WritePageRequest {
+            source_session_id: None,
             workspace_id: ws,
             project_id: proj,
             path: PagePath::new("_slots/current-focus.md").unwrap(),
@@ -6657,6 +6866,7 @@ mod tests {
             .unwrap();
 
         wiki.write_page(WritePageRequest {
+            source_session_id: None,
             workspace_id: ws,
             project_id: proj,
             path: PagePath::new("_slots/current-focus.md").unwrap(),
@@ -6796,6 +7006,7 @@ mod tests {
         .await;
 
         wiki.write_page(WritePageRequest {
+            source_session_id: None,
             workspace_id: ws,
             project_id: proj,
             path: PagePath::new("_slots/current-focus.md").unwrap(),
@@ -6913,6 +7124,7 @@ mod tests {
         .await;
 
         wiki.write_page(WritePageRequest {
+            source_session_id: None,
             workspace_id: ws,
             project_id: proj,
             path: PagePath::new("_slots/current-focus.md").unwrap(),
@@ -9499,6 +9711,218 @@ mod tests {
             post_delete_page(&router, "default", "audit", "notes/never-existed.md").await;
         assert_eq!(status, StatusCode::OK);
         assert_eq!(json["deleted"], true);
+    }
+
+    // ── purge-session (#387) ─────────────────────────────────────────────
+
+    async fn post_purge_session(
+        router: &Router,
+        body: serde_json::Value,
+    ) -> (StatusCode, serde_json::Value) {
+        let resp = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/admin/purge-session")
+                    .header("content-type", "application/json")
+                    .body(Body::from(serde_json::to_vec(&body).unwrap()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let status = resp.status();
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json = serde_json::from_slice(&bytes).unwrap_or(serde_json::Value::Null);
+        (status, json)
+    }
+
+    /// Seed a real session with an observation so the purge has something to
+    /// remove, and return its id.
+    async fn seed_purgeable_session(writer: &WriterHandle, ws: &str, project: &str) -> String {
+        let workspace_id = writer.get_or_create_workspace(ws).await.unwrap();
+        let project_id = writer
+            .get_or_create_project(workspace_id, project, None)
+            .await
+            .unwrap();
+        let session_id = ai_memory_core::SessionId::new();
+        writer
+            .begin_session(ai_memory_core::NewSession {
+                id: session_id,
+                workspace_id,
+                project_id,
+                agent_kind: ai_memory_core::AgentKind::Codex,
+                cwd: None,
+                actor_user: None,
+            })
+            .await
+            .unwrap();
+        writer
+            .insert_observation(ai_memory_core::Sanitized::new(
+                ai_memory_core::NewObservation {
+                    session_id,
+                    workspace_id,
+                    project_id,
+                    kind: ai_memory_core::ObservationKind::UserPrompt,
+                    extension: None,
+                    source_event: None,
+                    title: "prompt".into(),
+                    body: "secret-canary-payload".into(),
+                    importance: 5,
+                },
+                &ai_memory_core::Sanitizer::default(),
+            ))
+            .await
+            .unwrap();
+        writer.end_session(session_id, None).await.unwrap();
+        session_id.to_string()
+    }
+
+    #[tokio::test]
+    async fn purge_session_requires_confirm() {
+        let (_tmp, router, writer) = purge_session_test_router();
+        let session_id = seed_purgeable_session(&writer, "default", "audit").await;
+        let (status, json) = post_purge_session(
+            &router,
+            serde_json::json!({
+                "workspace": "default",
+                "project": "audit",
+                "session_id": session_id,
+                "confirm": false,
+            }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert!(
+            json["error"].as_str().unwrap().contains("confirm=true"),
+            "{json}"
+        );
+    }
+
+    #[tokio::test]
+    async fn purge_session_rejects_a_partial_uuid() {
+        let (_tmp, router, writer) = purge_session_test_router();
+        let session_id = seed_purgeable_session(&writer, "default", "audit").await;
+        // A prefix of a REAL session id must still be refused: the deletion is
+        // irreversible, so it may never resolve a target by guessing.
+        let (status, _) = post_purge_session(
+            &router,
+            serde_json::json!({
+                "workspace": "default",
+                "project": "audit",
+                "session_id": &session_id[..8],
+                "confirm": true,
+            }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+    }
+
+    #[tokio::test]
+    async fn purge_session_removes_the_session_and_is_idempotent() {
+        let (_tmp, router, writer) = purge_session_test_router();
+        let session_id = seed_purgeable_session(&writer, "default", "audit").await;
+        let body = serde_json::json!({
+            "workspace": "default",
+            "project": "audit",
+            "session_id": session_id,
+            "confirm": true,
+        });
+
+        let (status, json) = post_purge_session(&router, body.clone()).await;
+        assert_eq!(status, StatusCode::OK, "{json}");
+        assert_eq!(json["status"], "purged");
+        assert_eq!(json["counts"]["sessions"], 1);
+        assert_eq!(json["counts"]["observations"], 1);
+        assert_eq!(json["session_kind"], "native_lifecycle");
+        assert!(json["tombstone_id"].as_str().is_some());
+        let first_tombstone = json["tombstone_id"].as_str().unwrap().to_string();
+
+        let (status, json) = post_purge_session(&router, body).await;
+        assert_eq!(status, StatusCode::OK, "{json}");
+        assert_eq!(json["status"], "already_purged");
+        assert_eq!(json["tombstone_id"].as_str().unwrap(), first_tombstone);
+        assert_eq!(json["counts"]["sessions"], 0);
+    }
+
+    #[tokio::test]
+    async fn purge_session_in_the_wrong_project_is_indistinguishable_from_absent() {
+        let (_tmp, router, writer) = purge_session_test_router();
+        let session_id = seed_purgeable_session(&writer, "default", "audit").await;
+        // Seed the other project so the scope itself resolves.
+        seed_purgeable_session(&writer, "default", "other").await;
+
+        let (status, json) = post_purge_session(
+            &router,
+            serde_json::json!({
+                "workspace": "default",
+                "project": "other",
+                "session_id": session_id,
+                "confirm": true,
+            }),
+        )
+        .await;
+        // Confirming that the id exists elsewhere would leak another project's
+        // session, so a scope conflict reads exactly like "no such session".
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert_eq!(
+            json["error"].as_str().unwrap(),
+            "no such session in this workspace and project"
+        );
+
+        // And the real session must be untouched by the misdirected attempt.
+        let (status, json) = post_purge_session(
+            &router,
+            serde_json::json!({
+                "workspace": "default",
+                "project": "audit",
+                "session_id": session_id,
+                "confirm": true,
+            }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{json}");
+        assert_eq!(json["status"], "purged");
+    }
+
+    #[tokio::test]
+    async fn purge_session_refuses_an_open_session_without_force() {
+        let (_tmp, router, writer) = purge_session_test_router();
+        let workspace_id = writer.get_or_create_workspace("default").await.unwrap();
+        let project_id = writer
+            .get_or_create_project(workspace_id, "audit", None)
+            .await
+            .unwrap();
+        let session_id = ai_memory_core::SessionId::new();
+        writer
+            .begin_session(ai_memory_core::NewSession {
+                id: session_id,
+                workspace_id,
+                project_id,
+                agent_kind: ai_memory_core::AgentKind::Codex,
+                cwd: None,
+                actor_user: None,
+            })
+            .await
+            .unwrap();
+
+        let body = serde_json::json!({
+            "workspace": "default",
+            "project": "audit",
+            "session_id": session_id.to_string(),
+            "confirm": true,
+        });
+        let (status, json) = post_purge_session(&router, body.clone()).await;
+        assert_eq!(status, StatusCode::CONFLICT, "{json}");
+        assert!(json["error"].as_str().unwrap().contains("still open"));
+
+        let mut forced = body;
+        forced["force"] = serde_json::Value::Bool(true);
+        let (status, json) = post_purge_session(&router, forced).await;
+        assert_eq!(status, StatusCode::OK, "{json}");
+        assert_eq!(json["status"], "purged");
     }
 
     #[tokio::test]

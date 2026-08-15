@@ -489,6 +489,7 @@ async fn reorg_live_graveyards_only_default_workspace_pages() {
     store
         .writer
         .upsert_page(NewPage {
+            source_session_id: None,
             workspace_id: default_ws,
             project_id: default_proj,
             path: PagePath::new("notes/default-latest.md").unwrap(),
@@ -518,6 +519,7 @@ async fn reorg_live_graveyards_only_default_workspace_pages() {
     store
         .writer
         .upsert_page(NewPage {
+            source_session_id: None,
             workspace_id: sibling_ws,
             project_id: sibling_proj,
             path: PagePath::new("notes/sibling-latest.md").unwrap(),
@@ -598,6 +600,7 @@ async fn lint_dry_run_returns_lint_report_shape() {
     store
         .writer
         .upsert_page(NewPage {
+            source_session_id: None,
             workspace_id: ws,
             project_id: proj,
             path: PagePath::new("notes/test.md").unwrap(),
@@ -768,6 +771,7 @@ async fn embed_all_projects_rebuilds_workspace_projects() {
     state
         .wiki
         .write_page(WritePageRequest {
+            source_session_id: None,
             workspace_id: ws,
             project_id: alpha,
             path: PagePath::new("notes/a.md").unwrap(),
@@ -785,6 +789,7 @@ async fn embed_all_projects_rebuilds_workspace_projects() {
     state
         .wiki
         .write_page(WritePageRequest {
+            source_session_id: None,
             workspace_id: ws,
             project_id: beta,
             path: PagePath::new("notes/b.md").unwrap(),
@@ -877,6 +882,7 @@ async fn commit_with_new_page_returns_committed_true_and_40char_oid() {
     state
         .wiki
         .write_page(WritePageRequest {
+            source_session_id: None,
             workspace_id: ws,
             project_id: proj,
             path: PagePath::new("notes/commit-test.md").unwrap(),
@@ -927,6 +933,7 @@ async fn checkpoints_list_and_restore_page_round_trip() {
     state
         .wiki
         .write_page(WritePageRequest {
+            source_session_id: None,
             workspace_id: ws,
             project_id: proj,
             path: path.clone(),
@@ -946,6 +953,7 @@ async fn checkpoints_list_and_restore_page_round_trip() {
     state
         .wiki
         .write_page(WritePageRequest {
+            source_session_id: None,
             workspace_id: ws,
             project_id: proj,
             path: path.clone(),

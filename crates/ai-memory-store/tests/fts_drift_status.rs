@@ -29,6 +29,7 @@ async fn page_fts_rows_report_index_drift() {
     store
         .writer
         .upsert_page(NewPage {
+            source_session_id: None,
             workspace_id: ws,
             project_id: proj,
             path: PagePath::new("notes/one.md").unwrap(),

@@ -110,6 +110,7 @@ mod tests {
         store
             .writer
             .upsert_page(NewPage {
+                source_session_id: None,
                 workspace_id: ws,
                 project_id: proj,
                 path: PagePath::new("notes/stale.md").unwrap(),

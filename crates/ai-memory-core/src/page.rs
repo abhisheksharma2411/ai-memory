@@ -11,7 +11,7 @@ use std::str::FromStr;
 use jiff::Timestamp;
 use serde::{Deserialize, Serialize};
 
-use crate::ids::{PageId, PagePath, ProjectId, WorkspaceId};
+use crate::ids::{PageId, PagePath, ProjectId, SessionId, WorkspaceId};
 
 /// Lifetime classification for a page.
 ///
@@ -38,6 +38,18 @@ pub struct NewPage {
     pub workspace_id: WorkspaceId,
     /// Owning project.
     pub project_id: ProjectId,
+    /// Session this page's content was derived from, when it was derived from
+    /// exactly one (#387). `None` means "not declared by this write", NOT
+    /// "none": the store carries an existing page's provenance forward when a
+    /// new version does not declare one, so a hand edit, a watcher reindex, or
+    /// an LLM rewrite of a session page cannot quietly launder it into a page
+    /// that `purge-session` no longer recognizes as derived.
+    ///
+    /// Rebuilding an index from disk into an EMPTY database has nothing to
+    /// inherit from and does lose this link; the tombstone ledger is what keeps
+    /// purged content from returning in that case, not this column.
+    #[serde(default)]
+    pub source_session_id: Option<SessionId>,
     /// Relative path within the wiki tree.
     pub path: PagePath,
     /// Page title (rendered from frontmatter or the first H1).

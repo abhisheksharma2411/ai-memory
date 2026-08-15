@@ -28,6 +28,7 @@ fn new_page(
     body: &str,
 ) -> NewPage {
     NewPage {
+        source_session_id: None,
         workspace_id: ws,
         project_id: proj,
         path: PagePath::new(path).unwrap(),
@@ -50,6 +51,7 @@ fn wiki_req(
     body: &str,
 ) -> WritePageRequest {
     WritePageRequest {
+        source_session_id: None,
         workspace_id: ws,
         project_id: proj,
         path: PagePath::new(path).unwrap(),
@@ -613,6 +615,7 @@ async fn api_pages_derives_kind_from_path_when_frontmatter_absent() {
     store
         .writer
         .upsert_page(NewPage {
+            source_session_id: None,
             workspace_id: ws,
             project_id: proj,
             path: PagePath::new("decisions/adr-x.md").unwrap(),
@@ -634,6 +637,7 @@ async fn api_pages_derives_kind_from_path_when_frontmatter_absent() {
     store
         .writer
         .upsert_page(NewPage {
+            source_session_id: None,
             workspace_id: ws,
             project_id: proj,
             path: PagePath::new("notes/anything.md").unwrap(),
@@ -2240,6 +2244,7 @@ async fn api_page_handler_emits_etag_and_supports_if_none_match() {
         .await
         .unwrap();
     wiki.write_page(WritePageRequest {
+        source_session_id: None,
         workspace_id: ws,
         project_id: proj,
         path: PagePath::new("etag-test.md").unwrap(),
@@ -2321,6 +2326,7 @@ async fn api_page_handler_etag_differs_per_page() {
         .await
         .unwrap();
     wiki.write_page(WritePageRequest {
+        source_session_id: None,
         workspace_id: ws,
         project_id: proj,
         path: PagePath::new("page-a.md").unwrap(),
@@ -2336,6 +2342,7 @@ async fn api_page_handler_etag_differs_per_page() {
     .await
     .unwrap();
     wiki.write_page(WritePageRequest {
+        source_session_id: None,
         workspace_id: ws,
         project_id: proj,
         path: PagePath::new("page-b.md").unwrap(),

@@ -193,6 +193,7 @@ async fn m8_retention_lifecycle_end_to_end() {
         }
         let id = wiki
             .write_page(WritePageRequest {
+                source_session_id: None,
                 workspace_id: ws,
                 project_id: proj,
                 path: PagePath::new(fx.path.to_string()).expect("page path"),
@@ -498,6 +499,7 @@ async fn ttl_expiry_lifecycle_end_to_end() {
             frontmatter.insert("pinned".into(), serde_json::Value::Bool(true));
         }
         wiki.write_page(WritePageRequest {
+            source_session_id: None,
             workspace_id: ws,
             project_id: proj,
             path: PagePath::new(path.to_string()).expect("page path"),
@@ -745,6 +747,7 @@ async fn aged_decay_cleanup_stays_within_the_requested_scope() {
         ),
     ] {
         wiki.write_page(WritePageRequest {
+            source_session_id: None,
             workspace_id,
             project_id,
             path: PagePath::new(path).unwrap(),
@@ -855,6 +858,7 @@ async fn rewritten_decay_eviction_removes_the_file_and_entire_version_chain() {
     let path = PagePath::new("sessions/rewritten.md").unwrap();
 
     let write = |body: &str, entity: &str| WritePageRequest {
+        source_session_id: None,
         workspace_id: ws,
         project_id: proj,
         path: path.clone(),
@@ -957,6 +961,7 @@ async fn hard_delete_preserves_a_page_recreated_at_the_same_path() {
     let path = PagePath::new("sessions/recreated.md").unwrap();
 
     let write = |body: &str| WritePageRequest {
+        source_session_id: None,
         workspace_id: ws,
         project_id: proj,
         path: path.clone(),

@@ -145,6 +145,12 @@ pub enum Command {
     /// observations, handoffs, embeddings, on-disk wiki files).
     /// This is irreversible — requires `--confirm`.
     PurgeProject(PurgeProjectArgs),
+    /// Permanently delete ONE session by its exact UUID, across every layer
+    /// ai-memory administers: rows, FTS indexes, derived pages, handoffs,
+    /// auto-improvement artifacts, and the wiki files. Leaves only a
+    /// content-free tombstone that stops a late spooled event from
+    /// resurrecting it. Irreversible — requires `--confirm`.
+    PurgeSession(PurgeSessionArgs),
     /// Rename a project within its workspace. No files move on disk —
     /// the wiki is flat and pages are differentiated by project_id only.
     /// Useful after renaming the project's directory on disk so the hook
@@ -553,6 +559,34 @@ pub struct PurgeProjectArgs {
     /// out — purging is destructive and irreversible.
     #[arg(long)]
     pub confirm: bool,
+}
+
+/// Arguments for `purge-session`.
+#[derive(Debug, Args)]
+pub struct PurgeSessionArgs {
+    /// Workspace name. Defaults to the nearest `.ai-memory.toml` marker's
+    /// `workspace`, else `default`.
+    #[arg(long)]
+    pub workspace: Option<String>,
+    /// Project name. When omitted, auto-derived from the basename of
+    /// the current git repo root (or CWD if no git repo).
+    #[arg(long)]
+    pub project: Option<String>,
+    /// The session's complete UUID. Prefixes, titles, and paths are
+    /// deliberately not accepted: this operation is irreversible, so it must
+    /// never guess which session an operator meant.
+    #[arg(long)]
+    pub session_id: String,
+    /// REQUIRED for the purge to run. Without this flag the CLI errors out.
+    #[arg(long)]
+    pub confirm: bool,
+    /// Purge even when the session is still open, a consolidation is queued,
+    /// or an auto-improvement claim is outstanding.
+    #[arg(long)]
+    pub force: bool,
+    /// Print the raw JSON receipt only, for scripting.
+    #[arg(long)]
+    pub json: bool,
 }
 
 /// Arguments for `rename-project`.

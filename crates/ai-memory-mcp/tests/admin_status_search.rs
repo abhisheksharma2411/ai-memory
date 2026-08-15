@@ -52,6 +52,7 @@ async fn seed_page(store: &Store, title: &str, path: &str, body: &str) {
         .await
         .unwrap();
     let page = NewPage {
+        source_session_id: None,
         workspace_id: ws,
         project_id: proj,
         path: PagePath::new(path).unwrap(),
@@ -143,6 +144,7 @@ async fn list_projects_returns_workspace_project_pairs() {
     store
         .writer
         .upsert_page(NewPage {
+            source_session_id: None,
             workspace_id: ws,
             project_id: proj,
             path: PagePath::new("notes/b.md").unwrap(),

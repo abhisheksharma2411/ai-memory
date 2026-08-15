@@ -81,6 +81,7 @@ async fn seed(store: &Store) -> (WorkspaceId, ProjectId) {
 async fn write_page(writer: &WriterHandle, ws: WorkspaceId, proj: ProjectId, path: &str) -> PageId {
     writer
         .upsert_page(NewPage {
+            source_session_id: None,
             workspace_id: ws,
             project_id: proj,
             path: PagePath::new(path.to_string()).expect("path"),

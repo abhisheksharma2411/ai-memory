@@ -2821,6 +2821,7 @@ impl AiMemoryServer {
 
         let page_id = wiki
             .write_page(WritePageRequest {
+                source_session_id: None,
                 workspace_id: ws,
                 project_id: proj,
                 path: path.clone(),
@@ -4112,6 +4113,7 @@ mod tests {
         store
             .writer
             .upsert_page(NewPage {
+                source_session_id: None,
                 workspace_id: ws,
                 project_id: proj,
                 path: PagePath::new("foo.md").unwrap(),
@@ -4408,6 +4410,7 @@ mod tests {
         store
             .writer
             .upsert_page(NewPage {
+                source_session_id: None,
                 workspace_id: ws,
                 project_id: other,
                 path: PagePath::new("foo.md").unwrap(),
@@ -5259,6 +5262,7 @@ mod tests {
             .unwrap();
         let path = PagePath::new("notes/shared.md").unwrap();
         let make_page = |project_id, body: &str| NewPage {
+            source_session_id: None,
             workspace_id: ws,
             project_id,
             path: path.clone(),
@@ -5893,6 +5897,7 @@ mod tests {
         // A page findable ONLY via its entities (body avoids the query
         // word), and a page findable ONLY via a link from an FTS hit.
         let mut entity_only = NewPage {
+            source_session_id: None,
             workspace_id: ws,
             project_id: proj,
             path: PagePath::new("concepts/broker.md").unwrap(),
@@ -5915,6 +5920,7 @@ mod tests {
         store
             .writer
             .upsert_page(NewPage {
+                source_session_id: None,
                 workspace_id: ws,
                 project_id: proj,
                 path: PagePath::new("concepts/seed.md").unwrap(),
@@ -6003,6 +6009,7 @@ mod tests {
         store
             .writer
             .upsert_page(NewPage {
+                source_session_id: None,
                 workspace_id: global.workspace_id,
                 project_id: global.project_id,
                 path: PagePath::new("preferences/style.md").unwrap(),
@@ -6537,6 +6544,7 @@ mod tests {
         store
             .writer
             .upsert_page(NewPage {
+                source_session_id: None,
                 workspace_id: ws,
                 project_id: pages,
                 path: PagePath::new("page-hit.md").unwrap(),
@@ -6619,6 +6627,7 @@ mod tests {
         store
             .writer
             .upsert_page(NewPage {
+                source_session_id: None,
                 workspace_id: practice_ws,
                 project_id: testing,
                 path: PagePath::new("patterns.md").unwrap(),
@@ -6795,6 +6804,7 @@ mod tests {
             .await
             .unwrap();
         wiki.write_page(WritePageRequest {
+            source_session_id: None,
             workspace_id: practice_ws,
             project_id: docs,
             path: PagePath::new("notes/sibling.md").unwrap(),
@@ -6846,6 +6856,7 @@ mod tests {
         store
             .writer
             .upsert_page(NewPage {
+                source_session_id: None,
                 workspace_id: ws,
                 project_id: proj,
                 path: PagePath::new("notes/db-only-tool.md").unwrap(),
@@ -6966,6 +6977,7 @@ mod tests {
         store
             .writer
             .upsert_page(NewPage {
+                source_session_id: None,
                 workspace_id: ws,
                 project_id: product,
                 path: PagePath::new("product.md").unwrap(),
@@ -6984,6 +6996,7 @@ mod tests {
         store
             .writer
             .upsert_page(NewPage {
+                source_session_id: None,
                 workspace_id: practice_ws,
                 project_id: testing,
                 path: PagePath::new("patterns.md").unwrap(),
@@ -7002,6 +7015,7 @@ mod tests {
         store
             .writer
             .upsert_page(NewPage {
+                source_session_id: None,
                 workspace_id: ws,
                 project_id: hidden,
                 path: PagePath::new("hidden.md").unwrap(),
@@ -7098,6 +7112,7 @@ mod tests {
             store
                 .writer
                 .upsert_page(NewPage {
+                    source_session_id: None,
                     workspace_id: w,
                     project_id: p,
                     path: PagePath::new(path).unwrap(),
@@ -7117,6 +7132,7 @@ mod tests {
         store
             .writer
             .upsert_page(NewPage {
+                source_session_id: None,
                 workspace_id: ws,
                 project_id: other,
                 path: PagePath::new("expired.md").unwrap(),
@@ -7233,6 +7249,7 @@ mod tests {
             store
                 .writer
                 .upsert_page(NewPage {
+                    source_session_id: None,
                     workspace_id: w,
                     project_id: p,
                     path: PagePath::new(path).unwrap(),
@@ -7518,6 +7535,7 @@ mod tests {
             store
                 .writer
                 .upsert_page(NewPage {
+                    source_session_id: None,
                     workspace_id: w,
                     project_id: p,
                     path: PagePath::new(path).unwrap(),

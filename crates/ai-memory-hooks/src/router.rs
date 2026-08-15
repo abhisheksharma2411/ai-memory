@@ -2666,6 +2666,7 @@ async fn process_authorized(
         let page_id = state
             .wiki
             .write_page(ai_memory_wiki::WritePageRequest {
+                source_session_id: None,
                 workspace_id: new_page.workspace_id,
                 project_id: new_page.project_id,
                 path: new_page.path.clone(),
@@ -3028,6 +3029,7 @@ async fn consolidate_or_synth(
     state
         .wiki
         .write_page(ai_memory_wiki::WritePageRequest {
+            source_session_id: None,
             workspace_id: new_page.workspace_id,
             project_id: new_page.project_id,
             path: new_page.path,
@@ -8902,6 +8904,7 @@ mod tests {
         let page_id = state
             .wiki
             .write_page(ai_memory_wiki::WritePageRequest {
+                source_session_id: None,
                 workspace_id,
                 project_id,
                 path: page.path,
@@ -9633,6 +9636,7 @@ mod tests {
         pinned: bool,
     ) -> ai_memory_core::NewPage {
         ai_memory_core::NewPage {
+            source_session_id: None,
             workspace_id: ws,
             project_id: proj,
             path: ai_memory_core::PagePath::new(path).unwrap(),

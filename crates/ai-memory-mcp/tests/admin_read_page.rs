@@ -78,6 +78,7 @@ async fn read_page_falls_back_to_db_when_file_missing() {
     store
         .writer
         .upsert_page(NewPage {
+            source_session_id: None,
             workspace_id: ws,
             project_id: proj,
             path: PagePath::new("notes/db-only.md").unwrap(),
@@ -129,6 +130,7 @@ async fn read_page_serves_on_disk_page() {
     state
         .wiki
         .write_page(WritePageRequest {
+            source_session_id: None,
             workspace_id: ws,
             project_id: proj,
             path: PagePath::new("notes/on-disk.md").unwrap(),
@@ -179,6 +181,7 @@ async fn read_page_does_not_fall_back_when_disk_frontmatter_is_malformed() {
     state
         .wiki
         .write_page(WritePageRequest {
+            source_session_id: None,
             workspace_id: ws,
             project_id: proj,
             path: path.clone(),

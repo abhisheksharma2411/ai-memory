@@ -354,6 +354,7 @@ async fn write_report_page(
     let title = format!("Lint report {date}");
     let body = render_markdown(report);
     wiki.write_page(WritePageRequest {
+        source_session_id: None,
         workspace_id,
         project_id,
         path,

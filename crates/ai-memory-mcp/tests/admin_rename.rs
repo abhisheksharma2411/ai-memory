@@ -77,6 +77,7 @@ async fn seed_page(store: &Store, wiki: &Wiki, project: &str) -> String {
         .unwrap();
     let path = format!("notes/{project}.md");
     wiki.write_page(WritePageRequest {
+        source_session_id: None,
         workspace_id: ws,
         project_id: proj,
         path: PagePath::new(path.clone()).unwrap(),

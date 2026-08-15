@@ -2365,6 +2365,7 @@ mod tests {
         tier: Tier,
     ) {
         wiki.write_page(WritePageRequest {
+            source_session_id: None,
             workspace_id: ws,
             project_id: project,
             path: PagePath::new(path).unwrap(),
@@ -2676,6 +2677,7 @@ mod tests {
             .unwrap()
             .with_embedder(synthetic);
         wiki.write_page(WritePageRequest {
+            source_session_id: None,
             workspace_id: ws,
             project_id: proj,
             path: PagePath::new("notes/old-embedding.md").unwrap(),

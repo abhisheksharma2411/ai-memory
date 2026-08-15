@@ -2020,6 +2020,37 @@ impl ReaderPool {
         .await
     }
 
+    /// Whether ingest for this exact `(workspace, project, session)` must be
+    /// refused as terminal because the session was purged (#387).
+    ///
+    /// # Errors
+    /// Returns [`StoreError`] on pool or SQLite failure.
+    pub async fn is_session_purged(
+        &self,
+        workspace_id: WorkspaceId,
+        project_id: ProjectId,
+        session_id: SessionId,
+    ) -> StoreResult<bool> {
+        self.with_conn(move |conn| {
+            crate::session_purge::is_session_purged(conn, workspace_id, project_id, session_id)
+        })
+        .await
+    }
+
+    /// Why a purge would be destructive right now, if it would be: an open
+    /// session, a queued or running consolidation, or an outstanding
+    /// auto-improvement claim. `None` means the purge is safe to run.
+    ///
+    /// # Errors
+    /// Returns [`StoreError`] on pool or SQLite failure.
+    pub async fn session_purge_is_busy(
+        &self,
+        session_id: SessionId,
+    ) -> StoreResult<Option<String>> {
+        self.with_conn(move |conn| crate::session_purge::session_purge_is_busy(conn, session_id))
+            .await
+    }
+
     /// How a `SessionEnd` should treat its target session (issue #152).
     ///
     /// The old boolean ("is the session open?") conflated two very different

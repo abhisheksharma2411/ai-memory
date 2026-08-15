@@ -43,6 +43,7 @@ async fn write_slot(store: &Store, ws: WorkspaceId, proj: ProjectId, path: &str)
     store
         .writer
         .upsert_page(NewPage {
+            source_session_id: None,
             workspace_id: ws,
             project_id: proj,
             path: PagePath::new(path).unwrap(),
@@ -547,6 +548,7 @@ async fn expiry_and_slot_visibility_both_apply() {
         store
             .writer
             .upsert_page(NewPage {
+                source_session_id: None,
                 workspace_id: ws,
                 project_id: proj,
                 path: PagePath::new(path).unwrap(),

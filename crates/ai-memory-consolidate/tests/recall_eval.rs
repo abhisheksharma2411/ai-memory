@@ -127,6 +127,7 @@ async fn recall_at_5_baseline() {
 
     for (path, body) in CORPUS {
         wiki.write_page(WritePageRequest {
+            source_session_id: None,
             workspace_id: ws,
             project_id: proj,
             path: PagePath::new(path.to_string()).expect("path"),
@@ -186,6 +187,7 @@ async fn graph_neighbor_expansion_recovers_linked_page() {
     let wiki = Wiki::new(tmp.path(), store.writer.clone()).expect("wiki");
 
     wiki.write_page(WritePageRequest {
+        source_session_id: None,
         workspace_id: ws,
         project_id: proj,
         path: PagePath::new("notes/hidden_target.md").expect("path"),
@@ -201,6 +203,7 @@ async fn graph_neighbor_expansion_recovers_linked_page() {
     .await
     .expect("write target");
     wiki.write_page(WritePageRequest {
+        source_session_id: None,
         workspace_id: ws,
         project_id: proj,
         path: PagePath::new("notes/source.md").expect("path"),
@@ -272,6 +275,7 @@ async fn entity_stream_recovers_a_probe_fts_and_graph_both_miss() {
     let wiki = Wiki::new(tmp.path(), store.writer.clone()).expect("wiki");
 
     wiki.write_page(WritePageRequest {
+        source_session_id: None,
         workspace_id: ws,
         project_id: proj,
         path: PagePath::new("decisions/queue-choice.md").expect("path"),

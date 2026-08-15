@@ -63,6 +63,7 @@ async fn seed_page(state: &AdminState, store: &Store, path: &str, body: &str) {
     state
         .wiki
         .write_page(WritePageRequest {
+            source_session_id: None,
             workspace_id: ws,
             project_id: proj,
             path: PagePath::new(path).unwrap(),

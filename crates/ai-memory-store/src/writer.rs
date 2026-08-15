@@ -105,6 +105,12 @@ pub(crate) enum WriteCmd {
         summary_page_id: Option<PageId>,
         reply: oneshot::Sender<StoreResult<()>>,
     },
+    PurgeSession {
+        workspace_id: WorkspaceId,
+        project_id: ProjectId,
+        session_id: SessionId,
+        reply: oneshot::Sender<StoreResult<crate::session_purge::SessionPurgeReceipt>>,
+    },
     EndSessionWithHandoff {
         session_id: SessionId,
         summary_page_id: Option<PageId>,
@@ -580,6 +586,33 @@ impl WriterHandle {
         self.send(WriteCmd::EndSession {
             session_id,
             summary_page_id,
+            reply: tx,
+        })
+        .await?;
+        rx.await.map_err(|_| StoreError::WriterClosed)?
+    }
+
+    /// Permanently remove a session and everything derived from it, leaving
+    /// only a content-free tombstone (#387).
+    ///
+    /// The returned receipt names the wiki pages and pending auto-improvement
+    /// sidecars the caller must still remove from disk: the index is clean when
+    /// this returns, but the files and git history are not.
+    ///
+    /// # Errors
+    /// Returns [`StoreError::NotFound`] for an unknown session and
+    /// [`StoreError::InvalidState`] when the id belongs to another scope.
+    pub async fn purge_session(
+        &self,
+        workspace_id: WorkspaceId,
+        project_id: ProjectId,
+        session_id: SessionId,
+    ) -> StoreResult<crate::session_purge::SessionPurgeReceipt> {
+        let (tx, rx) = oneshot::channel();
+        self.send(WriteCmd::PurgeSession {
+            workspace_id,
+            project_id,
+            session_id,
             reply: tx,
         })
         .await?;
@@ -1801,6 +1834,20 @@ fn worker_loop(mut conn: Connection, mut rx: mpsc::Receiver<WriteCmd>) {
                 let result = ops::end_session(&mut conn, &session_id, summary_page_id.as_ref());
                 send_or_warn(reply, result, "end_session");
             }
+            WriteCmd::PurgeSession {
+                workspace_id,
+                project_id,
+                session_id,
+                reply,
+            } => {
+                let result = crate::session_purge::purge_session(
+                    &mut conn,
+                    workspace_id,
+                    project_id,
+                    session_id,
+                );
+                send_or_warn(reply, result, "purge_session");
+            }
             WriteCmd::EndSessionWithHandoff {
                 session_id,
                 summary_page_id,
@@ -2336,6 +2383,7 @@ mod tests {
 
     fn sample_page(ws: WorkspaceId, proj: ProjectId, path: &str, body: &str) -> NewPage {
         NewPage {
+            source_session_id: None,
             workspace_id: ws,
             project_id: proj,
             path: PagePath::new(path).unwrap(),

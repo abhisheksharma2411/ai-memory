@@ -401,6 +401,7 @@ impl Bootstrap {
             };
             written_paths.push(page.path.clone());
             requests.push(WritePageRequest {
+                source_session_id: None,
                 workspace_id: cfg.workspace_id,
                 project_id: cfg.project_id,
                 path,
@@ -426,6 +427,7 @@ impl Bootstrap {
             llm_chunks,
         });
         requests.push(WritePageRequest {
+            source_session_id: None,
             workspace_id: cfg.workspace_id,
             project_id: cfg.project_id,
             path: PagePath::new("bootstrap.md").expect("static path"),
