@@ -408,6 +408,16 @@ pub async fn run(config: &Config, args: ServeArgs) -> Result<()> {
     // operators discover misconfiguration immediately.
     let sanitizer = Sanitizer::new(&config.sanitize)
         .context("compiling sanitizer.extra_patterns from config")?;
+    // Finish any wiki-history purge interrupted mid-swap BEFORE the wiki is
+    // opened for business (#387). Serving first would let a reader observe the
+    // pre-purge history this is here to finish removing, and an error keeps the
+    // server from starting rather than quietly leaving deleted content
+    // recoverable.
+    if ai_memory_wiki::git_purge::recover_interrupted_purge(&config.data_dir)
+        .context("recovering an interrupted wiki history purge")?
+    {
+        tracing::warn!("resolved an interrupted wiki history purge during startup");
+    }
     let wiki = Wiki::new(&config.data_dir, store.writer.clone())?
         .with_sanitizer(sanitizer.clone())
         // Reader attached unconditionally: admission name-resolution uses it

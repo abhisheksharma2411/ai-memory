@@ -9,6 +9,7 @@ pub mod admission;
 mod atomic;
 mod error;
 mod git;
+pub mod git_purge;
 pub mod log_purge;
 mod markdown;
 pub mod migrations;

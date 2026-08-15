@@ -174,6 +174,31 @@ a hand edit cannot launder a page out of the purge's reach.
 - Refuses with `409` while the session is open, a consolidation is queued or
   running, or an auto-improvement claim is outstanding. `--force` overrides.
 
+**Git history.** Removing the file and committing would leave every earlier
+version reachable, and `restore-page` would hand one back. So the wiki
+repository is rebuilt without those paths and the old object database is
+physically destroyed — the content is gone from the ODB itself, not merely
+unreferenced. Properties worth knowing:
+
+- **History is preserved, not squashed.** Every commit is carried over minus
+  the purged paths; unrelated pages keep their full version history.
+- **Shared blobs are spared.** git stores one object for identical content, so
+  a blob a surviving page also uses is never destroyed.
+- **Verification precedes destruction.** The rebuilt repository is checked
+  against both the purged paths and the object database *before* the swap; a
+  failed check leaves the live repository exactly as it was.
+- **Interrupted swaps converge.** A durable journal is written across the swap
+  and resolved at the next startup, before the wiki is opened for business. If
+  the rebuilt repository was lost mid-swap, the old one is restored and the
+  server refuses to start until the purge is re-run — it will not quietly serve
+  content it claimed to have deleted.
+- **No residue.** No quarantine copy, `.bak`, old pack, or swap directory
+  remains in the data dir.
+
+If the history rebuild fails, the receipt carries a loud
+`GIT HISTORY NOT PURGED` warning: the rows are already gone, but earlier page
+versions remain recoverable until you re-run the command.
+
 **The tombstone.** The only permitted residue: scope, session UUID, purge time,
 schema version, and an audit-log id. No title, path, body, or count — a
 tombstone that quoted the session would defeat the deletion it records. It is

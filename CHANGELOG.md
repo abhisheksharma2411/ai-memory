@@ -27,6 +27,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   spending a retry attempt — and `purge-session` additionally sweeps the local
   `hook-spool` by exact session identity. Spools on other hosts cannot be
   reached by the CLI; the server-side tombstone is what refuses them (#387).
+- `purge-session` now removes the purged pages from the wiki's git history
+  itself, not just from the working tree. Deleting a file and committing left
+  every prior version reachable — and `restore-page` would hand one back — so
+  the repository is rebuilt without those paths and the old object database is
+  physically destroyed. History is preserved, not squashed; a blob shared with
+  a surviving page is spared; directories emptied by the purge are dropped; and
+  the rebuild is verified against both the paths and the object database before
+  anything destructive happens, so a failed verification leaves the live
+  repository untouched. An interrupted swap is completed from a durable journal
+  at the next startup, before the wiki is opened for business (#387).
 - Monthly log entries now record which session produced them, so
   `purge-session` removes exactly that session's lines and leaves every other
   session's intact. Entries written before this cannot be attributed to any

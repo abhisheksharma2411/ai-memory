@@ -5508,6 +5508,36 @@ async fn handle_purge_session(
         Err(e) => warnings.push(format!("could not purge monthly log entries: {e}")),
     }
 
+    // Strong deletion (#387): removing the file and committing would leave
+    // every prior version reachable in git history, and `restore-page` would
+    // hand one back. Rebuild the repository without those paths so the content
+    // is gone from the object database itself, not merely unreferenced.
+    //
+    // The wiki tree is shared, so paths are repo-relative: `<ws>/<proj>/<path>`.
+    let repo_paths: Vec<String> = receipt
+        .removed_pages
+        .iter()
+        .map(|path| format!("{ws_id}/{proj_id}/{}", path.as_str()))
+        .collect();
+    let git_report = if repo_paths.is_empty() {
+        ai_memory_wiki::git_purge::GitPurgeReport::default()
+    } else {
+        match ai_memory_wiki::git_purge::purge_paths_from_history(state.wiki.root(), &repo_paths) {
+            Ok(report) => report,
+            Err(e) => {
+                // The rows are already gone, so this cannot be rolled back —
+                // but it MUST be loud: history still holds the content, and an
+                // operator who believes otherwise has been misled.
+                warnings.push(format!(
+                    "GIT HISTORY NOT PURGED: {e}. The database rows are removed, but earlier \
+                     versions of the affected pages remain recoverable from wiki git history. \
+                     Re-run purge-session to retry."
+                ));
+                ai_memory_wiki::git_purge::GitPurgeReport::default()
+            }
+        }
+    };
+
     (
         StatusCode::OK,
         Json(
@@ -5531,6 +5561,9 @@ async fn handle_purge_session(
                     "auto_improve_proposal_events": receipt.counts.auto_improve_proposal_events,
                     "auto_improve_rejections": receipt.counts.auto_improve_rejections,
                     "page_versions": receipt.counts.page_versions,
+                    "git_repositories_rebuilt": git_report.repositories_rebuilt,
+                    "git_commits_rewritten": git_report.commits_rewritten,
+                    "git_blobs_destroyed": git_report.blobs_destroyed,
                 }),
                 backup_cutoff: receipt.backup_cutoff.to_string(),
                 warnings,
