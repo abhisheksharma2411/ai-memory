@@ -15,6 +15,7 @@
 //! proceed when any sibling `ai-memory` process is detected.
 
 use ai_memory_store::Store;
+use ai_memory_store::session_purge::SessionTombstone;
 use anyhow::{Context, Result, bail};
 use flate2::read::GzDecoder;
 use std::path::{Component, Path};
@@ -39,6 +40,9 @@ pub fn run(config: &Config, args: RestoreArgs) -> Result<()> {
     if !args.from.is_file() {
         bail!("source tarball {} not found", args.from.display());
     }
+
+    // Read the ledger BEFORE the overwrite destroys the database holding it.
+    let ledger = load_ledger(config, &args)?;
 
     let wiki = config.data_dir.join("wiki");
     let db = config.data_dir.join("db").join("memory.sqlite");
@@ -68,16 +72,89 @@ pub fn run(config: &Config, args: RestoreArgs) -> Result<()> {
         .with_context(|| format!("extracting into {}", config.data_dir.display()))?;
     info!(from = %args.from.display(), into = %config.data_dir.display(), "tarball extracted");
 
-    // Open + drop the store so refinery applies any pending migrations
-    // and the SQLite file is validated.
-    let _store = Store::open(&config.data_dir).context("opening restored store")?;
+    // Open the store so refinery applies any pending migrations and the SQLite
+    // file is validated.
+    let store = Store::open(&config.data_dir).context("opening restored store")?;
+
+    // Reapply the tombstone ledger BEFORE the restored state is available
+    // (#387). A snapshot taken before a purge contains everything that purge
+    // removed; restoring it without this silently resurrects deleted content,
+    // and the operator has no way to notice.
+    drop(store);
+    let reapplied = reapply_tombstones(config, &ledger)?;
+
     info!("restore complete");
     println!(
         "restored {} -> {}",
         args.from.display(),
         config.data_dir.display()
     );
+    if reapplied > 0 {
+        println!("re-purged {reapplied} session(s) the tombstone ledger says were deleted");
+    }
     Ok(())
+}
+
+/// Read the tombstone ledger that must survive this restore.
+///
+/// Prefers `--tombstones-from`, which is what makes restoring into a FRESH
+/// directory safe: there is no current database to carry a ledger over from, so
+/// without an explicit one a pre-purge snapshot cannot be declared a safe
+/// restoration.
+fn load_ledger(config: &Config, args: &RestoreArgs) -> Result<Vec<SessionTombstone>> {
+    let source = args
+        .tombstones_from
+        .clone()
+        .unwrap_or_else(|| config.data_dir.clone());
+    let db = source.join("db").join("memory.sqlite");
+    if args.tombstones_from.is_some() && !db.is_file() {
+        bail!(
+            "--tombstones-from {} has no db/memory.sqlite to read a tombstone ledger from",
+            source.display()
+        );
+    }
+    ai_memory_store::session_purge::read_ledger_from_db(&db)
+        .with_context(|| format!("reading the tombstone ledger from {}", db.display()))
+}
+
+/// Re-purge every session the ledger says was deleted but the snapshot brought
+/// back, then fail closed if any survives.
+fn reapply_tombstones(config: &Config, ledger: &[SessionTombstone]) -> Result<usize> {
+    if ledger.is_empty() {
+        return Ok(0);
+    }
+    let db = config.data_dir.join("db").join("memory.sqlite");
+    let repurged = ai_memory_store::session_purge::reapply_ledger(&db, ledger)
+        .context("reapplying the tombstone ledger to the restored database")?;
+
+    // The wiki files and git history came back with the snapshot too, so the
+    // filesystem layers must be reapplied, not just the rows.
+    let wiki_root = config.data_dir.join("wiki");
+    let mut repo_paths = Vec::new();
+    for session in &repurged {
+        for path in &session.repo_paths {
+            let _ = std::fs::remove_file(wiki_root.join(path));
+            repo_paths.push(path.clone());
+        }
+        info!(session = %session.session_id, pages = session.repo_paths.len(), "re-purged a resurrected session");
+    }
+    if !repo_paths.is_empty() {
+        ai_memory_wiki::git_purge::purge_paths_from_history(&wiki_root, &repo_paths)
+            .context("removing resurrected pages from restored wiki history")?;
+    }
+
+    // Fail closed: a restore that cannot prove the ledger holds is not a safe
+    // restoration, and reporting success would be worse than refusing.
+    let still_present = ai_memory_store::session_purge::count_resurrected(&db)
+        .context("verifying the restored state against the tombstone ledger")?;
+    if still_present > 0 {
+        bail!(
+            "restore aborted: {still_present} purged session(s) survive in the restored state. \
+             The data directory is NOT safe to serve."
+        );
+    }
+    info!(repurged = repurged.len(), "tombstone ledger reapplied");
+    Ok(repurged.len())
 }
 
 fn unpack_checked_archive<R: std::io::Read>(

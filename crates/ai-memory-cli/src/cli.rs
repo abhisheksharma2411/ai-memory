@@ -957,6 +957,15 @@ pub struct RestoreArgs {
     /// Overwrite an existing non-empty data dir.
     #[arg(long)]
     pub force: bool,
+    /// Data directory whose tombstone ledger governs this restore.
+    ///
+    /// A snapshot taken before a `purge-session` still contains everything that
+    /// purge removed. Restoring into the SAME directory carries its ledger over
+    /// automatically; restoring into a FRESH one has no ledger to carry, so
+    /// point this at the directory that holds the current one. Without it, a
+    /// pre-purge backup cannot be declared a safe restoration (#387).
+    #[arg(long, value_name = "PATH")]
+    pub tombstones_from: Option<PathBuf>,
 }
 
 /// Arguments for `checkpoints`.

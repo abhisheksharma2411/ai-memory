@@ -66,6 +66,16 @@ pub async fn run(config: &Config, _args: ReindexArgs) -> Result<()> {
         .reindex_all()
         .await
         .context("rebuilding index from wiki/")?;
+
+    // Reindex rebuilds pages from markdown, which cannot carry the relational
+    // provenance a purge relies on — so a session page whose file survived
+    // (restored from an old snapshot, say) would come back indexed. The
+    // tombstone ledger is the authority: drop anything it covers, by the
+    // deterministic `sessions/<uuid>.md` identity rather than by inspecting
+    // page text (#387).
+    let purged = drop_tombstoned_pages(config, &store, &wiki)
+        .await
+        .context("removing tombstoned pages after reindex")?;
     info!(
         workspaces = summary.workspaces,
         projects = summary.projects,
@@ -79,7 +89,59 @@ pub async fn run(config: &Config, _args: ReindexArgs) -> Result<()> {
         summary.workspaces,
         config.data_dir.join("wiki").display(),
     );
+    if purged > 0 {
+        println!("dropped {purged} page(s) covered by the session tombstone ledger");
+    }
     Ok(())
+}
+
+/// Remove pages the tombstone ledger says were purged, and their files.
+///
+/// Fails closed: if a tombstoned page cannot be removed, the reindex reports an
+/// error rather than leaving a rebuilt index that serves deleted content.
+async fn drop_tombstoned_pages(config: &Config, store: &Store, wiki: &Wiki) -> Result<usize> {
+    let db = store.db_path().to_path_buf();
+    let ledger = ai_memory_store::session_purge::read_ledger_from_db(&db)
+        .context("reading the tombstone ledger")?;
+    if ledger.is_empty() {
+        return Ok(0);
+    }
+    let mut removed = 0usize;
+    for tombstone in ledger {
+        let path = ai_memory_core::PagePath::new(format!("sessions/{}.md", tombstone.session_id))
+            .context("building the session page path")?;
+        let existed = store
+            .reader
+            .latest_page_id_by_ids(
+                tombstone.workspace_id,
+                tombstone.project_id,
+                path.as_str().to_string(),
+            )
+            .await
+            .context("looking up a tombstoned page")?
+            .is_some();
+        if !existed {
+            continue;
+        }
+        wiki.delete_page(
+            tombstone.workspace_id,
+            tombstone.project_id,
+            &path,
+            None,
+            None,
+        )
+        .await
+        .with_context(|| format!("removing tombstoned page {}", path.as_str()))?;
+        let abs = config
+            .data_dir
+            .join("wiki")
+            .join(tombstone.workspace_id.to_string())
+            .join(tombstone.project_id.to_string())
+            .join(path.as_str());
+        let _ = std::fs::remove_file(abs);
+        removed += 1;
+    }
+    Ok(removed)
 }
 
 #[cfg(test)]

@@ -22,6 +22,8 @@ use jiff::Timestamp;
 use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
 use uuid::Uuid;
 
+use tracing::warn;
+
 use crate::error::{StoreError, StoreResult};
 
 /// Contract version stamped on every tombstone this code writes.
@@ -255,6 +257,81 @@ pub fn purge_session(
     project_id: ProjectId,
     session_id: SessionId,
 ) -> StoreResult<SessionPurgeReceipt> {
+    // Zero freed pages as the delete proceeds. SQLite normally leaves deleted
+    // content in place and only marks the pages reusable, so without this the
+    // purged bytes stay legible in the database file — a "deletion" anyone with
+    // the file could read back. Restored below so ordinary writes keep their
+    // default (cheaper) behavior.
+    let previous_secure_delete: i32 = conn
+        .query_row("PRAGMA secure_delete", [], |row| row.get(0))
+        .unwrap_or(0);
+    conn.execute_batch("PRAGMA secure_delete = ON;")?;
+
+    let outcome = purge_session_inner(conn, workspace_id, project_id, session_id);
+
+    // Restore the pragma before propagating any error, so one failed purge does
+    // not silently change how the rest of the process deletes.
+    let _ = conn.execute_batch(&format!("PRAGMA secure_delete = {previous_secure_delete};"));
+    let receipt = outcome?;
+
+    reclaim_purged_bytes(conn);
+    Ok(receipt)
+}
+
+/// Make the deletion true of the FILES, not just of the tables.
+///
+/// Two residues survive an ordinary `DELETE`, and both were found by searching
+/// the data directory for a purged canary rather than by querying for it:
+///
+/// 1. **The write-ahead log.** Until a checkpoint runs, the deleted rows are
+///    still readable in `memory.sqlite-wal` — sitting beside the database and
+///    ready to be copied into the next backup.
+/// 2. **Freed pages in the database file.** `secure_delete` zeroes content as
+///    a delete proceeds, but pages freed by earlier writes (a superseded page
+///    version, say) keep their bytes until the file is rebuilt.
+/// 3. **FTS5 index segments.** An FTS5 delete is logical — it writes a delete
+///    marker and leaves the original terms in the existing segments. The index
+///    must be rebuilt from its content table or the purged text stays readable
+///    in the shadow tables.
+///
+/// Neither is fatal to correctness of the index, which is exactly why both are
+/// easy to miss: every query says the content is gone while the bytes are still
+/// on disk. Failures are logged rather than fatal — the rows ARE deleted, and
+/// refusing the whole purge over an incomplete vacuum would leave the operator
+/// worse off.
+fn reclaim_purged_bytes(conn: &Connection) {
+    // Rebuild the FTS indexes from their content tables. FTS5 deletes are
+    // LOGICAL: removing a row writes a delete marker and leaves the original
+    // terms inside the existing index segments until a merge happens to rewrite
+    // them. `MATCH` correctly returns nothing, which is exactly why this is easy
+    // to miss — the queries all say the content is gone while the purged text is
+    // still legible in `pages_fts_data` / `observations_fts_data`.
+    for table in ["pages_fts", "observations_fts"] {
+        if let Err(e) =
+            conn.execute_batch(&format!("INSERT INTO {table}({table}) VALUES('rebuild');"))
+        {
+            warn!(error = %e, table, "purge could not rebuild the FTS index; purged terms may remain in its segments");
+        }
+    }
+    if let Err(e) = conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);") {
+        warn!(error = %e, "purge could not truncate the WAL; purged bytes may remain in memory.sqlite-wal until the next checkpoint");
+    }
+    if let Err(e) = conn.execute_batch("VACUUM;") {
+        warn!(error = %e, "purge could not vacuum the database; purged bytes may remain in freed pages of memory.sqlite");
+    }
+    // VACUUM writes the rebuilt database through the WAL, so checkpoint again
+    // or the bytes it just reclaimed reappear in the log it wrote them through.
+    if let Err(e) = conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);") {
+        warn!(error = %e, "purge could not truncate the WAL after vacuum");
+    }
+}
+
+fn purge_session_inner(
+    conn: &mut Connection,
+    workspace_id: WorkspaceId,
+    project_id: ProjectId,
+    session_id: SessionId,
+) -> StoreResult<SessionPurgeReceipt> {
     // Immediate: the purge decides what to delete from rows it has read, so a
     // deferred transaction could upgrade mid-way and lose to a writer that
     // added derived rows in between.
@@ -437,6 +514,242 @@ pub fn purge_session(
         removed_proposal_sidecars: sidecars,
         warnings: Vec::new(),
     })
+}
+
+/// Every tombstone in this database, newest first.
+///
+/// A restore carries this ledger across the overwrite: without it, restoring a
+/// pre-purge snapshot silently resurrects everything a purge removed, and the
+/// operator has no way to know.
+///
+/// # Errors
+/// Returns [`StoreError`] on SQLite failure or a malformed stored row.
+pub fn all_tombstones(conn: &Connection) -> StoreResult<Vec<SessionTombstone>> {
+    let mut stmt = conn.prepare(
+        "SELECT session_id, workspace_id, project_id, tombstone_id, schema_version, purged_at \
+         FROM session_tombstones ORDER BY purged_at DESC",
+    )?;
+    let rows = stmt.query_map([], |row| {
+        Ok((
+            row.get::<_, Vec<u8>>(0)?,
+            row.get::<_, Vec<u8>>(1)?,
+            row.get::<_, Vec<u8>>(2)?,
+            row.get::<_, Vec<u8>>(3)?,
+            row.get::<_, i64>(4)?,
+            row.get::<_, i64>(5)?,
+        ))
+    })?;
+    let mut out = Vec::new();
+    for row in rows {
+        let (session, ws, proj, tombstone, schema_version, purged_at) = row?;
+        out.push(SessionTombstone {
+            session_id: SessionId::from_slice(&session)?,
+            workspace_id: WorkspaceId::from_slice(&ws)?,
+            project_id: ProjectId::from_slice(&proj)?,
+            tombstone_id: uuid_from_slice(&tombstone)?,
+            schema_version,
+            purged_at: Timestamp::from_microsecond(purged_at)
+                .map_err(|e| StoreError::InvalidState(format!("tombstone timestamp: {e}")))?,
+        });
+    }
+    Ok(out)
+}
+
+/// Insert tombstones carried over from another database, keeping any already
+/// present.
+///
+/// Used by restore: the ledger is imported BEFORE the restored state is made
+/// available, so a session purged after the snapshot was taken is re-purged
+/// rather than served.
+///
+/// Returns the number of rows newly inserted.
+///
+/// # Errors
+/// Returns [`StoreError`] on SQLite failure.
+pub fn import_tombstones(
+    conn: &mut Connection,
+    tombstones: &[SessionTombstone],
+) -> StoreResult<usize> {
+    let tx = conn.transaction()?;
+    let mut inserted = 0usize;
+    for tombstone in tombstones {
+        // The scope rows may not exist in the restored database (the project
+        // could have been purged too), so the ledger is inserted without
+        // requiring them — a tombstone must never be droppable by a cascade.
+        let affected = tx.execute(
+            "INSERT OR IGNORE INTO session_tombstones \
+             (session_id, workspace_id, project_id, tombstone_id, schema_version, purged_at, audit_id) \
+             SELECT ?1, ?2, ?3, ?4, ?5, ?6, NULL \
+             WHERE EXISTS (SELECT 1 FROM workspaces WHERE id = ?2) \
+               AND EXISTS (SELECT 1 FROM projects WHERE id = ?3)",
+            params![
+                tombstone.session_id.as_bytes(),
+                tombstone.workspace_id.as_bytes(),
+                tombstone.project_id.as_bytes(),
+                tombstone.tombstone_id.as_bytes(),
+                tombstone.schema_version,
+                tombstone.purged_at.as_microsecond(),
+            ],
+        )?;
+        inserted += affected;
+    }
+    tx.commit()?;
+    Ok(inserted)
+}
+
+/// Session ids that a tombstone covers but whose rows are still present.
+///
+/// After a restore this is the work list: each one is a session the ledger says
+/// was deleted and the restored snapshot brought back. An empty result is the
+/// fail-closed check that the restore is safe to expose.
+///
+/// # Errors
+/// Returns [`StoreError`] on SQLite failure or a malformed stored row.
+pub fn resurrected_sessions(conn: &Connection) -> StoreResult<Vec<SessionTombstone>> {
+    Ok(all_tombstones(conn)?
+        .into_iter()
+        .filter(|tombstone| {
+            conn.query_row(
+                "SELECT 1 FROM sessions WHERE id = ?1",
+                params![tombstone.session_id.as_bytes()],
+                |_| Ok(()),
+            )
+            .optional()
+            .ok()
+            .flatten()
+            .is_some()
+        })
+        .collect())
+}
+
+/// Purge a session whose rows came back with a restored snapshot.
+///
+/// Distinct from [`purge_session`] because the tombstone already exists: the
+/// ordinary path would short-circuit on it and report `AlreadyPurged` without
+/// removing the resurrected rows.
+///
+/// # Errors
+/// Returns [`StoreError`] on SQLite failure.
+pub fn repurge_tombstoned_session(
+    conn: &mut Connection,
+    tombstone: &SessionTombstone,
+) -> StoreResult<SessionPurgeReceipt> {
+    // Drop the ledger row, run the ordinary purge, then restore the ORIGINAL
+    // tombstone id and time: the receipt an operator already holds must keep
+    // identifying this deletion.
+    conn.execute(
+        "DELETE FROM session_tombstones WHERE session_id = ?1",
+        params![tombstone.session_id.as_bytes()],
+    )?;
+    let mut receipt = purge_session(
+        conn,
+        tombstone.workspace_id,
+        tombstone.project_id,
+        tombstone.session_id,
+    )?;
+    conn.execute(
+        "UPDATE session_tombstones SET tombstone_id = ?2, purged_at = ?3 WHERE session_id = ?1",
+        params![
+            tombstone.session_id.as_bytes(),
+            tombstone.tombstone_id.as_bytes(),
+            tombstone.purged_at.as_microsecond(),
+        ],
+    )?;
+    receipt.tombstone_id = tombstone.tombstone_id;
+    receipt.purged_at = tombstone.purged_at;
+    Ok(receipt)
+}
+
+/// Read the tombstone ledger from a database file directly.
+///
+/// Restore runs with the server stopped, so it uses a plain connection rather
+/// than the writer actor: there is no concurrent writer to serialize against,
+/// and the ledger must be read before the actor's database is overwritten.
+///
+/// A database that predates the ledger (no `session_tombstones` table) yields
+/// an empty ledger rather than an error, so restoring an old backup still works.
+///
+/// # Errors
+/// Returns [`StoreError`] when the file exists but cannot be read.
+pub fn read_ledger_from_db(db_path: &std::path::Path) -> StoreResult<Vec<SessionTombstone>> {
+    if !db_path.is_file() {
+        return Ok(Vec::new());
+    }
+    let conn = Connection::open(db_path)?;
+    let has_table: Option<i64> = conn
+        .query_row(
+            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'session_tombstones'",
+            [],
+            |row| row.get(0),
+        )
+        .optional()?;
+    if has_table.is_none() {
+        return Ok(Vec::new());
+    }
+    all_tombstones(&conn)
+}
+
+/// One session that a restore brought back and this call removed again.
+#[derive(Debug, Clone)]
+pub struct RepurgedSession {
+    /// The session the ledger said was deleted.
+    pub session_id: SessionId,
+    /// Wiki paths, relative to the wiki root, whose files and history the
+    /// caller must still remove. Scoped `<workspace>/<project>/<page path>`
+    /// because that is how they sit in the shared wiki tree.
+    pub repo_paths: Vec<String>,
+}
+
+/// Import `ledger` into the restored database and re-purge anything it covers
+/// that came back with the snapshot.
+///
+/// Returns what was re-purged, so the caller can reapply the filesystem and git
+/// layers the snapshot also restored.
+///
+/// # Errors
+/// Returns [`StoreError`] on SQLite failure. A non-empty
+/// [`resurrected_sessions`] result after this returns means the restore is NOT
+/// safe to expose and the caller must refuse.
+pub fn reapply_ledger(
+    db_path: &std::path::Path,
+    ledger: &[SessionTombstone],
+) -> StoreResult<Vec<RepurgedSession>> {
+    let mut conn = Connection::open(db_path)?;
+    conn.pragma_update(None, "foreign_keys", "ON")?;
+    import_tombstones(&mut conn, ledger)?;
+
+    let mut repurged = Vec::new();
+    for tombstone in resurrected_sessions(&conn)? {
+        let receipt = repurge_tombstoned_session(&mut conn, &tombstone)?;
+        repurged.push(RepurgedSession {
+            session_id: tombstone.session_id,
+            repo_paths: receipt
+                .removed_pages
+                .iter()
+                .map(|page| {
+                    format!(
+                        "{}/{}/{}",
+                        tombstone.workspace_id,
+                        tombstone.project_id,
+                        page.as_str()
+                    )
+                })
+                .collect(),
+        });
+    }
+    Ok(repurged)
+}
+
+/// How many purged sessions still have rows in this database.
+///
+/// The fail-closed check a restore runs last: anything other than zero means
+/// the restored state serves content the ledger says was deleted.
+///
+/// # Errors
+/// Returns [`StoreError`] on SQLite failure.
+pub fn count_resurrected(db_path: &std::path::Path) -> StoreResult<usize> {
+    let conn = Connection::open(db_path)?;
+    Ok(resurrected_sessions(&conn)?.len())
 }
 
 fn collect_blob_ids(
