@@ -199,6 +199,41 @@ If the history rebuild fails, the receipt carries a loud
 `GIT HISTORY NOT PURGED` warning: the rows are already gone, but earlier page
 versions remain recoverable until you re-run the command.
 
+**The database files.** Deleting rows is not enough to make the bytes go away,
+and each of these was found by searching the data directory for a purged canary
+rather than by querying for it:
+
+- **FTS5 index segments.** An FTS5 delete is *logical*: it writes a delete
+  marker and leaves the original terms in the existing segments. `MATCH`
+  correctly returns nothing while the purged text stays readable in
+  `pages_fts_data` / `observations_fts_data`. The indexes are rebuilt from
+  their content tables.
+- **The write-ahead log.** Until a checkpoint runs, the deleted rows remain
+  readable in `memory.sqlite-wal`, beside the database and ready to be copied
+  into the next backup.
+- **Freed pages.** `secure_delete` zeroes content as the delete proceeds, and a
+  vacuum reclaims pages freed by earlier writes.
+
+If any of these cannot complete, the purge logs a warning rather than failing:
+the rows are genuinely deleted, and refusing the whole operation over an
+incomplete vacuum would leave you worse off.
+
+**Shared files and commit messages.** The monthly log belongs to every session
+that wrote that month, so its path is kept and each historical version is
+rewritten with only the purged session's marked lines removed. Commit messages
+embed the session's own prompt text, so commits attributed to it are redacted,
+matched by its short-id handle rather than by searching text.
+
+**Restore and reindex.** A snapshot taken before a purge contains everything
+that purge removed. `restore` therefore reads the tombstone ledger *before* the
+overwrite destroys it, reapplies it to the restored state, and **fails closed**
+if any purged session survives — a restore that cannot prove the ledger holds
+is not a safe restoration. Restoring into a fresh directory has no ledger of its
+own, so pass `--tombstones-from <path>` pointing at the directory that holds the
+current one. `reindex` drops pages the ledger covers by their deterministic
+`sessions/<uuid>.md` identity, because markdown rebuilt from disk cannot carry
+the relational provenance a purge relies on.
+
 **The tombstone.** The only permitted residue: scope, session UUID, purge time,
 schema version, and an audit-log id. No title, path, body, or count — a
 tombstone that quoted the session would defeat the deletion it records. It is
