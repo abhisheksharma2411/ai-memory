@@ -69,6 +69,42 @@ enum JournalState {
     Swapping,
 }
 
+/// What a history purge must remove, and how.
+///
+/// Three distinct kinds of residue, because the naive "delete these paths" only
+/// covers the first — and a live end-to-end run is what surfaced the other two:
+///
+/// 1. **Whole paths**, e.g. the session's own pages: removed from every commit.
+/// 2. **Shared files**, e.g. the monthly log: the file belongs to every session
+///    that wrote to it, so removing the path would destroy other sessions'
+///    history. Instead each historical version is rewritten with the purged
+///    session's marked lines removed.
+/// 3. **Commit messages**, which embed the session's own prompt text. The
+///    rebuilt commit carries the message verbatim unless it is redacted.
+#[derive(Debug, Clone, Default)]
+pub struct HistoryPurgeSpec {
+    /// Repo-relative paths removed from every commit outright.
+    pub doomed_paths: Vec<String>,
+    /// Repo-relative paths kept, with `line_marker` lines scrubbed from every
+    /// historical version.
+    pub scrub_paths: Vec<String>,
+    /// Marker identifying the purged session's lines inside a scrubbed file.
+    /// Empty disables line scrubbing.
+    pub line_marker: String,
+    /// Commit-message prefix identifying commits this session produced, e.g.
+    /// `session 11111111`. Matched as an identity handle, never as free text.
+    /// Empty disables message redaction.
+    pub commit_prefix: String,
+}
+
+impl HistoryPurgeSpec {
+    /// Whether this spec would change anything.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.doomed_paths.is_empty() && self.scrub_paths.is_empty()
+    }
+}
+
 /// What a history purge removed.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct GitPurgeReport {
@@ -84,6 +120,11 @@ pub struct GitPurgeReport {
     pub blobs_destroyed: usize,
     /// Repositories rebuilt (0 when there was no history to rewrite, else 1).
     pub repositories_rebuilt: usize,
+    /// Historical versions of shared files rewritten to drop the purged
+    /// session's lines.
+    pub blobs_scrubbed: usize,
+    /// Commit messages redacted because they carried the session's own text.
+    pub messages_redacted: usize,
 }
 
 fn git_err(e: git2::Error) -> WikiError {
@@ -108,10 +149,14 @@ fn purge_err(msg: impl Into<String>) -> WikiError {
 /// Returns [`WikiError`] if the repository cannot be read, the rebuild fails
 /// verification, or the swap cannot be completed. On a verification failure the
 /// live repository is left untouched.
-pub fn purge_paths_from_history(root: &Path, paths: &[String]) -> WikiResult<GitPurgeReport> {
-    if paths.is_empty() {
+pub fn purge_paths_from_history(
+    root: &Path,
+    spec: &HistoryPurgeSpec,
+) -> WikiResult<GitPurgeReport> {
+    if spec.is_empty() {
         return Ok(GitPurgeReport::default());
     }
+    let paths = &spec.doomed_paths;
     let doomed: HashSet<&str> = paths.iter().map(String::as_str).collect();
     let repo = Repository::open(root).map_err(git_err)?;
 
@@ -133,7 +178,14 @@ pub fn purge_paths_from_history(root: &Path, paths: &[String]) -> WikiResult<Git
     let _ = std::fs::remove_dir_all(&scratch);
     let _ = std::fs::remove_dir_all(&retired);
 
-    let report = build_replacement(&repo, &scratch, &doomed, objects_before, &doomed_blobs);
+    let report = build_replacement(
+        &repo,
+        &scratch,
+        &doomed,
+        spec,
+        objects_before,
+        &doomed_blobs,
+    );
     let mut report = match report {
         Ok(report) => report,
         Err(e) => {
@@ -144,7 +196,7 @@ pub fn purge_paths_from_history(root: &Path, paths: &[String]) -> WikiResult<Git
 
     // Verify BEFORE anything destructive: a failure here must leave the live
     // repository exactly as it was.
-    if let Err(e) = verify_replacement(&scratch, &doomed, &doomed_blobs) {
+    if let Err(e) = verify_replacement(&scratch, &doomed, spec, &doomed_blobs) {
         let _ = std::fs::remove_dir_all(&scratch);
         return Err(e);
     }
@@ -363,6 +415,7 @@ fn build_replacement(
     repo: &Repository,
     scratch: &Path,
     doomed: &HashSet<&str>,
+    spec: &HistoryPurgeSpec,
     objects_before: usize,
     doomed_blobs: &HashSet<Oid>,
 ) -> WikiResult<GitPurgeReport> {
@@ -378,15 +431,27 @@ fn build_replacement(
     walk.set_sorting(git2::Sort::TOPOLOGICAL | git2::Sort::REVERSE)
         .map_err(git_err)?;
 
+    let scrub: HashSet<&str> = spec.scrub_paths.iter().map(String::as_str).collect();
     let mut remapped: HashMap<Oid, Oid> = HashMap::new();
     let mut commits_rewritten = 0usize;
+    let mut blobs_scrubbed = 0usize;
+    let mut messages_redacted = 0usize;
     let mut last_new = None;
 
     for oid in walk {
         let oid = oid.map_err(git_err)?;
         let commit = repo.find_commit(oid).map_err(git_err)?;
         let tree = commit.tree().map_err(git_err)?;
-        let new_tree_oid = copy_tree_without(repo, &new_repo, &tree, "", doomed)?;
+        let new_tree_oid = copy_tree_without(
+            repo,
+            &new_repo,
+            &tree,
+            "",
+            doomed,
+            &scrub,
+            &spec.line_marker,
+            &mut blobs_scrubbed,
+        )?;
         let new_tree = new_repo.find_tree(new_tree_oid).map_err(git_err)?;
 
         let parents: Vec<_> = commit
@@ -400,12 +465,26 @@ fn build_replacement(
             .map_err(git_err)?;
         let parent_refs: Vec<&git2::Commit<'_>> = parent_commits.iter().collect();
 
+        // A commit message embeds the session's own prompt text, so a rebuilt
+        // commit would carry the purged content in plain sight. Matched by the
+        // session's short-id handle rather than by searching the text.
+        let original = commit.message().unwrap_or("");
+        let message = if !spec.commit_prefix.is_empty()
+            && original
+                .trim_start()
+                .starts_with(spec.commit_prefix.as_str())
+        {
+            messages_redacted += 1;
+            format!("{} (purged)", spec.commit_prefix)
+        } else {
+            original.to_string()
+        };
         let new_oid = new_repo
             .commit(
                 None,
                 &commit.author(),
                 &commit.committer(),
-                commit.message().unwrap_or(""),
+                &message,
                 &new_tree,
                 &parent_refs,
             )
@@ -451,16 +530,22 @@ fn build_replacement(
         objects_after,
         blobs_destroyed: 0,
         repositories_rebuilt: 0,
+        blobs_scrubbed,
+        messages_redacted,
     })
 }
 
 /// Copy `tree` into `dest`, omitting any entry whose full path is doomed.
+#[allow(clippy::too_many_arguments)]
 fn copy_tree_without(
     src: &Repository,
     dest: &Repository,
     tree: &git2::Tree<'_>,
     prefix: &str,
     doomed: &HashSet<&str>,
+    scrub: &HashSet<&str>,
+    line_marker: &str,
+    scrubbed: &mut usize,
 ) -> WikiResult<Oid> {
     let mut builder = dest.treebuilder(None).map_err(git_err)?;
     for entry in tree.iter() {
@@ -470,7 +555,16 @@ fn copy_tree_without(
             Some(git2::ObjectType::Tree) => {
                 let subtree = src.find_tree(entry.id()).map_err(git_err)?;
                 let sub_prefix = format!("{full}/");
-                let new_sub = copy_tree_without(src, dest, &subtree, &sub_prefix, doomed)?;
+                let new_sub = copy_tree_without(
+                    src,
+                    dest,
+                    &subtree,
+                    &sub_prefix,
+                    doomed,
+                    scrub,
+                    line_marker,
+                    scrubbed,
+                )?;
                 // Drop directories that became empty, so a purge cannot leave
                 // an empty shell where a session's pages used to live.
                 let new_tree = dest.find_tree(new_sub).map_err(git_err)?;
@@ -485,7 +579,26 @@ fn copy_tree_without(
                     continue;
                 }
                 let blob = src.find_blob(entry.id()).map_err(git_err)?;
-                let new_id = dest.blob(blob.content()).map_err(git_err)?;
+                // A shared file (the monthly log) belongs to every session that
+                // wrote to it, so the path must survive while THIS session's
+                // marked lines are removed from every historical version.
+                let content = if scrub.contains(full.as_str()) && !line_marker.is_empty() {
+                    let text = String::from_utf8_lossy(blob.content());
+                    if text.contains(line_marker) {
+                        *scrubbed += 1;
+                        let kept: String = text
+                            .lines()
+                            .filter(|line| !line.contains(line_marker))
+                            .map(|line| format!("{line}\n"))
+                            .collect();
+                        kept.into_bytes()
+                    } else {
+                        blob.content().to_vec()
+                    }
+                } else {
+                    blob.content().to_vec()
+                };
+                let new_id = dest.blob(&content).map_err(git_err)?;
                 builder
                     .insert(name, new_id, entry.filemode())
                     .map_err(git_err)?;
@@ -510,6 +623,7 @@ fn copy_tree_without(
 fn verify_replacement(
     scratch: &Path,
     doomed: &HashSet<&str>,
+    spec: &HistoryPurgeSpec,
     doomed_blobs: &HashSet<Oid>,
 ) -> WikiResult<()> {
     let repo = Repository::open(scratch).map_err(git_err)?;
@@ -561,6 +675,39 @@ fn verify_replacement(
             "git purge: rebuilt object database still contains purged blob {oid}"
         )));
     }
+
+    // 3. No object anywhere may still carry the session's line marker, and no
+    //    commit message may still be attributed to it. Checked across the whole
+    //    database rather than only reachable objects, for the same reason as
+    //    above: an unreachable copy is still a copy.
+    if !spec.line_marker.is_empty() || !spec.commit_prefix.is_empty() {
+        let mut offender = None;
+        odb.foreach(|oid| {
+            let Ok(obj) = odb.read(*oid) else {
+                return true;
+            };
+            let carries_marker = !spec.line_marker.is_empty()
+                && matches!(obj.kind(), git2::ObjectType::Blob)
+                && String::from_utf8_lossy(obj.data()).contains(spec.line_marker.as_str());
+            let carries_attribution = !spec.commit_prefix.is_empty()
+                && matches!(obj.kind(), git2::ObjectType::Commit)
+                && String::from_utf8_lossy(obj.data())
+                    .contains(&format!("{} ", spec.commit_prefix))
+                && !String::from_utf8_lossy(obj.data())
+                    .contains(&format!("{} (purged)", spec.commit_prefix));
+            if carries_marker || carries_attribution {
+                offender = Some(*oid);
+                return false;
+            }
+            true
+        })
+        .map_err(git_err)?;
+        if let Some(oid) = offender {
+            return Err(purge_err(format!(
+                "git purge: rebuilt object database still attributes content to the purged session ({oid})"
+            )));
+        }
+    }
     Ok(())
 }
 
@@ -593,6 +740,13 @@ mod tests {
     /// database is unambiguous evidence the deletion failed.
     const DOOMED_CANARY: &str = "doomed-canary-4b7e91";
     const KEPT_CANARY: &str = "kept-canary-2f8c03";
+
+    fn doomed_spec() -> HistoryPurgeSpec {
+        HistoryPurgeSpec {
+            doomed_paths: vec!["sessions/doomed.md".to_string()],
+            ..Default::default()
+        }
+    }
 
     struct Fixture {
         _tmp: tempfile::TempDir,
@@ -684,8 +838,7 @@ mod tests {
         let fx = fixture();
         assert!(canary_in_any_object(&fx.root, DOOMED_CANARY));
 
-        let report =
-            purge_paths_from_history(&fx.root, &["sessions/doomed.md".to_string()]).unwrap();
+        let report = purge_paths_from_history(&fx.root, &doomed_spec()).unwrap();
 
         assert_eq!(report.repositories_rebuilt, 1);
         assert_eq!(
@@ -709,7 +862,7 @@ mod tests {
     #[test]
     fn purge_leaves_no_scratch_or_retired_directory_behind() {
         let fx = fixture();
-        purge_paths_from_history(&fx.root, &["sessions/doomed.md".to_string()]).unwrap();
+        purge_paths_from_history(&fx.root, &doomed_spec()).unwrap();
         assert_eq!(
             leftover_scratch_dirs(&fx.root),
             Vec::<PathBuf>::new(),
@@ -724,7 +877,7 @@ mod tests {
     #[test]
     fn purge_preserves_history_and_the_surviving_pages_content() {
         let fx = fixture();
-        purge_paths_from_history(&fx.root, &["sessions/doomed.md".to_string()]).unwrap();
+        purge_paths_from_history(&fx.root, &doomed_spec()).unwrap();
 
         let repo = Repository::open(&fx.root).unwrap();
         let mut walk = repo.revwalk().unwrap();
@@ -759,7 +912,7 @@ mod tests {
             "shared content",
         );
 
-        let report = purge_paths_from_history(&root, &["sessions/doomed.md".to_string()]).unwrap();
+        let report = purge_paths_from_history(&root, &doomed_spec()).unwrap();
         assert_eq!(
             report.blobs_destroyed, 0,
             "a blob the surviving page also uses must be spared"
@@ -785,7 +938,7 @@ mod tests {
     #[test]
     fn purge_drops_directories_it_empties() {
         let fx = fixture();
-        purge_paths_from_history(&fx.root, &["sessions/doomed.md".to_string()]).unwrap();
+        purge_paths_from_history(&fx.root, &doomed_spec()).unwrap();
         let repo = Repository::open(&fx.root).unwrap();
         let tree = repo
             .head()
@@ -800,10 +953,96 @@ mod tests {
         );
     }
 
+    /// Regression for two residues that fixtures with generic commit messages
+    /// and no shared files could never surface — a live end-to-end run did.
+    ///
+    /// The monthly log belongs to EVERY session that wrote that month, so
+    /// removing its path would destroy the other sessions' history. Its
+    /// historical versions must instead be rewritten without the purged
+    /// session's marked lines. And a commit message embeds the session's own
+    /// prompt text, so the rebuilt commit carries the purged content in plain
+    /// sight unless it is redacted.
+    #[test]
+    fn purge_scrubs_shared_log_history_and_redacts_commit_messages() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let root = tmp.path().join("wiki");
+        std::fs::create_dir_all(&root).unwrap();
+        let repo = Repository::init(&root).unwrap();
+
+        let marker_a = "<!-- ai-memory:session=11111111 -->";
+        let marker_b = "<!-- ai-memory:session=22222222 -->";
+        // Version 1 of the log holds A's line...
+        commit(
+            &repo,
+            &root,
+            &[(
+                "log-2026-08.md",
+                &format!("## [t1] user-prompt | {DOOMED_CANARY} {marker_a}\n"),
+            )],
+            &format!("session 11111111: {DOOMED_CANARY}"),
+        );
+        // ...and version 2 adds B's, so the file is genuinely shared.
+        commit(
+            &repo,
+            &root,
+            &[(
+                "log-2026-08.md",
+                &format!(
+                    "## [t1] user-prompt | {DOOMED_CANARY} {marker_a}\n\
+                     ## [t2] user-prompt | {KEPT_CANARY} {marker_b}\n"
+                ),
+            )],
+            &format!("session 22222222: {KEPT_CANARY}"),
+        );
+
+        let spec = HistoryPurgeSpec {
+            doomed_paths: Vec::new(),
+            scrub_paths: vec!["log-2026-08.md".to_string()],
+            line_marker: marker_a.to_string(),
+            commit_prefix: "session 11111111".to_string(),
+        };
+        let report = purge_paths_from_history(&root, &spec).unwrap();
+
+        assert!(
+            report.blobs_scrubbed >= 2,
+            "both log versions must be rewritten"
+        );
+        assert_eq!(
+            report.messages_redacted, 1,
+            "A's commit message must be redacted"
+        );
+        assert!(
+            !canary_in_any_object(&root, DOOMED_CANARY),
+            "A's text must not survive in ANY object — log blob or commit message"
+        );
+        assert!(
+            canary_in_any_object(&root, KEPT_CANARY),
+            "B's log line and commit message must survive"
+        );
+
+        // The shared file itself must still exist, with B's line intact.
+        let repo = Repository::open(&root).unwrap();
+        let tree = repo
+            .head()
+            .unwrap()
+            .peel_to_commit()
+            .unwrap()
+            .tree()
+            .unwrap();
+        let entry = tree.get_path(Path::new("log-2026-08.md")).unwrap();
+        let body = repo.find_blob(entry.id()).unwrap();
+        let body = String::from_utf8_lossy(body.content());
+        assert!(
+            body.contains(KEPT_CANARY),
+            "the shared log must keep B: {body}"
+        );
+        assert!(!body.contains(marker_a), "and lose A: {body}");
+    }
+
     #[test]
     fn purging_nothing_is_a_no_op() {
         let fx = fixture();
-        let report = purge_paths_from_history(&fx.root, &[]).unwrap();
+        let report = purge_paths_from_history(&fx.root, &HistoryPurgeSpec::default()).unwrap();
         assert_eq!(report, GitPurgeReport::default());
         assert!(canary_in_any_object(&fx.root, DOOMED_CANARY));
     }
@@ -820,7 +1059,15 @@ mod tests {
         let purge_id = "deadbeefdeadbeef".to_string();
         let scratch = fx.root.join(format!("{SCRATCH_PREFIX}new-{purge_id}"));
         let retired = fx.root.join(format!("{SCRATCH_PREFIX}old-{purge_id}"));
-        build_replacement(&repo, &scratch, &doomed, objects_before, &doomed_blobs).unwrap();
+        build_replacement(
+            &repo,
+            &scratch,
+            &doomed,
+            &doomed_spec(),
+            objects_before,
+            &doomed_blobs,
+        )
+        .unwrap();
         drop(repo);
 
         // Simulate the crash: journal says Swapping, old .git moved aside,

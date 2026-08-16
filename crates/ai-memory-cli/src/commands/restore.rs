@@ -139,7 +139,11 @@ fn reapply_tombstones(config: &Config, ledger: &[SessionTombstone]) -> Result<us
         info!(session = %session.session_id, pages = session.repo_paths.len(), "re-purged a resurrected session");
     }
     if !repo_paths.is_empty() {
-        ai_memory_wiki::git_purge::purge_paths_from_history(&wiki_root, &repo_paths)
+        let spec = ai_memory_wiki::git_purge::HistoryPurgeSpec {
+            doomed_paths: repo_paths,
+            ..Default::default()
+        };
+        ai_memory_wiki::git_purge::purge_paths_from_history(&wiki_root, &spec)
             .context("removing resurrected pages from restored wiki history")?;
     }
 

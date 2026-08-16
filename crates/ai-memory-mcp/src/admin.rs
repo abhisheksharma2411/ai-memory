@@ -5399,6 +5399,29 @@ pub struct PurgeSessionReceipt {
     pub warnings: Vec<String>,
 }
 
+/// Repo-relative paths of a project's monthly logs.
+///
+/// Shared files: every session that wrote during that month has entries in
+/// them, so a purge scrubs its own marked lines rather than removing the path.
+fn monthly_log_paths(
+    wiki: &Wiki,
+    workspace_id: ai_memory_core::WorkspaceId,
+    project_id: ai_memory_core::ProjectId,
+) -> Vec<String> {
+    let root = wiki.project_root(workspace_id, project_id);
+    let Ok(entries) = std::fs::read_dir(&root) else {
+        return Vec::new();
+    };
+    entries
+        .flatten()
+        .filter_map(|entry| {
+            let name = entry.file_name().to_string_lossy().into_owned();
+            (name.starts_with("log-") && name.ends_with(".md"))
+                .then(|| format!("{workspace_id}/{project_id}/{name}"))
+        })
+        .collect()
+}
+
 async fn handle_purge_session(
     State(state): State<Arc<AdminState>>,
     author_ext: Option<axum::Extension<ai_memory_core::UserId>>,
@@ -5519,10 +5542,21 @@ async fn handle_purge_session(
         .iter()
         .map(|path| format!("{ws_id}/{proj_id}/{}", path.as_str()))
         .collect();
-    let git_report = if repo_paths.is_empty() {
+    // The monthly log is shared with every other session that wrote to it, so
+    // its path must survive while THIS session's marked lines are scrubbed from
+    // every historical version. Commit messages embed the session's own prompt
+    // text and are matched by its short-id handle.
+    let session_text = session_id.to_string();
+    let spec = ai_memory_wiki::git_purge::HistoryPurgeSpec {
+        doomed_paths: repo_paths.clone(),
+        scrub_paths: monthly_log_paths(&state.wiki, ws_id, proj_id),
+        line_marker: ai_memory_wiki::log_purge::session_marker(session_id),
+        commit_prefix: format!("session {}", &session_text[..8]),
+    };
+    let git_report = if spec.is_empty() {
         ai_memory_wiki::git_purge::GitPurgeReport::default()
     } else {
-        match ai_memory_wiki::git_purge::purge_paths_from_history(state.wiki.root(), &repo_paths) {
+        match ai_memory_wiki::git_purge::purge_paths_from_history(state.wiki.root(), &spec) {
             Ok(report) => report,
             Err(e) => {
                 // The rows are already gone, so this cannot be rolled back —
@@ -5564,6 +5598,8 @@ async fn handle_purge_session(
                     "git_repositories_rebuilt": git_report.repositories_rebuilt,
                     "git_commits_rewritten": git_report.commits_rewritten,
                     "git_blobs_destroyed": git_report.blobs_destroyed,
+                    "git_blobs_scrubbed": git_report.blobs_scrubbed,
+                    "git_messages_redacted": git_report.messages_redacted,
                 }),
                 backup_cutoff: receipt.backup_cutoff.to_string(),
                 warnings,
