@@ -35,7 +35,12 @@ dirs.workspace = true
 figment.workspace = true
 flate2.workspace = true
 fs2.workspace = true
-rmcp = { workspace = true, features = ["client", "transport-streamable-http-client-reqwest"] }
+# `transport-streamable-http-client-reqwest` pulls reqwest in with no TLS backend
+# (`__reqwest = ["dep:reqwest"]` and nothing more), so the bridge could not reach an
+# `https://` MCP server at all. rmcp's `reqwest` feature adds `reqwest?/rustls`, which
+# on reqwest 0.13 is `rustls-platform-verifier` — the OS trust store, matching the
+# behaviour the workspace client uses for every other outbound request (#492).
+rmcp = { workspace = true, features = ["client", "transport-streamable-http-client-reqwest", "reqwest"] }
 serde.workspace = true
 serde_json.workspace = true
 toml_edit.workspace = true
