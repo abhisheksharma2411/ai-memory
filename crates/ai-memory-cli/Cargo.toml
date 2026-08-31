@@ -41,10 +41,17 @@ fs2.workspace = true
 #
 # `reqwest-tls-no-provider` is `reqwest?/rustls-no-provider`: the platform verifier
 # without a pinned crypto provider. rmcp's plain `reqwest` feature would be
-# `reqwest?/rustls`, which pins aws-lc-rs and drags in a C toolchain and an Android
-# JNI stack. `ring` is already in the lockfile via the reqwest 0.12 the rest of the
-# workspace uses, so the bridge installs that as the process default instead
-# (see `install_crypto_provider` in `commands/mcp_bridge.rs`).
+# `reqwest?/rustls`, which additionally pins aws-lc-rs — and with it a C toolchain
+# (cmake/nasm on Windows) in every build of this workspace. `ring` is already in the
+# lockfile via the reqwest 0.12 the rest of the workspace uses, so the bridge
+# installs that as the process default instead (see `install_crypto_provider` in
+# `commands/mcp_bridge.rs`).
+#
+# The crypto provider is the whole of the difference. Both routes go through
+# `rustls-platform-verifier`, so both put its deps — including `jni` and
+# `rustls-platform-verifier-android` — in the lockfile. Those are target-gated and
+# are not compiled for our platforms, but they are not avoided by this choice, and
+# a comment claiming otherwise would misdirect the next TLS decision here.
 rmcp = { workspace = true, features = [
     "client",
     "transport-streamable-http-client-reqwest",
