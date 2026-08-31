@@ -37,10 +37,20 @@ flate2.workspace = true
 fs2.workspace = true
 # `transport-streamable-http-client-reqwest` pulls reqwest in with no TLS backend
 # (`__reqwest = ["dep:reqwest"]` and nothing more), so the bridge could not reach an
-# `https://` MCP server at all. rmcp's `reqwest` feature adds `reqwest?/rustls`, which
-# on reqwest 0.13 is `rustls-platform-verifier` — the OS trust store, matching the
-# behaviour the workspace client uses for every other outbound request (#492).
-rmcp = { workspace = true, features = ["client", "transport-streamable-http-client-reqwest", "reqwest"] }
+# `https://` MCP server at all.
+#
+# `reqwest-tls-no-provider` is `reqwest?/rustls-no-provider`: the platform verifier
+# without a pinned crypto provider. rmcp's plain `reqwest` feature would be
+# `reqwest?/rustls`, which pins aws-lc-rs and drags in a C toolchain and an Android
+# JNI stack. `ring` is already in the lockfile via the reqwest 0.12 the rest of the
+# workspace uses, so the bridge installs that as the process default instead
+# (see `install_crypto_provider` in `commands/mcp_bridge.rs`).
+rmcp = { workspace = true, features = [
+    "client",
+    "transport-streamable-http-client-reqwest",
+    "reqwest-tls-no-provider",
+] }
+rustls = { workspace = true }
 serde.workspace = true
 serde_json.workspace = true
 toml_edit.workspace = true

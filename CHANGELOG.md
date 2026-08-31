@@ -41,11 +41,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   server URL failed at connect with `invalid URL, scheme is not http`, and the
   only URL that worked was plaintext `http://` — which is also the transport
   the bridge attaches its bearer token to. Enabling rmcp's `reqwest` feature
-  adds `reqwest?/rustls`, which on reqwest 0.13 is `rustls-platform-verifier`,
-  so the bridge now verifies against the platform trust store like every other
-  outbound request in the workspace. The workspace-client half of #492 landed
-  in #496; this is the MCP transport, which is a second, independent copy of
-  reqwest ([#497]).
+  the bridge now uses rmcp's `reqwest-tls-no-provider`
+  (`reqwest?/rustls-no-provider`), which supplies the platform certificate
+  verifier without pinning a crypto provider, and installs `ring` — already
+  compiled for this binary via the workspace's reqwest 0.12 — as the process
+  default. rmcp's plain `reqwest` feature would have pinned `aws-lc-rs`,
+  adding a compiled C dependency to every build for a bridge most users never
+  enable. The workspace-client half of #492 landed in #496; this is the MCP
+  transport, which is a second, independent copy of reqwest ([#497]).
 
 
 ## [1.33.0] - 2026-08-28
