@@ -95,4 +95,4 @@ pub use opencode::{OPENCODE_DEFAULT_MODEL, OPENCODE_ZEN_BASE_URL, OpenCodeProvid
 pub use provider::{LlmProvider, complete_structured};
 pub use reranker::{LlmReranker, RerankCandidate, RerankScore, Reranker};
 pub use stored_token::StoredOAuthToken;
-pub use types::{ChatMessage, ChatRequest, ChatResponse, Role, Usage};
+pub use types::{ChatMessage, ChatRequest, ChatResponse, ReasoningEffort, Role, Usage};

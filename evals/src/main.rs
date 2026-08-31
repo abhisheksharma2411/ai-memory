@@ -372,6 +372,7 @@ impl From<ResolvedConfig> for ProviderConfig {
             // same schema-constrained path operators receive.
             compat_strict: true,
             request_timeout_secs: ai_memory_llm::DEFAULT_REQUEST_TIMEOUT_SECS,
+            reasoning_effort: None,
         }
     }
 }

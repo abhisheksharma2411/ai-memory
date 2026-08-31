@@ -56,6 +56,7 @@ tempfile.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true
+rstest.workspace = true
 tower.workspace = true
 tokio = { workspace = true, features = ["test-util"] }
 

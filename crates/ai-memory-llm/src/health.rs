@@ -6,6 +6,7 @@
 use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
+use cognomen::Cognomen;
 use jiff::Timestamp;
 use serde::{Deserialize, Serialize};
 
@@ -63,8 +64,8 @@ impl ProviderHealth {
 }
 
 /// Wire-format provider-health status.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "kebab-case")]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Cognomen)]
+#[cognomen(kebab)]
 pub enum ProviderHealthStatus {
     /// The role has no provider configured.
     #[default]

@@ -11,7 +11,7 @@ use tracing::debug;
 use crate::error::{LlmError, LlmResult};
 use crate::provider::LlmProvider;
 use crate::response::{provider_error_body, response_json_limited};
-use crate::types::{ChatRequest, ChatResponse, Role, Usage};
+use crate::types::{ChatRequest, ChatResponse, ReasoningEffort, Usage};
 
 /// Default OpenAI API base.
 pub const DEFAULT_BASE_URL: &str = "https://api.openai.com";
@@ -90,6 +90,7 @@ pub struct OpenAiProvider {
     model: String,
     dialect: RequestDialect,
     timeout: Duration,
+    reasoning_effort: Option<ReasoningEffort>,
 }
 
 impl OpenAiProvider {
@@ -108,6 +109,7 @@ impl OpenAiProvider {
             model: model.into(),
             dialect: RequestDialect::Official,
             timeout: Duration::from_secs(crate::DEFAULT_REQUEST_TIMEOUT_SECS),
+            reasoning_effort: None,
         })
     }
 
@@ -142,6 +144,15 @@ impl OpenAiProvider {
         self.dialect = dialect;
         self
     }
+
+    /// Set reasoning effort. `None` omits the field so the model default
+    /// applies. Official Chat Completions send `reasoning_effort`; OpenRouter
+    /// and xAI hosts use their native shapes.
+    #[must_use]
+    pub fn with_reasoning_effort(mut self, effort: Option<ReasoningEffort>) -> Self {
+        self.reasoning_effort = effort;
+        self
+    }
 }
 
 #[derive(Debug, Serialize)]
@@ -156,6 +167,19 @@ struct OpenAiRequest<'a> {
     temperature: Option<f32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     response_format: Option<OpenAiResponseFormat>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    reasoning_effort: Option<ReasoningEffort>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    reasoning: Option<OpenAiReasoning>,
+}
+
+#[derive(Debug, Serialize)]
+struct OpenAiReasoning {
+    effort: ReasoningEffort,
+    /// OpenRouter: keep thinking tokens out of `message.content` so
+    /// structured-output parse is not polluted.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    exclude: bool,
 }
 
 #[derive(Debug, Serialize)]
@@ -261,10 +285,7 @@ impl OpenAiProvider {
         }
         for m in &request.messages {
             messages.push(OpenAiMsg {
-                role: match m.role {
-                    Role::User => "user",
-                    Role::Assistant => "assistant",
-                },
+                role: m.role.as_ref(),
                 content: &m.content,
             });
         }
@@ -296,6 +317,7 @@ impl OpenAiProvider {
                 (mt, mct, temp)
             }
         };
+        let (reasoning_effort, reasoning) = self.chat_reasoning_fields();
         OpenAiRequest {
             model: &self.model,
             messages,
@@ -303,7 +325,21 @@ impl OpenAiProvider {
             max_completion_tokens,
             temperature,
             response_format,
+            reasoning_effort,
+            reasoning,
         }
+    }
+
+    /// Native reasoning payload for this host / dialect.
+    ///
+    /// Official OpenAI and generic openai-compat send top-level
+    /// `reasoning_effort`. OpenRouter's Chat Completions docs use
+    /// `reasoning: { effort, exclude }`. xAI Grok Chat Completions uses
+    /// `reasoning_effort` with a clamped value set (cannot disable).
+    fn chat_reasoning_fields(&self) -> (Option<ReasoningEffort>, Option<OpenAiReasoning>) {
+        self.reasoning_effort
+            .map(|effort| ReasoningHost::detect(self.dialect, &self.base_url).fields(effort))
+            .unwrap_or((None, None))
     }
 
     fn to_chat_response(&self, response: OpenAiResponse) -> ChatResponse {
@@ -450,6 +486,47 @@ fn model_requires_default_temperature(model: &str) -> bool {
     model_requires_max_completion_tokens(model)
 }
 
+fn is_openrouter_base(url: &str) -> bool {
+    url.to_ascii_lowercase().contains("openrouter.ai")
+}
+
+fn is_xai_base(url: &str) -> bool {
+    let lower = url.to_ascii_lowercase();
+    lower.contains("api.x.ai") || lower.contains("://x.ai/") || lower.contains(".x.ai/")
+}
+
+/// Which reasoning object this Chat Completions host expects.
+#[derive(Debug, Clone, Copy)]
+enum ReasoningHost {
+    OpenAi,
+    OpenRouter,
+    Grok,
+}
+
+impl ReasoningHost {
+    fn detect(dialect: RequestDialect, base_url: &str) -> Self {
+        match dialect {
+            RequestDialect::Compat if is_openrouter_base(base_url) => Self::OpenRouter,
+            RequestDialect::Compat if is_xai_base(base_url) => Self::Grok,
+            RequestDialect::Official | RequestDialect::Compat => Self::OpenAi,
+        }
+    }
+
+    fn fields(self, effort: ReasoningEffort) -> (Option<ReasoningEffort>, Option<OpenAiReasoning>) {
+        match self {
+            Self::OpenRouter => (
+                None,
+                Some(OpenAiReasoning {
+                    effort: effort.openai_wire_effort(),
+                    exclude: true,
+                }),
+            ),
+            Self::Grok => (Some(effort.grok_chat_effort()), None),
+            Self::OpenAi => (Some(effort.openai_wire_effort()), None),
+        }
+    }
+}
+
 /// Per-model output-token ceiling for the `Official` dialect.
 ///
 /// OpenAI rejects requests above the model's published limit with
@@ -484,7 +561,8 @@ mod tests {
         OpenAiProvider, RequestDialect, enforce_strict_object_schemas,
         model_requires_max_completion_tokens, normalize_openai_base,
     };
-    use crate::types::{ChatMessage, ChatRequest, Role};
+    use crate::types::{ChatMessage, ChatRequest, ReasoningEffort, Role};
+    use rstest::rstest;
     use schemars::JsonSchema;
     use secrecy::SecretString;
     use serde::{Deserialize, Serialize};
@@ -929,6 +1007,78 @@ mod tests {
         let req = p.build_request(&req_input, None);
         let json = serde_json::to_value(&req).unwrap();
         assert_eq!(json["max_completion_tokens"], json!(64_000));
+    }
+
+    fn chat_reasoning_json(
+        dialect: RequestDialect,
+        base_url: Option<&str>,
+        model: &str,
+        effort: Option<ReasoningEffort>,
+    ) -> serde_json::Value {
+        let mut provider = OpenAiProvider::new(SecretString::new("test-key".into()), model)
+            .unwrap()
+            .with_dialect(dialect)
+            .with_reasoning_effort(effort);
+        if let Some(url) = base_url {
+            provider = provider.with_base_url(url);
+        }
+        serde_json::to_value(provider.build_request(&chat_request(), None)).unwrap()
+    }
+
+    #[rstest]
+    #[case::official_low(
+        RequestDialect::Official,
+        None,
+        "gpt-5.4-mini",
+        Some(ReasoningEffort::Low),
+        Some("low"),
+        None
+    )]
+    #[case::official_unset(RequestDialect::Official, None, "gpt-5.4-mini", None, None, None)]
+    #[case::openrouter_excludes_content(
+        RequestDialect::Compat,
+        Some("https://openrouter.ai/api/v1"),
+        "anthropic/claude-sonnet-4.6",
+        Some(ReasoningEffort::High),
+        None,
+        Some("high")
+    )]
+    #[case::xai_none_clamps_low(
+        RequestDialect::Compat,
+        Some("https://api.x.ai/v1"),
+        "grok-4.6",
+        Some(ReasoningEffort::None),
+        Some("low"),
+        None
+    )]
+    #[case::official_ultra_clamps_max(
+        RequestDialect::Official,
+        None,
+        "gpt-5.4-mini",
+        Some(ReasoningEffort::Ultra),
+        Some("max"),
+        None
+    )]
+    fn chat_request_uses_native_reasoning_shape(
+        #[case] dialect: RequestDialect,
+        #[case] base_url: Option<&str>,
+        #[case] model: &str,
+        #[case] effort: Option<ReasoningEffort>,
+        #[case] reasoning_effort: Option<&str>,
+        #[case] reasoning_object: Option<&str>,
+    ) {
+        let json = chat_reasoning_json(dialect, base_url, model, effort);
+        match reasoning_effort {
+            Some(expected) => assert_eq!(json["reasoning_effort"], json!(expected)),
+            None => assert!(json.get("reasoning_effort").is_none()),
+        }
+        match reasoning_object {
+            Some(expected) => {
+                assert_eq!(json["reasoning"]["effort"], json!(expected));
+                assert_eq!(json["reasoning"]["exclude"], json!(true));
+            }
+            None => assert!(json.get("reasoning").is_none()),
+        }
     }
 
     #[test]
