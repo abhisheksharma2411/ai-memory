@@ -144,9 +144,10 @@ jobs:
           TAILWIND_SKIP: "1"
         run: cargo build --release -p ai-memory-cli
 
-      # Mirrors the Linux tarball, minus Linux-only service assets
-      # (packaging/systemd|sysusers|tmpfiles|env). macOS users get the binary,
-      # hooks bundle, default config template, and the docs a macOS user needs
+      # Mirrors the Linux tarball, swapping the Linux-only service assets
+      # (packaging/systemd|sysusers|tmpfiles|env) for the macOS-only
+      # packaging/launchd agent. macOS users get the binary, hooks bundle,
+      # default config template, and the docs a macOS user needs
       # (install.md + macos.md).
       - name: Create release tarball
         env:
@@ -157,6 +158,8 @@ jobs:
           mkdir -p "dist/$artifact"
           cp target/release/ai-memory "dist/$artifact/ai-memory"
           cp -a hooks "dist/$artifact/hooks"
+          mkdir -p "dist/$artifact/packaging"
+          cp -a packaging/launchd "dist/$artifact/packaging/launchd"
           mkdir -p "dist/$artifact/crates/ai-memory-cli/templates"
           cp crates/ai-memory-cli/templates/config.default.toml \
             "dist/$artifact/crates/ai-memory-cli/templates/config.default.toml"
@@ -179,6 +182,7 @@ jobs:
           "$smoke/ai-memory" --version
           for path in \
             hooks \
+            packaging/launchd/com.github.akitaonrails.ai-memory.plist \
             crates/ai-memory-cli/templates/config.default.toml \
             docs/install.md \
             docs/macos.md \
