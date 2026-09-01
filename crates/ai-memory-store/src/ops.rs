@@ -898,10 +898,14 @@ fn replace_links_in_tx(
 
     let mut seen = BTreeSet::new();
     for link in &page.links {
+        // The relation joins the dedupe key (and the table's PK): a
+        // typed edge and a plain reference to the same target are two
+        // different rows, mirroring `link_type` in the schema.
         let key = (
             link.workspace.clone(),
             link.project.clone(),
             link.path.as_str().to_string(),
+            link.relation,
         );
         if !seen.insert(key) {
             continue;
@@ -911,13 +915,15 @@ fn replace_links_in_tx(
         tx.execute(
             "INSERT INTO links \
                  (from_page_id, to_page_id, to_workspace, to_project, to_path, link_type) \
-             VALUES (?1, ?2, ?3, ?4, ?5, 'references')",
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
             params![
                 from_page_id.as_bytes(),
                 to_page_blob,
                 link.workspace,
                 link.project,
                 link.path.as_str(),
+                link.relation
+                    .map_or("references", ai_memory_core::Relation::as_str),
             ],
         )?;
     }
@@ -6208,6 +6214,7 @@ pub(crate) mod tests {
             workspace: None,
             project: Some("infra".into()),
             path: PagePath::new("runbooks/02.md").unwrap(),
+            relation: None,
         }];
         let source_id = upsert_page(&mut conn, &source).unwrap();
 

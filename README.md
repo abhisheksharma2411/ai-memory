@@ -345,6 +345,7 @@ diagram, crate breakdown, schema notes, and invariants.
 - [`docs/research-2026-landscape.md`](docs/research-2026-landscape.md) - how the field looks and where we sit in it.
 - [`docs/ROADMAP-2.0.md`](docs/ROADMAP-2.0.md) - the plan for the 2.0 release, one item at a time.
 - [`docs/okf.md`](docs/okf.md) - the wiki is natively an Open Knowledge Format (OKF v0.2) bundle; design and field mapping.
+- [`docs/typed-edges.md`](docs/typed-edges.md) - typed relation edges (`causes` / `fixes` / `contradicts`) and how lint uses them.
 - [`docs/MIGRATION-2.0.md`](docs/MIGRATION-2.0.md) - upgrading an existing store to 2.0: the backup-gated automatic migration and how to restore.
 - [`docs/benchmarks/`](docs/benchmarks/README.md) - published retrieval-quality numbers with provenance, reproducible from the in-repo harness.
 - [`docs/ROADMAP-2.0.md`](docs/ROADMAP-2.0.md) - the 2.0 plan.

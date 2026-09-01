@@ -1259,6 +1259,30 @@ fn build_frontmatter(
     if let Some(summary) = usable_summary(page.summary.as_deref(), &page.title) {
         map.insert("summary".into(), serde_json::Value::String(summary));
     }
+    // Typed edges (2.0 item 3): only vocabulary keys survive — an LLM
+    // inventing `blames:` must not mint a new edge kind. The wiki write
+    // boundary parses this frontmatter into typed links.
+    let relations: serde_json::Map<String, serde_json::Value> = page
+        .relations
+        .iter()
+        .filter(|(key, targets)| {
+            ai_memory_core::Relation::parse(key).is_some() && !targets.is_empty()
+        })
+        .map(|(key, targets)| {
+            (
+                key.clone(),
+                serde_json::Value::Array(
+                    targets
+                        .iter()
+                        .map(|t| serde_json::Value::String(t.clone()))
+                        .collect(),
+                ),
+            )
+        })
+        .collect();
+    if !relations.is_empty() {
+        map.insert("relations".into(), serde_json::Value::Object(relations));
+    }
     map.insert("consolidated".into(), serde_json::Value::Bool(true));
     serde_json::Value::Object(map)
 }
@@ -1738,6 +1762,7 @@ mod tests {
             body_markdown: "Body prose.".into(),
             tags: Vec::new(),
             summary: Some("Bounded the queue so backpressure is testable.".into()),
+            relations: std::collections::BTreeMap::new(),
         };
         let session_id = SessionId::new();
         let frontmatter = build_frontmatter(&page, session_id, AgentKind::Codex);
@@ -1773,6 +1798,41 @@ mod tests {
             );
         }
         assert!(SYSTEM_PROMPT.contains("ONE line of plain prose"));
+    }
+
+    /// Only the closed vocabulary survives into `relations:` frontmatter
+    /// — an LLM inventing `blames:` must not mint a new edge kind.
+    #[test]
+    fn relations_frontmatter_keeps_only_the_vocabulary() {
+        let mut page = ConsolidatedPage {
+            title: "T".into(),
+            body_markdown: "b".into(),
+            tags: vec![],
+            summary: None,
+            relations: std::collections::BTreeMap::new(),
+        };
+        page.relations
+            .insert("fixes".into(), vec!["gotchas/g.md".into()]);
+        page.relations
+            .insert("blames".into(), vec!["notes/x.md".into()]);
+        page.relations.insert("causes".into(), vec![]);
+        let fm = build_frontmatter(&page, SessionId::new(), AgentKind::ClaudeCode);
+        let relations = fm["relations"].as_object().unwrap();
+        assert_eq!(relations.len(), 1, "{relations:?}");
+        assert_eq!(relations["fixes"][0], "gotchas/g.md");
+    }
+
+    #[test]
+    fn pages_without_relations_omit_the_key() {
+        let page = ConsolidatedPage {
+            title: "T".into(),
+            body_markdown: "b".into(),
+            tags: vec![],
+            summary: None,
+            relations: std::collections::BTreeMap::new(),
+        };
+        let fm = build_frontmatter(&page, SessionId::new(), AgentKind::ClaudeCode);
+        assert!(fm.get("relations").is_none());
     }
 
     #[test]

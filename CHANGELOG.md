@@ -8,6 +8,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- Pages can declare typed relation edges in `relations:` frontmatter —
+  a closed `causes` / `fixes` / `contradicts` vocabulary riding the
+  existing `links.link_type` column (no schema migration). Declared
+  `contradicts` edges surface as zero-LLM `contradiction` lint findings
+  (including stale declarations whose target no longer resolves), and
+  the session-end consolidation prompt may emit relations under the
+  same schema-constrained vocabulary. See `docs/typed-edges.md`.
 - `ai-memory export-okf --project <p> -o <bundle.tar.gz>` and
   `POST /admin/export-okf` — stream one project's wiki as a validated
   OKF v0.2 bundle with a freshly generated index; a non-conformant page
