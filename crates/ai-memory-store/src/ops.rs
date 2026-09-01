@@ -4367,7 +4367,70 @@ pub(crate) mod tests {
         }
     }
 
+    /// A subscriber that exists only to be counted (#558).
+    ///
+    /// `tracing` resolves a callsite's interest **once**, on first execution,
+    /// and caches the answer process-globally. While only one `Dispatch` is
+    /// alive — which `WARNING_CAPTURE_LOCK` guarantees, since it serialises the
+    /// captures — `tracing-core` takes a fast path that resolves that answer
+    /// from the *registering thread's own* default subscriber
+    /// (`callsite.rs`: `if has_just_one { … dispatcher::get_default(f) }`).
+    /// A thread without one resolves to `Interest::never()`, and every later
+    /// capture of that callsite goes blind.
+    ///
+    /// Keeping a second `Dispatch` alive for the life of the test binary
+    /// defeats that: with more than one registered, resolution consults every
+    /// live dispatcher instead of only the current thread's, so the capture's
+    /// own subscriber counts no matter which thread registers first.
+    ///
+    /// **Being counted is the whole contribution.** It is never installed as
+    /// anyone's default and never receives an event. Verified by control: see
+    /// `a_subscriberless_thread_must_not_disable_a_callsite_the_capture_needs`,
+    /// which fails when this pin is removed and passes with it, whatever this
+    /// subscriber answers.
+    ///
+    /// The two ways it could stop being invisible are not symmetric, and the
+    /// difference is easy to get backwards:
+    ///
+    /// - **Interest is not a maximum.** `Interest::and` keeps the value when
+    ///   two dispatchers agree and collapses to `sometimes()` when they differ.
+    ///   This pin answers `never` (its `enabled` is false, and the default
+    ///   `register_callsite` follows that), so pairing it with a capture that
+    ///   answers `always` yields `sometimes` — a per-event `enabled()` call,
+    ///   answered by whichever subscriber is actually in scope. That is why an
+    ///   inert pin cannot silence a callsite someone else wants.
+    /// - **The level hint *is* a maximum**, and a `None` hint is read as
+    ///   `TRACE`. Hence the explicit `Some(OFF)` below.
+    struct RegistryPin;
+
+    impl tracing::Subscriber for RegistryPin {
+        /// Explicit, and load-bearing — see
+        /// `the_registry_pin_stays_invisible_to_the_global_max_level`.
+        fn max_level_hint(&self) -> Option<tracing::level_filters::LevelFilter> {
+            Some(tracing::level_filters::LevelFilter::OFF)
+        }
+
+        fn enabled(&self, _: &tracing::Metadata<'_>) -> bool {
+            false
+        }
+
+        fn new_span(&self, _: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+            tracing::span::Id::from_u64(1)
+        }
+
+        fn record(&self, _: &tracing::span::Id, _: &tracing::span::Record<'_>) {}
+        fn record_follows_from(&self, _: &tracing::span::Id, _: &tracing::span::Id) {}
+        fn event(&self, _: &tracing::Event<'_>) {}
+        fn enter(&self, _: &tracing::span::Id) {}
+        fn exit(&self, _: &tracing::span::Id) {}
+    }
+
+    /// Holds the second dispatcher alive. Constructing a `Dispatch` is what
+    /// registers it, so simply keeping this initialised is the mechanism.
+    static REGISTRY_PIN: std::sync::OnceLock<tracing::Dispatch> = std::sync::OnceLock::new();
+
     fn capture_warnings(run: impl FnOnce()) -> String {
+        REGISTRY_PIN.get_or_init(|| tracing::Dispatch::new(RegistryPin));
         let _guard = WARNING_CAPTURE_LOCK.lock().unwrap();
         let logs = CapturedLogs::default();
         let subscriber = tracing_subscriber::fmt()
@@ -4377,6 +4440,84 @@ pub(crate) mod tests {
             .finish();
         tracing::subscriber::with_default(subscriber, run);
         String::from_utf8(logs.0.lock().unwrap().clone()).unwrap()
+    }
+
+    /// Guards the `max_level_hint` override on [`RegistryPin`] against being
+    /// removed as apparent dead code.
+    ///
+    /// The pin has to be *registered* to do its job, and every registered
+    /// dispatcher feeds `tracing`'s global max level — which `rebuild_interest`
+    /// computes as the maximum across live dispatchers, reading a `None` hint
+    /// as `TRACE`. Dropping the override therefore raises this binary's global
+    /// level from `OFF` to `TRACE` for good after the first capture. Measured
+    /// both ways: with `Some(OFF)` the level follows exactly the `OFF -> WARN`
+    /// path it follows with no pin at all; without the override it goes to
+    /// `TRACE` and stays there.
+    ///
+    /// Nothing observable breaks when that happens, which is precisely why it
+    /// wants a guard rather than a comment — every `trace!` and `debug!`
+    /// callsite in the crate would quietly start being evaluated instead of
+    /// short-circuiting.
+    #[test]
+    fn the_registry_pin_stays_invisible_to_the_global_max_level() {
+        use tracing::Subscriber as _;
+
+        assert_eq!(
+            RegistryPin.max_level_hint(),
+            Some(tracing::level_filters::LevelFilter::OFF),
+            "a None hint is read as TRACE, which would raise the whole binary's \
+             global max level as a side effect of pinning the dispatcher"
+        );
+    }
+
+    /// A `warn!` callsite reachable from nowhere but the control test below.
+    ///
+    /// The defect being reproduced is in `tracing`'s **one-shot** callsite
+    /// registration, so the callsite has to still be unregistered when the
+    /// control runs. Any second caller would register it first and make the
+    /// control vacuous.
+    fn control_only_warn() {
+        tracing::warn!("control-callsite-canary");
+    }
+
+    /// #558: a thread with no subscriber must not be able to disable a
+    /// callsite that a concurrent capture depends on.
+    ///
+    /// The flake is `Interest::never()` cached **globally** for a callsite,
+    /// resolved from whichever thread happens to register it first:
+    ///
+    /// - `tracing`'s event macro gates on the global max level *before*
+    ///   consulting the callsite's interest. With no other subscriber in this
+    ///   binary that level starts at `OFF`, so a subscriberless thread normally
+    ///   short-circuits and never registers anything.
+    /// - While a capture holds a live `Dispatch`, the level is `WARN`, and now
+    ///   a subscriberless thread *does* reach the registration.
+    /// - With a single live dispatcher, registration resolves interest from the
+    ///   registering thread's own default — `NoSubscriber` — writing
+    ///   `Interest::never()` into a process-global cache.
+    ///
+    /// The capturing thread then skips its `warn!` entirely and the capture
+    /// comes back **empty**, which is the reported symptom. Under `--workspace`
+    /// the foreign thread is real: the homonym `warn!` in this module is also
+    /// driven by the `ai-memory-writer` thread and by other libtest threads,
+    /// none of which hold a subscriber.
+    ///
+    /// Ordering, not luck, reproduces it: register from the foreign thread
+    /// first, then ask the capture to observe the same callsite.
+    #[test]
+    fn a_subscriberless_thread_must_not_disable_a_callsite_the_capture_needs() {
+        let logs = capture_warnings(|| {
+            std::thread::spawn(control_only_warn)
+                .join()
+                .expect("control thread panicked");
+            control_only_warn();
+        });
+
+        assert!(
+            logs.contains("control-callsite-canary"),
+            "a subscriberless thread registered this callsite as Interest::never() \
+             and the capture went blind: {logs:?}"
+        );
     }
 
     fn handoff_acceptance(
