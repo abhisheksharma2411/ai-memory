@@ -1,16 +1,26 @@
 //! Provider-neutral request/response types.
 
-use cognomen::{Cognomen, Label};
 use serde::{Deserialize, Serialize};
 
 /// Message role in a chat turn.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Cognomen)]
-#[cognomen(lower)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
 pub enum Role {
     /// Message from the user.
     User,
     /// Message from the assistant (the model).
     Assistant,
+}
+
+impl Role {
+    /// Canonical lowercase wire string (`user` / `assistant`).
+    #[must_use]
+    pub const fn as_str(&self) -> &'static str {
+        match self {
+            Self::User => "user",
+            Self::Assistant => "assistant",
+        }
+    }
 }
 
 /// One message in the chat history.
@@ -116,8 +126,8 @@ pub struct ChatResponse {
 /// Omitting the config key (Rust `None`) leaves the model default;
 /// [`Self::None`] is the wire value `none` (disable reasoning where the
 /// backend allows it).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Cognomen)]
-#[cognomen(lower)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
 pub enum ReasoningEffort {
     /// Disable reasoning (`none`).
     None,
@@ -140,10 +150,20 @@ pub enum ReasoningEffort {
 }
 
 impl ReasoningEffort {
-    /// Canonical wire-format string.
+    /// Canonical lowercase wire-format string.
     #[must_use]
-    pub fn as_str(self) -> &'static str {
-        Label::as_str(&self)
+    pub const fn as_str(&self) -> &'static str {
+        match self {
+            Self::None => "none",
+            Self::Minimal => "minimal",
+            Self::Low => "low",
+            Self::Medium => "medium",
+            Self::High => "high",
+            Self::XHigh => "xhigh",
+            Self::Max => "max",
+            Self::Ultra => "ultra",
+            Self::Persistent => "persistent",
+        }
     }
 
     /// xAI Grok Chat Completions only accepts `low`/`medium`/`high`/`xhigh`
@@ -184,14 +204,25 @@ impl ReasoningEffort {
 #[cfg(test)]
 mod tests {
     use super::ReasoningEffort;
-    use cognomen::Variants;
     use rstest::rstest;
+
+    const ALL_EFFORTS: [ReasoningEffort; 9] = [
+        ReasoningEffort::None,
+        ReasoningEffort::Minimal,
+        ReasoningEffort::Low,
+        ReasoningEffort::Medium,
+        ReasoningEffort::High,
+        ReasoningEffort::XHigh,
+        ReasoningEffort::Max,
+        ReasoningEffort::Ultra,
+        ReasoningEffort::Persistent,
+    ];
 
     #[test]
     fn reasoning_effort_roundtrips() {
         assert_eq!(
-            ReasoningEffort::LABELS,
-            &[
+            ALL_EFFORTS.map(|effort| effort.as_str()),
+            [
                 "none",
                 "minimal",
                 "low",
@@ -203,11 +234,10 @@ mod tests {
                 "persistent",
             ]
         );
-        for &effort in ReasoningEffort::VARIANTS {
+        for effort in ALL_EFFORTS {
             let raw = effort.as_str();
             let parsed: ReasoningEffort = serde_json::from_value(serde_json::json!(raw)).unwrap();
             assert_eq!(parsed, effort);
-            assert_eq!(effort, raw);
             assert_eq!(
                 serde_json::to_value(effort).unwrap(),
                 serde_json::json!(raw)

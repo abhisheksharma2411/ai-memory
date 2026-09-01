@@ -285,7 +285,7 @@ impl OpenAiProvider {
         }
         for m in &request.messages {
             messages.push(OpenAiMsg {
-                role: m.role.as_ref(),
+                role: m.role.as_str(),
                 content: &m.content,
             });
         }

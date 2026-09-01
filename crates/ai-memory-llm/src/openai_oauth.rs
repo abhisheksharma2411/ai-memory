@@ -318,7 +318,7 @@ fn build_request<'a>(
         .messages
         .iter()
         .map(|msg| CodexInputMessage {
-            role: msg.role.as_ref(),
+            role: msg.role.as_str(),
             content: vec![CodexInputContent {
                 kind: "input_text",
                 text: &msg.content,

@@ -409,7 +409,7 @@ fn build_chat_request<'a>(
     }
     for m in &request.messages {
         messages.push(CopilotMsg {
-            role: m.role.as_ref(),
+            role: m.role.as_str(),
             content: &m.content,
         });
     }

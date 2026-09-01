@@ -44,9 +44,6 @@ thiserror = "2"
 
 # Serialization.
 serde = { version = "1", features = ["derive"] }
-# Compile-time enum labels for wire/config strings. `serde` generates
-# Serialize/Deserialize from the same labels as `Label::as_str`.
-cognomen = { version = "0.5", features = ["serde"] }
 # `preserve_order` keeps existing JSON key order intact when we
 # round-trip user config files via `install-mcp --apply`. Without it,
 # `~/.claude.json` (which has dozens of CC-managed keys) would be

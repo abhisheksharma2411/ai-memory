@@ -3,7 +3,6 @@
 use std::time::Duration;
 
 use async_trait::async_trait;
-use cognomen::Cognomen;
 use secrecy::{ExposeSecret, SecretString};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
@@ -249,7 +248,7 @@ impl AnthropicProvider {
             .messages
             .iter()
             .map(|m| AnthropicMsg {
-                role: m.role.as_ref(),
+                role: m.role.as_str(),
                 content: &m.content,
             })
             .collect();
@@ -344,8 +343,7 @@ enum ClaudeId {
     MythosPreview,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Cognomen)]
-#[cognomen(lower)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ClaudeFamily {
     Opus,
     Sonnet,
@@ -355,6 +353,16 @@ enum ClaudeFamily {
 }
 
 impl ClaudeFamily {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Opus => "opus",
+            Self::Sonnet => "sonnet",
+            Self::Haiku => "haiku",
+            Self::Fable => "fable",
+            Self::Mythos => "mythos",
+        }
+    }
+
     fn effort_since(self) -> Option<(u32, u32)> {
         match self {
             Self::Opus => Some((4, 5)),
@@ -370,6 +378,25 @@ impl ClaudeFamily {
             Self::Fable | Self::Mythos => Some((5, 0)),
             Self::Haiku => None,
         }
+    }
+}
+
+impl std::str::FromStr for ClaudeFamily {
+    type Err = ();
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        for family in [
+            Self::Opus,
+            Self::Sonnet,
+            Self::Haiku,
+            Self::Fable,
+            Self::Mythos,
+        ] {
+            if s == family.as_str() {
+                return Ok(family);
+            }
+        }
+        Err(())
     }
 }
 
@@ -683,6 +710,20 @@ mod tests {
             Some(expected) => assert_eq!(body["thinking"]["type"], json!(expected)),
             None => assert!(body.get("thinking").is_none()),
         }
+    }
+
+    #[test]
+    fn claude_family_parses_lowercase_labels() {
+        for family in [
+            ClaudeFamily::Opus,
+            ClaudeFamily::Sonnet,
+            ClaudeFamily::Haiku,
+            ClaudeFamily::Fable,
+            ClaudeFamily::Mythos,
+        ] {
+            assert_eq!(family.as_str().parse::<ClaudeFamily>().unwrap(), family);
+        }
+        assert!("unknown".parse::<ClaudeFamily>().is_err());
     }
 
     #[test]
