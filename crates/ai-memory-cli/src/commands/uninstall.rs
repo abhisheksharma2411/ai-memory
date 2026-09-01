@@ -344,6 +344,7 @@ fn build_plan(args: &UninstallArgs) -> anyhow::Result<Vec<PlannedChange>> {
             Omp,
             AntigravityCli,
             Zero,
+            Zcode,
             VsCodeCopilot,
             Zed,
             Devin,
@@ -1095,7 +1096,7 @@ fn mcp_servers_path(client: McpClient) -> Option<&'static [&'static str]> {
         | McpClient::Swival
         | McpClient::Devin => Some(&["mcpServers"]),
         McpClient::OpenCode => Some(&["mcp"]),
-        McpClient::Openclaw | McpClient::Zero => Some(&["mcp", "servers"]),
+        McpClient::Openclaw | McpClient::Zero | McpClient::Zcode => Some(&["mcp", "servers"]),
         McpClient::VsCodeCopilot => Some(&["servers"]),
         McpClient::Zed => Some(&["context_servers"]),
         McpClient::Codex | McpClient::Grok | McpClient::Pi => None,
@@ -1482,6 +1483,16 @@ mod tests {
     #[test]
     fn hook_signature_matches_native_windows_command() {
         let cmd = r#""C:\Users\alice\bin\ai-memory.exe" --data-dir "C:\Users\alice\AppData\Local\ai-memory" hook --event session-start --agent claude-code --server-url "http://h:49374""#;
+        assert!(hook_command_is_ours(cmd));
+    }
+
+    /// #515 gave Codex's Windows command a leading `& ` call operator.
+    /// `hook_command_is_ours` matches on substrings, so the prefix is
+    /// harmless — but if that ever became a prefix match, uninstall would
+    /// silently stop finding Codex hooks and leave them behind.
+    #[test]
+    fn hook_signature_matches_a_powershell_call_operator_command() {
+        let cmd = r#"& "C:\Users\alice\bin\ai-memory.exe" --data-dir "C:\Users\alice\AppData\Local\ai-memory" hook --event session-start --agent codex --server-url "http://h:49374""#;
         assert!(hook_command_is_ours(cmd));
     }
 

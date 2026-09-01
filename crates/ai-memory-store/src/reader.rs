@@ -36,7 +36,7 @@ use crate::error::{StoreError, StoreResult};
 use crate::fts_query::prepare_fts5_query;
 use crate::maintenance::MaintenanceJob;
 use crate::users::TOKEN_HASH_LEN;
-use crate::workstream::{ManagedRunContext, StoredManagedRunStatus};
+use crate::workstream::{ManagedRunContext, StoredManagedRunStatus, StoredWorkstreamSummary};
 
 /// TTL guard for retrieval surfaces (search / recent / embedding hits /
 /// graph neighbours / briefing lists): appended to a WHERE clause that
@@ -817,6 +817,57 @@ pub struct ContaminationReport {
     pub findings: Vec<ContaminationFinding>,
 }
 
+/// One `audit_log` row with names resolved through LEFT JOINs.
+///
+/// Workspace, project, page, and author are `Option` because the log has
+/// no foreign keys (V05: append-only; orphan rows are expected).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct AuditEvent {
+    /// Auto-increment primary key; also the keyset pagination cursor.
+    pub id: i64,
+    /// Event time in microseconds since Unix epoch (V01 convention).
+    pub at: i64,
+    /// Writer-assigned op (`create_page`, `supersede_page`, `purge_project`, …).
+    pub op: String,
+    /// Workspace name, or `None` when the id no longer resolves.
+    pub workspace: Option<String>,
+    /// Project name, or `None` when the id no longer resolves.
+    pub project: Option<String>,
+    /// Page path, or `None` when the id no longer resolves.
+    pub page_path: Option<String>,
+    /// Username, or `None` for anonymous writes and deleted users.
+    pub author_username: Option<String>,
+    /// Schema column. The only writer stores the literal `{}`; not a payload.
+    pub detail: String,
+}
+
+/// Filters for [`ReaderPool::list_audit_events`].
+#[derive(Debug, Clone)]
+pub struct AuditLogFilter {
+    /// Restrict to this workspace **name**.
+    pub workspace: Option<String>,
+    /// Restrict to this project **name**.
+    pub project: Option<String>,
+    /// Restrict to this op string.
+    pub op: Option<String>,
+    /// Keyset cursor: return rows with `id` strictly less than this value.
+    pub before_id: Option<i64>,
+    /// Page size. Clamped to `1..=200`; [`Default`] is 50.
+    pub limit: usize,
+}
+
+impl Default for AuditLogFilter {
+    fn default() -> Self {
+        Self {
+            workspace: None,
+            project: None,
+            op: None,
+            before_id: None,
+            limit: 50,
+        }
+    }
+}
+
 /// Counts that must all be zero before `ai-memory reindex` rebuilds the
 /// derived SQLite store from wiki files.
 #[derive(Debug, Clone, Default, Serialize)]
@@ -897,6 +948,13 @@ pub struct DerivedIndexStatus {
     pub observations_fts_rows: u64,
     /// Latest pages without any embedding row.
     pub latest_pages_missing_embeddings: u64,
+    /// Latest pages whose last embed attempt failed or was skipped and which
+    /// still have no embedding. These are the pages an operator can act on.
+    pub embed_failures_unresolved: u64,
+    /// Latest pages that recorded a failed or skipped embed at some point but
+    /// have an embedding now. Kept because a global `embed --force` used to
+    /// erase exactly this history, leaving a recurrence unattributable (#528).
+    pub embed_failures_recovered: u64,
     /// Stored embedding rows, regardless of provider/model/dim.
     pub embedding_rows: u64,
     /// Stored embedding triples and row counts.
@@ -1324,6 +1382,28 @@ impl ReaderPool {
     ) -> StoreResult<Vec<WorkstreamEvent>> {
         self.with_conn(move |conn| {
             crate::workstream::search_events(conn, workstream_id, &query, limit)
+        })
+        .await
+    }
+
+    /// List recent managed workstreams for one exact repository/worktree.
+    pub async fn recent_workstreams(
+        &self,
+        workspace_id: WorkspaceId,
+        project_id: ProjectId,
+        repo_fingerprint: String,
+        worktree_fingerprint: String,
+        limit: usize,
+    ) -> StoreResult<Vec<StoredWorkstreamSummary>> {
+        self.with_conn(move |conn| {
+            crate::workstream::list_recent(
+                conn,
+                workspace_id,
+                project_id,
+                &repo_fingerprint,
+                &worktree_fingerprint,
+                limit,
+            )
         })
         .await
     }
@@ -3183,6 +3263,42 @@ impl ReaderPool {
         .await
     }
 
+    /// Count the observations the prune pass would delete for this scope.
+    ///
+    /// Same predicate as
+    /// [`prune_consolidated_observations`](crate::ops::prune_consolidated_observations),
+    /// read-only, so a dry run can report a number without any chance of a
+    /// write. Kept beside the delete rather than derived from it because the
+    /// dry run must never open a write transaction at all.
+    ///
+    /// # Errors
+    /// Propagates SQL errors.
+    pub async fn prunable_observation_count(
+        &self,
+        workspace_id: WorkspaceId,
+        project_id: ProjectId,
+        cutoff_us: i64,
+    ) -> StoreResult<usize> {
+        self.with_conn(move |conn| {
+            let n: i64 = conn.query_row(
+                "SELECT COUNT(*) FROM observations o \
+                 WHERE o.workspace_id = ?1 \
+                   AND o.project_id = ?2 \
+                   AND o.created_at < ?3 \
+                   AND EXISTS ( \
+                       SELECT 1 FROM sessions s \
+                       JOIN pages p ON p.id = s.summary_page_id \
+                       WHERE s.id = o.session_id \
+                         AND p.superseded_at IS NULL \
+                   )",
+                params![workspace_id.as_bytes(), project_id.as_bytes(), cutoff_us],
+                |row| row.get(0),
+            )?;
+            Ok(usize::try_from(n).unwrap_or(0))
+        })
+        .await
+    }
+
     /// Return the number of DISTINCT operators that reinforced each
     /// `is_latest = 1` page of a project, for the sweep's breadth term.
     ///
@@ -3564,6 +3680,63 @@ impl ReaderPool {
     /// descriptor column there would compute one for the whole corpus on
     /// every search. Here the input is only the handful of ids that survived
     /// fusion and still lack a title.
+    /// Open handoffs for a project, oldest first (#513).
+    ///
+    /// `memory_handoff_cancel` takes an exact id and nothing exposed one, so a
+    /// backlog could be observed in `status` counts but never addressed. Oldest
+    /// first because the operator's question is "what is stale", and the
+    /// automatic expiry deliberately spares manual and sibling-directory
+    /// handoffs — which is how a months-old entry survives to be listed here.
+    pub async fn open_handoffs_for_project(
+        &self,
+        workspace_id: WorkspaceId,
+        project_id: ProjectId,
+        limit: usize,
+    ) -> StoreResult<Vec<OpenHandoff>> {
+        self.with_conn(move |conn| {
+            let mut stmt = conn.prepare(
+                "SELECT id, from_agent, to_agent, cwd, created_at \
+                 FROM handoffs \
+                 WHERE workspace_id = ?1 AND project_id = ?2 AND state = 'open' \
+                 ORDER BY created_at ASC, id ASC \
+                 LIMIT ?3",
+            )?;
+            let rows = stmt.query_map(
+                params![
+                    workspace_id.as_bytes(),
+                    project_id.as_bytes(),
+                    u64::try_from(limit).unwrap_or(u64::MAX),
+                ],
+                |row| {
+                    let id: Vec<u8> = row.get(0)?;
+                    Ok((
+                        id,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, Option<String>>(2)?,
+                        row.get::<_, Option<String>>(3)?,
+                        row.get::<_, i64>(4)?,
+                    ))
+                },
+            )?;
+            let mut out = Vec::new();
+            for row in rows {
+                let (id, from_agent, to_agent, cwd, created_at) = row?;
+                let Ok(id) = HandoffId::from_slice(&id) else {
+                    continue;
+                };
+                out.push(OpenHandoff {
+                    id: id.to_string(),
+                    from_agent,
+                    to_agent,
+                    cwd,
+                    created_at_ms: created_at / 1_000,
+                });
+            }
+            Ok(out)
+        })
+        .await
+    }
+
     async fn page_descriptors_for_ids(
         &self,
         workspace_id: WorkspaceId,
@@ -6561,6 +6734,88 @@ impl ReaderPool {
         Ok(ContaminationReport { summary, findings })
     }
 
+    /// List `audit_log` rows newest-first, resolving names through LEFT JOINs.
+    ///
+    /// Workspace/project filters match on **name** (the same convention as
+    /// [`Self::list_pages`]). `before_id` is a keyset cursor (`id < ?` under
+    /// `ORDER BY id DESC`): new events get higher ids, so they land on later
+    /// first pages instead of shifting this window and duplicating or skipping
+    /// rows already seen. `limit` is clamped to `1..=200`.
+    ///
+    /// `detail` is the schema column; the only writer currently stores the
+    /// literal `{}`.
+    ///
+    /// # Errors
+    /// Propagates any SQL or pool error.
+    pub async fn list_audit_events(&self, filter: AuditLogFilter) -> StoreResult<Vec<AuditEvent>> {
+        let limit = filter.limit.clamp(1, 200);
+        let workspace = filter.workspace.filter(|s| !s.is_empty());
+        let project = filter.project.filter(|s| !s.is_empty());
+        let op = filter.op.filter(|s| !s.is_empty());
+        let before_id = filter.before_id;
+        self.with_conn(move |conn| {
+            let mut sql = String::from(
+                "SELECT a.id, a.at, a.op, w.name, p.name, pg.path, u.username, a.detail \
+                 FROM audit_log a \
+                 LEFT JOIN workspaces w ON w.id = a.workspace_id \
+                 LEFT JOIN projects p ON p.id = a.project_id \
+                 LEFT JOIN pages pg ON pg.id = a.page_id \
+                 LEFT JOIN users u ON u.id = a.author_id",
+            );
+            let mut binds: Vec<Value> = Vec::new();
+            let mut clauses: Vec<&str> = Vec::new();
+            if workspace.is_some() {
+                clauses.push("w.name = ?");
+            }
+            if project.is_some() {
+                clauses.push("p.name = ?");
+            }
+            if op.is_some() {
+                clauses.push("a.op = ?");
+            }
+            if before_id.is_some() {
+                clauses.push("a.id < ?");
+            }
+            if !clauses.is_empty() {
+                sql.push_str(" WHERE ");
+                sql.push_str(&clauses.join(" AND "));
+            }
+            sql.push_str(" ORDER BY a.id DESC LIMIT ?");
+            if let Some(ws) = &workspace {
+                binds.push(Value::Text(ws.clone()));
+            }
+            if let Some(proj) = &project {
+                binds.push(Value::Text(proj.clone()));
+            }
+            if let Some(op) = &op {
+                binds.push(Value::Text(op.clone()));
+            }
+            if let Some(before) = before_id {
+                binds.push(Value::Integer(before));
+            }
+            binds.push(Value::Integer(i64::try_from(limit).unwrap_or(200)));
+            let mut stmt = conn.prepare(&sql)?;
+            let rows = stmt.query_map(params_from_iter(binds.iter()), |row| {
+                Ok(AuditEvent {
+                    id: row.get(0)?,
+                    at: row.get(1)?,
+                    op: row.get(2)?,
+                    workspace: row.get(3)?,
+                    project: row.get(4)?,
+                    page_path: row.get(5)?,
+                    author_username: row.get(6)?,
+                    detail: row.get(7)?,
+                })
+            })?;
+            let mut out = Vec::new();
+            for row in rows {
+                out.push(row?);
+            }
+            Ok(out)
+        })
+        .await
+    }
+
     /// Return aggregate counts for the `status` view.
     ///
     /// # Errors
@@ -6624,6 +6879,25 @@ impl ReaderPool {
                 observations_fts_rows: count(
                     conn,
                     "SELECT COUNT(*) FROM observations_fts_docsize",
+                )?,
+                // Split by whether an embedding exists *now*: a failure row is
+                // the last unsuccessful attempt, not proof the page is still
+                // broken. Without this join a page that failed once and
+                // recovered would read as an outstanding problem forever.
+                embed_failures_unresolved: count(
+                    conn,
+                    "SELECT COUNT(*) \
+                     FROM page_embed_failures f \
+                     JOIN pages pg ON pg.id = f.page_id AND pg.is_latest = 1 \
+                     LEFT JOIN page_embeddings pe ON pe.page_id = f.page_id \
+                     WHERE pe.page_id IS NULL",
+                )?,
+                embed_failures_recovered: count(
+                    conn,
+                    "SELECT COUNT(*) \
+                     FROM page_embed_failures f \
+                     JOIN pages pg ON pg.id = f.page_id AND pg.is_latest = 1 \
+                     JOIN page_embeddings pe ON pe.page_id = f.page_id",
                 )?,
                 latest_pages_missing_embeddings: count(
                     conn,
@@ -7405,6 +7679,20 @@ fn slot_exclusion_sql(
 /// a server behind a trusted proxy what follows the prefix is whatever
 /// `X-Memory-Actor-Sub` carried — an OIDC subject the engine never parses — so
 /// nothing upstream constrains its characters.
+/// One open handoff, as an operator needs to see it to decide what to cancel.
+///
+/// Content-free by construction: identity, provenance and age only. The
+/// summary body is deliberately absent — this exists so
+/// `memory_handoff_cancel` has an id to be given, not to render the handoff.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct OpenHandoff {
+    pub id: String,
+    pub from_agent: String,
+    pub to_agent: Option<String>,
+    pub cwd: Option<String>,
+    pub created_at_ms: i64,
+}
+
 fn handoff_owner_sql(filter: &OwnerFilter, param_index: usize) -> (String, Option<String>) {
     match filter {
         OwnerFilter::Any => (String::new(), None),

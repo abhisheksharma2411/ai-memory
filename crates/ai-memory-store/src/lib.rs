@@ -45,18 +45,19 @@ pub use decay::{
 pub use error::{StoreError, StoreResult};
 pub use maintenance::MaintenanceJob;
 pub use ops::{
-    AdmittedSession, DeleteWorkspaceSummary, EmbeddingWrite, HookSessionAdmission,
-    IngestObservationOutcome, LifecycleOnlyEndOutcome, MoveSessionSummary, MoveSummary, PagesMode,
-    PurgeSummary, ReorgSummary,
+    AdmittedSession, Compaction, DeleteWorkspaceSummary, EmbedOutcome, EmbeddingWrite,
+    HookSessionAdmission, IngestObservationOutcome, LifecycleOnlyEndOutcome, MoveSessionSummary,
+    MoveSummary, ObservationPruneOutcome, PagesMode, PurgeSessionSummary, PurgeSummary,
+    ReorgSummary, purge_session, record_embed_failure,
 };
 pub use reader::{
-    ActivityWindow, AgentSessionCount, AutoImproveCandidateSession, BriefPageBody, BriefingPage,
-    BriefingSnapshot, ClientActivity, ContaminationFinding, ContaminationReport,
-    ContaminationSummary, DecayCandidate, DecayTombstone, DerivedIndexStatus, EmbeddingTripleCount,
-    FeedbackFinding, GraphVia, HealthDetail, HealthPage, ObservationHit, ObservationOrder,
-    ObservationPage, ObservationPageResult, ObservationRecord, OpenSession, PageAuthor, PageHit,
-    PageHitWithMeta, PageLinks, PageMeta, PageSummary, ProjectSummary, ReaderPool,
-    ReindexTargetStatus, RelatedPage, RrfContributions, ScopeRow, SearchExplain,
+    ActivityWindow, AgentSessionCount, AuditEvent, AuditLogFilter, AutoImproveCandidateSession,
+    BriefPageBody, BriefingPage, BriefingSnapshot, ClientActivity, ContaminationFinding,
+    ContaminationReport, ContaminationSummary, DecayCandidate, DecayTombstone, DerivedIndexStatus,
+    EmbeddingTripleCount, FeedbackFinding, GraphVia, HealthDetail, HealthPage, ObservationHit,
+    ObservationOrder, ObservationPage, ObservationPageResult, ObservationRecord, OpenSession,
+    PageAuthor, PageHit, PageHitWithMeta, PageLinks, PageMeta, PageSummary, ProjectSummary,
+    ReaderPool, ReindexTargetStatus, RelatedPage, RrfContributions, ScopeRow, SearchExplain,
     SessionDependentRows, SessionEndDisposition, SessionSummary, StatusCounts, StoredEmbedding,
     StoredPageBody, WorkspaceScopeRow, WorkspaceSummary, f32_vec_to_bytes,
 };
@@ -69,7 +70,7 @@ pub use session_consolidation::{SESSION_CONSOLIDATION_MAX_ATTEMPTS, SessionConso
 pub use users::{TOKEN_HASH_LEN, TOKEN_RAW_LEN, TokenPepper, generate_token, hash_token};
 pub use workstream::{
     FinishWorkstreamRun, FinishedWorkstreamRun, ManagedRunContext, PrepareWorkstreamRun,
-    PreparedWorkstreamRun, StoredManagedRunStatus, WorkstreamSelection,
+    PreparedWorkstreamRun, StoredManagedRunStatus, StoredWorkstreamSummary, WorkstreamSelection,
 };
 pub use writer::{StartupContextAcceptance, WriterHandle};
 
@@ -2544,6 +2545,90 @@ mod tests {
         "1. Bound the scheduler queue\n",
         "2. Make the backpressure test deterministic\n",
     );
+
+    /// #513: `memory_handoff_cancel` takes an exact id and nothing exposed
+    /// one, so an accumulated backlog was visible as a count and impossible
+    /// to address. Oldest-first because the operator's question is which are
+    /// stale.
+    #[tokio::test]
+    async fn open_handoffs_are_listed_oldest_first_and_exclude_accepted() {
+        let tmp = TempDir::new().unwrap();
+        let store = Store::open(tmp.path()).unwrap();
+        let ws = store
+            .writer
+            .get_or_create_workspace("default")
+            .await
+            .unwrap();
+        let proj = store
+            .writer
+            .get_or_create_project(ws, "ai-memory", None)
+            .await
+            .unwrap();
+        let new_handoff = |agent: AgentKind| NewHandoff {
+            workspace_id: ws,
+            project_id: proj,
+            from_session_id: None,
+            from_agent: agent,
+            to_agent: None,
+            cwd: None,
+            summary: "continue".into(),
+            open_questions: Vec::new(),
+            next_steps: Vec::new(),
+            files_touched: Vec::new(),
+            owner_user: None,
+        };
+        let first = store
+            .writer
+            .insert_handoff(new_handoff(AgentKind::ClaudeCode))
+            .await
+            .unwrap();
+        let second = store
+            .writer
+            .insert_handoff(new_handoff(AgentKind::Codex))
+            .await
+            .unwrap();
+
+        let open = store
+            .reader
+            .open_handoffs_for_project(ws, proj, 50)
+            .await
+            .unwrap();
+        assert_eq!(open.len(), 2, "both handoffs are open");
+        assert_eq!(
+            open[0].id,
+            first.to_string(),
+            "oldest first: {:?}",
+            open.iter().map(|h| &h.id).collect::<Vec<_>>()
+        );
+        assert_eq!(open[1].id, second.to_string());
+        assert_eq!(open[0].from_agent, "claude-code");
+        assert_eq!(open[1].from_agent, "codex");
+
+        // The listing must answer "what is still pending", so an accepted
+        // handoff has to drop out — otherwise it re-proposes work already
+        // taken, which is the failure the backlog already causes.
+        store
+            .writer
+            .accept_handoff(HandoffAcceptance {
+                handoff_id: first,
+                workspace_id: ws,
+                project_id: proj,
+                accepting_agent: AgentKind::Codex,
+                accepting_session: None,
+                accepting_user: None,
+                owner_filter: ai_memory_core::OwnerFilter::Any,
+                receiving_cwd: None,
+            })
+            .await
+            .unwrap();
+        let open = store
+            .reader
+            .open_handoffs_for_project(ws, proj, 50)
+            .await
+            .unwrap();
+        assert_eq!(open.len(), 1, "the accepted handoff must not be listed");
+        assert_eq!(open[0].id, second.to_string());
+    }
 
     #[tokio::test]
     async fn a_written_summary_changes_what_the_descriptor_tells_the_reader() {
@@ -5732,6 +5817,172 @@ mod tests {
                 "invalid name '{invalid}' must be rejected: {err}"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn recent_workstreams_are_checkout_local_and_include_linked_harnesses() {
+        let tmp = TempDir::new().unwrap();
+        let store = Store::open(tmp.path()).unwrap();
+        let (ws, proj) = open_managed_scope(&store, "managed-list").await;
+        let prepare = |name: &str, agent| PrepareWorkstreamRun {
+            agent,
+            selection: WorkstreamSelection::New(name.into()),
+            ..managed_prepare_input(ws, proj, name)
+        };
+
+        let older = store
+            .writer
+            .prepare_workstream_run(prepare("older", AgentKind::OpenCode))
+            .await
+            .unwrap();
+        let current = store
+            .writer
+            .prepare_workstream_run(prepare("current", AgentKind::Codex))
+            .await
+            .unwrap();
+        store
+            .writer
+            .finish_workstream_run(FinishWorkstreamRun {
+                run_id: current.run_id,
+                native_session_id: Some("codex-native".into()),
+                source_cursor: None,
+                events: Vec::new(),
+                complete: true,
+                segment_path: None,
+                exit_code: Some(0),
+            })
+            .await
+            .unwrap();
+        let claude = store
+            .writer
+            .prepare_workstream_run(PrepareWorkstreamRun {
+                agent: AgentKind::ClaudeCode,
+                selection: WorkstreamSelection::Named("current".into()),
+                ..managed_prepare_input(ws, proj, "claude")
+            })
+            .await
+            .unwrap();
+        store
+            .writer
+            .finish_workstream_run(FinishWorkstreamRun {
+                run_id: claude.run_id,
+                native_session_id: Some("claude-native".into()),
+                source_cursor: None,
+                events: Vec::new(),
+                complete: true,
+                segment_path: None,
+                exit_code: Some(0),
+            })
+            .await
+            .unwrap();
+        // A non-current workstream may finish later and therefore be more
+        // recently active; the selected workstream must still lead the list.
+        store
+            .writer
+            .finish_workstream_run(FinishWorkstreamRun {
+                run_id: older.run_id,
+                native_session_id: Some("open-code-native".into()),
+                source_cursor: None,
+                events: Vec::new(),
+                complete: true,
+                segment_path: None,
+                exit_code: Some(0),
+            })
+            .await
+            .unwrap();
+
+        let hidden = store
+            .writer
+            .prepare_workstream_run(PrepareWorkstreamRun {
+                repo_fingerprint: "other-repo".into(),
+                worktree_fingerprint: "other-worktree".into(),
+                selection: WorkstreamSelection::New("hidden".into()),
+                ..managed_prepare_input(ws, proj, "hidden")
+            })
+            .await
+            .unwrap();
+        store
+            .writer
+            .cancel_managed_run(hidden.run_id)
+            .await
+            .unwrap();
+
+        let rows = store
+            .reader
+            .recent_workstreams(ws, proj, "repo".into(), "worktree".into(), 20)
+            .await
+            .unwrap();
+        assert_eq!(
+            rows.iter().map(|row| row.name.as_str()).collect::<Vec<_>>(),
+            ["current", "older"]
+        );
+        assert!(rows[0].current);
+        assert!(!rows[1].current);
+        assert_eq!(
+            rows[0].linked_harnesses,
+            [AgentKind::ClaudeCode, AgentKind::Codex]
+        );
+        assert_eq!(rows[1].linked_harnesses, [AgentKind::OpenCode]);
+        assert!(rows[0].last_active_at >= rows[0].created_at);
+        let limited = store
+            .reader
+            .recent_workstreams(ws, proj, "repo".into(), "worktree".into(), 1)
+            .await
+            .unwrap();
+        assert_eq!(limited.len(), 1);
+        assert_eq!(limited[0].workstream_id, current.workstream_id);
+        assert!(limited[0].current);
+        assert_eq!(
+            limited[0].linked_harnesses,
+            [AgentKind::ClaudeCode, AgentKind::Codex]
+        );
+    }
+
+    #[tokio::test]
+    async fn recent_workstreams_do_not_leak_across_workspaces() {
+        // Two workspaces can hold a project of the same name over the very
+        // same clone, so repo/worktree identity alone does not separate them:
+        // only the scope columns do.
+        let tmp = TempDir::new().unwrap();
+        let store = Store::open(tmp.path()).unwrap();
+        let (mine, mine_proj) = open_managed_scope(&store, "shared-name").await;
+        let theirs = store
+            .writer
+            .get_or_create_workspace("other-workspace")
+            .await
+            .unwrap();
+        let theirs_proj = store
+            .writer
+            .get_or_create_project(theirs, "shared-name", None)
+            .await
+            .unwrap();
+
+        for (ws, proj, name) in [(mine, mine_proj, "mine"), (theirs, theirs_proj, "theirs")] {
+            store
+                .writer
+                .prepare_workstream_run(PrepareWorkstreamRun {
+                    selection: WorkstreamSelection::New(name.into()),
+                    ..managed_prepare_input(ws, proj, name)
+                })
+                .await
+                .unwrap();
+        }
+
+        async fn visible(store: &Store, ws: WorkspaceId, proj: ProjectId) -> Vec<String> {
+            store
+                .reader
+                .recent_workstreams(ws, proj, "repo".into(), "worktree".into(), 20)
+                .await
+                .unwrap()
+                .into_iter()
+                .map(|row| row.name)
+                .collect()
+        }
+        assert_eq!(visible(&store, mine, mine_proj).await, ["mine"]);
+        assert_eq!(visible(&store, theirs, theirs_proj).await, ["theirs"]);
+        // A real workspace paired with the other one's project must not fall
+        // back to either list.
+        assert!(visible(&store, mine, theirs_proj).await.is_empty());
     }
 
     #[tokio::test]

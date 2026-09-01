@@ -43,6 +43,10 @@ pub enum Command {
     /// Resume the most recently launched managed checkout from anywhere,
     /// without `cd` and without picking from a list.
     Continue(ContinueArgs),
+    /// List open cross-agent handoffs so a stale one can be cancelled by id.
+    Handoffs(HandoffsArgs),
+    /// List recent managed workstreams selectable from the current checkout.
+    Workstreams(WorkstreamsArgs),
     /// Search the complete visible event ledger for a managed workstream.
     WorkstreamSearch(WorkstreamSearchArgs),
     /// Audit the store for likely cross-project contamination (read-only,
@@ -141,10 +145,24 @@ pub enum Command {
     /// `is_latest=false` (they were a multi-project mash-up) so the
     /// next consolidation can regenerate them per-project. Idempotent.
     Reorg(ReorgArgs),
-    /// Permanently delete a project and ALL its data (pages, sessions,
-    /// observations, handoffs, embeddings, on-disk wiki files).
-    /// This is irreversible — requires `--confirm`.
+    /// Delete a project: its pages, sessions, observations, handoffs,
+    /// embeddings, managed workstreams and on-disk wiki files.
+    ///
+    /// Irreversible — requires `--confirm`. By default this is a logical
+    /// delete: the rows are gone and nothing can reach them through the API
+    /// or search, but their bytes remain in free pages of the database file
+    /// until it is rewritten, as with any SQLite delete. `--compact`
+    /// reclaims them; neither mode is forensic erasure, because the wiki git
+    /// history and any earlier backup still hold the content.
     PurgeProject(PurgeProjectArgs),
+    /// Permanently delete ONE session and everything derived from it.
+    ///
+    /// Removes the session row, its observations, the handoffs it authored,
+    /// its derived wiki page (every version) and their embeddings — scoped
+    /// strictly to the named workspace and project. Handoffs this session
+    /// only *accepted* are left alone: their text belongs to the session that
+    /// wrote them.
+    PurgeSession(PurgeSessionArgs),
     /// Rename a project within its workspace. No files move on disk —
     /// the wiki is flat and pages are differentiated by project_id only.
     /// Useful after renaming the project's directory on disk so the hook
@@ -302,6 +320,59 @@ pub struct ContinueArgs {
     /// Forwarded to `run`.
     #[arg(long)]
     pub fresh: bool,
+}
+
+/// Arguments for `workstreams`.
+/// Arguments for `handoffs`.
+#[derive(Debug, Args)]
+pub struct HandoffsArgs {
+    /// Workspace to inspect (defaults to the resolved scope).
+    #[arg(long)]
+    pub workspace: Option<String>,
+    /// Project to inspect (defaults to the resolved scope).
+    #[arg(long)]
+    pub project: Option<String>,
+    /// Maximum handoffs to list.
+    #[arg(long, default_value_t = 50, value_parser = clap::value_parser!(u16).range(1..=500))]
+    pub limit: u16,
+    /// Emit JSON instead of the human listing.
+    #[arg(long)]
+    pub json: bool,
+    /// Expire every open handoff in the scope instead of listing them.
+    ///
+    /// Unlike the automatic sweep this does NOT spare manual handoffs or ones
+    /// from another directory — those exemptions are exactly what a leftover
+    /// backlog is made of, so honouring them would clear nothing. Pair with
+    /// `--older-than-days` to keep recent batons.
+    ///
+    /// This is a state change, not a delete: the summary and provenance
+    /// survive and the handoff simply stops being consumable. Requires
+    /// `--confirm`.
+    #[arg(long)]
+    pub expire_all: bool,
+    /// With `--expire-all`, only expire handoffs at least this many days old.
+    #[arg(long)]
+    pub older_than_days: Option<u32>,
+    /// REQUIRED by `--expire-all`.
+    #[arg(long)]
+    pub confirm: bool,
+}
+
+#[derive(Debug, Args)]
+pub struct WorkstreamsArgs {
+    /// Workspace containing the managed workstreams. Defaults to the nearest
+    /// `.ai-memory.toml` marker's `workspace`, else `default`.
+    #[arg(long)]
+    pub workspace: Option<String>,
+    /// Project override. Defaults to the current repository project.
+    #[arg(long)]
+    pub project: Option<String>,
+    /// Maximum workstreams to return, current first then newest activity.
+    #[arg(long, default_value_t = 20, value_parser = clap::value_parser!(u8).range(1..=100))]
+    pub limit: u8,
+    /// Emit JSON instead of readable rows.
+    #[arg(long)]
+    pub json: bool,
 }
 
 /// Arguments for `workstream-search`.
@@ -562,6 +633,52 @@ pub struct PurgeProjectArgs {
     /// out — purging is destructive and irreversible.
     #[arg(long)]
     pub confirm: bool,
+    /// Also reclaim the freed bytes: rebuild the FTS indexes and VACUUM the
+    /// database after the delete commits.
+    ///
+    /// Without this the purge is a logical delete — the project is gone from
+    /// the API and from search, but its bytes stay in free pages of the
+    /// database file until it is next rewritten, as with any SQLite delete.
+    ///
+    /// This rewrites the WHOLE database and needs free disk space of about
+    /// its size, so it takes minutes on a large store. It also does NOT make
+    /// the content forensically unrecoverable: the wiki git history and any
+    /// backup taken before the purge still contain it.
+    #[arg(long)]
+    pub compact: bool,
+}
+
+/// Arguments for `purge-session`.
+#[derive(Debug, Args)]
+pub struct PurgeSessionArgs {
+    /// Full session UUID, exactly as `sessions.id` stores it.
+    #[arg(long)]
+    pub session_id: String,
+    /// Workspace name. Defaults to the nearest `.ai-memory.toml` marker's
+    /// `workspace`, else `default`.
+    #[arg(long)]
+    pub workspace: Option<String>,
+    /// Project name. When omitted, auto-derived from the basename of
+    /// the current git repo root (or CWD if no git repo).
+    #[arg(long)]
+    pub project: Option<String>,
+    /// REQUIRED for the purge to run. Without this flag the CLI errors
+    /// out — purging is destructive and irreversible.
+    #[arg(long)]
+    pub confirm: bool,
+    /// Also reclaim the freed bytes: rebuild the affected FTS indexes and
+    /// VACUUM the database after the delete commits.
+    ///
+    /// Without this the purge is a logical delete — the session is gone from
+    /// the API and from search, but its bytes stay in free pages of the
+    /// database file until it is next rewritten, as with any SQLite delete.
+    ///
+    /// This rewrites the WHOLE database and needs free disk space of about
+    /// its size, so it takes minutes on a large store. It also does NOT make
+    /// the content forensically unrecoverable: the wiki git history and any
+    /// backup taken before the purge still contain it.
+    #[arg(long)]
+    pub compact: bool,
 }
 
 /// Arguments for `rename-project`.
@@ -1100,6 +1217,17 @@ pub enum AgentChoice {
     /// session-end event).
     #[value(alias = "poolside")]
     Pool,
+    /// ZCode (z.ai) — JSON-config lifecycle hooks in the root `hooks` block
+    /// of `~/.zcode/cli/config.json` (the same file `install-mcp --client
+    /// zcode` registers MCP servers in). Entries are exec-form
+    /// `type: "process"` (`command` + `args`, no shell), so ai-memory's
+    /// native `hook` command runs directly. ZCode injects `SessionStart`
+    /// stdout as model context (`hookSpecificOutput.additionalContext`,
+    /// verified live against engine v0.16.5), so handoff delivery works.
+    /// `Stop` fires at the end of every turn and there is no `SessionEnd`,
+    /// so close sessions with `ai-memory finalize-session --agent zcode`.
+    #[value(alias = "zai")]
+    Zcode,
 }
 
 impl AgentChoice {
@@ -1128,6 +1256,7 @@ impl AgentChoice {
             Self::KiroCli | Self::KiroCliV3 => AgentKind::KiroCli,
             Self::CommandCode => AgentKind::CommandCode,
             Self::Pool => AgentKind::Pool,
+            Self::Zcode => AgentKind::Zcode,
         }
     }
 
@@ -1139,7 +1268,9 @@ impl AgentChoice {
     #[must_use]
     pub const fn script_hook_subdir(self) -> Option<&'static str> {
         match self {
-            Self::OpenCode | Self::Pi | Self::Omp | Self::Openclaw | Self::Zero => None,
+            Self::OpenCode | Self::Pi | Self::Omp | Self::Openclaw | Self::Zero | Self::Zcode => {
+                None
+            }
             _ => Some(self.kind().as_str()),
         }
     }
@@ -1149,7 +1280,8 @@ impl AgentChoice {
 #[derive(Debug, Args)]
 pub struct FinalizeSessionArgs {
     /// Agent kind to finalize. Defaults to Codex for backward compatibility;
-    /// Codex, Antigravity CLI, and Pool have no reliable true SessionEnd hook.
+    /// Codex, Antigravity CLI, Pool, and ZCode have no reliable true
+    /// SessionEnd hook.
     #[arg(long, value_enum, default_value_t = AgentChoice::Codex)]
     pub agent: AgentChoice,
     /// Workspace name. Defaults to the nearest `.ai-memory.toml` marker's
@@ -1213,12 +1345,17 @@ pub enum McpClient {
     /// Oh My Pi (`omp`) — `~/.omp/agent/mcp.json`.
     #[value(alias = "oh-my-pi")]
     Omp,
-    /// Google Antigravity CLI (`agy`) — `~/.gemini/antigravity-cli/mcp_config.json`.
+    /// Google Antigravity CLI (`agy`) — `~/.gemini/config/mcp_config.json`.
     #[value(alias = "antigravity", alias = "agy")]
     AntigravityCli,
     /// Zero coding agent (Gitlawb/zero) — `~/.config/zero/config.json`,
     /// `mcp.servers` map with native HTTP transport + bearer headers.
     Zero,
+    /// ZCode (z.ai) — `~/.zcode/cli/config.json`, nested `mcp.servers`
+    /// map with `type: "http"` + `url` + optional `headers`. ZCode's
+    /// entry schema is strict: unknown keys make it drop the server
+    /// silently, so the generated entry carries nothing else.
+    Zcode,
     /// Devin CLI — `~/.devin/config.json`.
     Devin,
     /// xAI Grok Build CLI — `~/.grok/config.toml` under
@@ -2432,6 +2569,34 @@ mod tests {
     }
 
     #[test]
+    fn zcode_hook_and_finalize_aliases_parse() {
+        for alias in ["zcode", "zai"] {
+            let cli = Cli::try_parse_from([
+                "ai-memory",
+                "install-hooks",
+                "--agent",
+                alias,
+                "--server-url",
+                "http://127.0.0.1:49374",
+            ])
+            .unwrap_or_else(|error| panic!("failed to parse ZCode alias {alias}: {error}"));
+            let Command::InstallHooks(args) = cli.command else {
+                panic!("expected install-hooks for ZCode alias {alias}");
+            };
+            assert_eq!(args.agent, AgentChoice::Zcode);
+            assert_eq!(args.agent.kind(), ai_memory_core::AgentKind::Zcode);
+            // Native exec-form integration: no script bundle to stage.
+            assert_eq!(args.agent.script_hook_subdir(), None);
+        }
+        let cli = Cli::try_parse_from(["ai-memory", "finalize-session", "--agent", "zcode"])
+            .expect("failed to parse finalize-session --agent zcode");
+        let Command::FinalizeSession(args) = cli.command else {
+            panic!("expected finalize-session for zcode");
+        };
+        assert_eq!(args.agent, AgentChoice::Zcode);
+    }
+
+    #[test]
     fn command_code_mcp_and_hook_aliases_parse() {
         for alias in ["command-code", "commandcode", "cmdc", "cmd"] {
             let mcp = Cli::try_parse_from([
@@ -2479,6 +2644,23 @@ mod tests {
             panic!("expected install-mcp for swival");
         };
         assert_eq!(args.client, McpClient::Swival);
+    }
+
+    #[test]
+    fn zcode_mcp_client_parses() {
+        let cli = Cli::try_parse_from([
+            "ai-memory",
+            "install-mcp",
+            "--client",
+            "zcode",
+            "--server-url",
+            "http://memory.example:49374",
+        ])
+        .unwrap_or_else(|error| panic!("failed to parse MCP client zcode: {error}"));
+        let Command::InstallMcp(args) = cli.command else {
+            panic!("expected install-mcp for zcode");
+        };
+        assert_eq!(args.client, McpClient::Zcode);
     }
 
     #[test]

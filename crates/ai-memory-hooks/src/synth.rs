@@ -14,9 +14,12 @@ use ai_memory_core::{
 };
 use jiff::tz::TimeZone;
 
+use crate::payload::{is_safe_tool_title, truncate_for_title};
+
 const RAW_OBSERVATION_MAX_LINES: usize = 500;
 const RAW_OBSERVATION_HEAD_LINES: usize = 250;
 const RAW_OBSERVATION_TAIL_LINES: usize = RAW_OBSERVATION_MAX_LINES - RAW_OBSERVATION_HEAD_LINES;
+const SUBAGENT_PROMPT_PREAMBLE: &str = "You are a subagent spawned by another session.";
 
 /// Build a [`NewPage`] from the observations collected during a session.
 ///
@@ -101,19 +104,35 @@ pub fn synthesize_session_page(
 /// literal "session" remains only for the case where there is nothing else
 /// at all.
 fn derive_title(observations: &[Observation], session_id: SessionId) -> String {
+    let mut rejected_subagent_preamble = false;
     for obs in observations {
-        if obs.kind == ObservationKind::UserPrompt
-            && !obs.title.is_empty()
-            && !looks_like_scaffolding(&obs.title)
-        {
+        if obs.kind != ObservationKind::UserPrompt {
+            continue;
+        }
+        if obs.title.trim() == SUBAGENT_PROMPT_PREAMBLE {
+            rejected_subagent_preamble = true;
+            if let Some(title) = obs
+                .body
+                .lines()
+                .map(str::trim)
+                .find(|line| !line.is_empty() && !looks_like_title_scaffolding(line))
+            {
+                return truncate_for_title(title);
+            }
+            continue;
+        }
+        if !obs.title.is_empty() && !looks_like_scaffolding(&obs.title) {
             return obs.title.clone();
         }
+    }
+    if rejected_subagent_preamble {
+        return format!("Session {session_id}");
     }
     for obs in observations {
         if obs.kind == ObservationKind::SessionStart {
             continue;
         }
-        if !obs.title.is_empty() && !looks_like_scaffolding(&obs.title) {
+        if !obs.title.is_empty() && !looks_like_title_scaffolding(&obs.title) {
             return obs.title.clone();
         }
     }
@@ -124,6 +143,10 @@ fn derive_title(observations: &[Observation], session_id: SessionId) -> String {
         return "session".to_string();
     }
     format!("Session {session_id}")
+}
+
+fn looks_like_title_scaffolding(candidate: &str) -> bool {
+    candidate.trim() == SUBAGENT_PROMPT_PREAMBLE || looks_like_scaffolding(candidate)
 }
 
 /// The per-session counts that both the rendered body and the frontmatter
@@ -209,24 +232,39 @@ fn session_summary(tally: &SessionTally<'_>) -> String {
         let mut by_calls: Vec<(&str, usize)> =
             tally.tool_counts.iter().map(|(k, v)| (*k, *v)).collect();
         by_calls.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(b.0)));
-        let named: Vec<&str> = by_calls
+        // A `tool <family>` title is what `safe_tool_title` writes when the
+        // harness's own tool name is not carried through: a partition of the
+        // calls, never a name for them. Listing those spends the reader's
+        // attention to say "some of the calls touched files and some did
+        // not", so they are counted but not named, and a session with
+        // nothing else to name drops the clause rather than filling it.
+        let nameable: Vec<&str> = by_calls
             .iter()
-            .take(SUMMARY_MAX_NAMED_TOOLS)
             .map(|(name, _)| *name)
+            .filter(|name| !is_safe_tool_title(name))
             .collect();
-        let tools = if by_calls.len() > SUMMARY_MAX_NAMED_TOOLS {
-            format!(
-                "{} and {} more",
-                join_and(&named),
-                by_calls.len() - SUMMARY_MAX_NAMED_TOOLS
-            )
+        parts.push(if nameable.is_empty() {
+            format!("{calls} completed tool call{}", plural(calls))
         } else {
-            join_and(&named)
-        };
-        parts.push(format!(
-            "{calls} completed tool call{} across {tools}",
-            plural(calls)
-        ));
+            let named: Vec<&str> = nameable
+                .iter()
+                .copied()
+                .take(SUMMARY_MAX_NAMED_TOOLS)
+                .collect();
+            let tools = if by_calls.len() > named.len() {
+                format!(
+                    "{} and {} more",
+                    join_and(&named),
+                    by_calls.len() - named.len()
+                )
+            } else {
+                join_and(&named)
+            };
+            format!(
+                "{calls} completed tool call{} across {tools}",
+                plural(calls)
+            )
+        });
     }
 
     if let (Some(start), Some(end)) = (tally.start, tally.end)
@@ -545,6 +583,44 @@ mod tests {
         );
     }
 
+    /// Measured on a live 1,885-page instance: 21,136 of 29,804 `PostToolUse`
+    /// observations (71%) carried one of three `tool <family>` literals,
+    /// against 56 real tool names in the other 29%. Every tool mention in
+    /// every summary on that instance was a family label, so the clause was
+    /// spending characters to say nothing.
+    #[test]
+    fn family_labels_are_counted_but_not_named() {
+        let mut observations = vec![obs(ObservationKind::UserPrompt, "do the thing")];
+        for (tool, calls) in [("tool non-file", 9), ("tool file", 4), ("tool unknown", 2)] {
+            for _ in 0..calls {
+                observations.push(obs(ObservationKind::PostToolUse, tool));
+            }
+        }
+        let summary = session_summary(&tally_session(&observations));
+        assert_eq!(summary, "1 prompt, 15 completed tool calls.");
+        assert!(
+            !summary.contains("across"),
+            "nothing nameable is left, so the clause must go rather than be filled: {summary}"
+        );
+    }
+
+    /// A session that mixes both keeps the names it has. The families still
+    /// count toward the total and toward "and N more", because they are real
+    /// groups of calls — they just are not worth a reader's attention.
+    #[test]
+    fn real_names_survive_alongside_family_labels() {
+        let mut observations = vec![obs(ObservationKind::UserPrompt, "do the thing")];
+        for (tool, calls) in [("tool non-file", 20), ("Bash", 5), ("Edit", 2)] {
+            for _ in 0..calls {
+                observations.push(obs(ObservationKind::PostToolUse, tool));
+            }
+        }
+        assert_eq!(
+            session_summary(&tally_session(&observations)),
+            "1 prompt, 27 completed tool calls across Bash and Edit and 1 more."
+        );
+    }
+
     #[test]
     fn many_tools_are_named_by_volume_then_counted() {
         let mut observations = vec![obs(ObservationKind::UserPrompt, "do the thing")];
@@ -586,6 +662,68 @@ mod tests {
                 "{scaffold:?} must be skipped in favour of the next real prompt"
             );
         }
+    }
+
+    #[test]
+    fn subagent_preamble_promotes_the_first_task_line() {
+        let preamble = "You are a subagent spawned by another session.";
+        let task = "Review the audit runbook and identify stale checks.";
+        let mut prompt = obs(ObservationKind::UserPrompt, preamble);
+        prompt.body = format!("{preamble}\n\n{task}");
+
+        let page = synthesize_session_page(
+            WorkspaceId::new(),
+            ProjectId::new(),
+            SessionId::new(),
+            AgentKind::OpenCode,
+            &[prompt],
+        );
+
+        assert_eq!(page.title, task);
+    }
+
+    #[test]
+    fn subagent_preamble_without_a_task_falls_back_to_session_identity() {
+        let session_id = SessionId::new();
+        let preamble = "You are a subagent spawned by another session.";
+        let mut prompt = obs(ObservationKind::UserPrompt, preamble);
+        prompt.body = preamble.into();
+        let observations = vec![prompt, obs(ObservationKind::PostToolUse, "tool file")];
+
+        let page = synthesize_session_page(
+            WorkspaceId::new(),
+            ProjectId::new(),
+            session_id,
+            AgentKind::OpenCode,
+            &observations,
+        );
+
+        assert_eq!(page.title, format!("Session {session_id}"));
+    }
+
+    #[test]
+    fn repeated_user_requests_remain_separate_session_pages() {
+        let first_session = SessionId::new();
+        let second_session = SessionId::new();
+        let observations = vec![obs(ObservationKind::UserPrompt, "Review the audit runbook")];
+
+        let first = synthesize_session_page(
+            WorkspaceId::new(),
+            ProjectId::new(),
+            first_session,
+            AgentKind::OpenCode,
+            &observations,
+        );
+        let second = synthesize_session_page(
+            WorkspaceId::new(),
+            ProjectId::new(),
+            second_session,
+            AgentKind::OpenCode,
+            &observations,
+        );
+
+        assert_eq!(first.title, second.title);
+        assert_ne!(first.path, second.path);
     }
 
     /// Every candidate is scaffolding. The page still needs a title, and

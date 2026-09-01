@@ -7,8 +7,9 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use ai_memory_consolidate::{
-    AutoImproveReviewConfig, Consolidator, EmbedBackfillOptions, ScheduledAutoImproveSettings,
-    run_auto_improve_scheduler_tick, run_embedding_backfill, run_lint, run_sweep_with_breadth,
+    AutoImproveReviewConfig, Consolidator, EmbedBackfillOptions, ObservationRetention,
+    ScheduledAutoImproveSettings, run_auto_improve_scheduler_tick, run_embedding_backfill,
+    run_lint, run_sweep_with_options,
 };
 use ai_memory_core::{ActiveProject, ProjectId, Sanitizer, WorkspaceId};
 use ai_memory_hooks::{
@@ -17,7 +18,7 @@ use ai_memory_hooks::{
 };
 use ai_memory_llm::{Embedder, LlmProvider, ProviderHealth, build_embedder, build_provider};
 use ai_memory_mcp::{
-    AdminState, AiMemoryServer, ScopeInvalidation, admin_router_with_decay_breadth,
+    AdminState, AiMemoryServer, ScopeInvalidation, admin_router_with_sweep_tuning,
 };
 use ai_memory_store::{ReaderPool, Store, WriterHandle};
 use ai_memory_web::{WebMountSpec, mount_web_router, normalize_prefix, web_base_href};
@@ -525,6 +526,7 @@ pub async fn run(config: &Config, args: ServeArgs) -> Result<()> {
         .with_wiki(wiki.clone())
         .with_decay_params(decay_params)
         .with_decay_breadth_weight(config.decay.breadth_weight)
+        .with_observation_retention(config.decay.observation_retention())
         .with_auto_improve_require_approval(config.auto_improve.require_approval)
         .with_auto_improve_review_config(auto_improve_review_config_from_settings(
             &config.auto_improve,
@@ -687,7 +689,7 @@ pub async fn run(config: &Config, args: ServeArgs) -> Result<()> {
                 sanitizer: sanitizer.clone(),
                 data_dir: config.data_dir.clone(),
             });
-            let admin = admin_router_with_decay_breadth(
+            let admin = admin_router_with_sweep_tuning(
                 AdminState {
                     ingest_metrics: ingest_metrics.clone(),
                     writer: store.writer.clone(),
@@ -717,6 +719,7 @@ pub async fn run(config: &Config, args: ServeArgs) -> Result<()> {
                     trusted_proxy_identity: trusted_proxy_identity_enabled(&config.auth),
                 },
                 config.decay.breadth_weight,
+                config.decay.observation_retention(),
             );
             // Multi-rung auth assembly:
             //   - rung 0 (no bearer_token configured) → AuthState::new
@@ -966,6 +969,7 @@ async fn start_maintenance_scheduler(
                             &wiki,
                             &decay.decay_params(),
                             decay.breadth_weight,
+                            decay.observation_retention(),
                         )
                         .await?;
                         if outcome.errors > 0 {
@@ -980,6 +984,7 @@ async fn start_maintenance_scheduler(
                             evicted = outcome.evicted,
                             expired = outcome.expired,
                             hard_deleted = outcome.hard_deleted,
+                            observations_pruned = outcome.observations_pruned,
                             errors = outcome.errors,
                             elapsed_ms = started.elapsed().as_millis(),
                             "scheduled forget sweep completed"
@@ -1102,6 +1107,7 @@ async fn start_maintenance_scheduler(
                         Ok(outcome) => info!(
                             scopes = outcome.scopes,
                             embedded = outcome.embedded,
+                            skipped = outcome.skipped,
                             failed = outcome.failed,
                             errors = outcome.errors,
                             elapsed_ms = started.elapsed().as_millis(),
@@ -1195,6 +1201,7 @@ struct ScheduledSweepTickOutcome {
     evicted: usize,
     expired: usize,
     hard_deleted: usize,
+    observations_pruned: usize,
     errors: usize,
 }
 
@@ -1204,6 +1211,7 @@ async fn run_scheduled_sweep_tick(
     wiki: &Wiki,
     decay: &ai_memory_store::DecayParams,
     breadth_weight: f64,
+    retention: ObservationRetention,
 ) -> Result<ScheduledSweepTickOutcome> {
     let scopes = reader.list_all_scopes().await?;
     let mut outcome = ScheduledSweepTickOutcome {
@@ -1212,7 +1220,7 @@ async fn run_scheduled_sweep_tick(
     };
 
     for scope in scopes {
-        match run_sweep_with_breadth(
+        match run_sweep_with_options(
             reader,
             writer,
             Some(wiki),
@@ -1220,6 +1228,7 @@ async fn run_scheduled_sweep_tick(
             scope.project_id,
             decay,
             breadth_weight,
+            retention,
             false,
         )
         .await
@@ -1229,6 +1238,7 @@ async fn run_scheduled_sweep_tick(
                 outcome.evicted += report.evicted.iter().filter(|page| page.deleted).count();
                 outcome.expired += report.expired.len();
                 outcome.hard_deleted += report.hard_deleted;
+                outcome.observations_pruned += report.observations_pruned;
             }
             Err(e) => {
                 outcome.errors += 1;
@@ -1299,6 +1309,10 @@ async fn run_scheduled_lint_tick(
 struct ScheduledEmbeddingBackfillTickOutcome {
     scopes: usize,
     embedded: usize,
+    /// Pages that already had a current embedding. Reported because a
+    /// tick that skipped everything and a tick that had nothing to do
+    /// are otherwise indistinguishable in the log.
+    skipped: usize,
     failed: usize,
     errors: usize,
 }
@@ -1329,6 +1343,7 @@ async fn run_scheduled_embedding_backfill_tick(
         {
             Ok(counts) => {
                 outcome.embedded += counts.embedded;
+                outcome.skipped += counts.skipped;
                 outcome.failed += counts.failed;
             }
             Err(e) => {
@@ -2521,9 +2536,16 @@ mod tests {
             cold_threshold: 2.0,
             ..ai_memory_store::DecayParams::default()
         };
-        let outcome = run_scheduled_sweep_tick(&store.reader, &store.writer, &wiki, &decay, 0.0)
-            .await
-            .unwrap();
+        let outcome = run_scheduled_sweep_tick(
+            &store.reader,
+            &store.writer,
+            &wiki,
+            &decay,
+            0.0,
+            ObservationRetention::default(),
+        )
+        .await
+        .unwrap();
 
         assert_eq!(outcome.scopes, 2);
         assert_eq!(outcome.errors, 0);
@@ -2636,6 +2658,58 @@ mod tests {
                 .unwrap();
             assert_eq!(embedded.len(), 1, "each project should get embeddings");
         }
+    }
+
+    /// A tick that skipped every page and a tick that had nothing to do
+    /// both embed zero pages. Without `skipped` in the completion line
+    /// they are the same log entry, so a page being passed over every
+    /// hour reads as a quiet, healthy scheduler (#509).
+    #[tokio::test]
+    async fn scheduled_embedding_tick_distinguishes_skipped_work_from_an_idle_pass() {
+        let (_tmp, store, wiki, ws, first, second) = two_project_wiki().await;
+        let embedder: Arc<dyn Embedder> = Arc::new(SyntheticEmbedder::new(16));
+
+        let idle =
+            run_scheduled_embedding_backfill_tick(&store.reader, &store.writer, &wiki, &embedder)
+                .await
+                .unwrap();
+        assert_eq!(
+            (idle.embedded, idle.skipped),
+            (0, 0),
+            "no pages yet: nothing embedded and nothing skipped"
+        );
+
+        for (project, name) in [(first, "first"), (second, "second")] {
+            write_test_page(
+                &wiki,
+                ws,
+                project,
+                &format!("notes/{name}.md"),
+                name,
+                Tier::Semantic,
+            )
+            .await;
+        }
+
+        let first_pass =
+            run_scheduled_embedding_backfill_tick(&store.reader, &store.writer, &wiki, &embedder)
+                .await
+                .unwrap();
+        assert_eq!((first_pass.embedded, first_pass.skipped), (2, 0));
+
+        let second_pass =
+            run_scheduled_embedding_backfill_tick(&store.reader, &store.writer, &wiki, &embedder)
+                .await
+                .unwrap();
+        assert_eq!(
+            (second_pass.embedded, second_pass.failed),
+            (0, 0),
+            "the work is done, so the tick embeds nothing"
+        );
+        assert_eq!(
+            second_pass.skipped, 2,
+            "but it must still say it passed over two pages, or it is              indistinguishable from the idle tick above"
+        );
     }
 
     #[test]

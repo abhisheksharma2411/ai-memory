@@ -7,6 +7,426 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- `ai-memory handoffs --expire-all --confirm` and `POST /admin/handoffs/expire`
+  clear a stale open-handoff backlog for one scope. The listing added in
+  v1.35.0 made a backlog visible and gave `memory_handoff_cancel` the ids it
+  needs, but clearing one required a call per handoff (#513).
+
+  It deliberately does **not** honour the exemptions the automatic sweep
+  applies. `expire_superseded_auto_handoffs` spares manual handoffs
+  (`from_session_id IS NULL`) and ones whose `cwd` does not match the accepting
+  session — correct for a sweep triggered by an unrelated accept, and the
+  reason a backlog accumulates at all. The leftover backlog is therefore made,
+  by construction, of exactly the handoffs that sweep will never touch, so an
+  operator-driven expiry honouring the same exemptions would clear nothing. A
+  test pins that: applying the sweep's manual-handoff exemption leaves the
+  backlog behind.
+
+  A state change rather than a delete — the summary, provenance and timestamps
+  survive and the handoff simply stops being consumable, which is also why it
+  is recoverable in a way a delete would not be. Owner scoping lives inside the
+  `UPDATE` so expiring another user's baton is a zero-row no-op rather than a
+  read-then-write race, matching `cancel_handoff`. `--older-than-days N` keeps
+  recent batons; `--confirm` is required and the count is audited.
+- `ai-memory purge-session --session-id <uuid> --confirm` and
+  `POST /admin/purge-session` delete one session by UUID: its row, its
+  observations, the handoffs it authored, its `sessions/<id>.md` page and
+  every superseded version, their embeddings, and its auto-improve runs.
+  `purge-project` was too broad and `delete-page` removed a single wiki path,
+  so an application promising to forget one conversation had nothing to call
+  (#387).
+
+  Scope is enforced structurally rather than trusted: every statement filters
+  on `workspace_id` and `project_id` alongside `session_id`, a session outside
+  the named scope is a `404` with nothing deleted, and derived pages are
+  deleted by id rather than by path — two projects can hold the same
+  `sessions/<uuid>.md`, and deleting by path would take the other one with it.
+  Targets are collected before anything is cut, because
+  `auto_improve_runs.session_id`, `handoffs.from_session_id`,
+  `handoffs.accepted_by_session` and `pages.supersedes` are all
+  `ON DELETE SET NULL`: cutting the session first destroys the pointers needed
+  to find what it produced. Handoffs the session only *accepted* are
+  deliberately kept — that text belongs to the session that authored them. The
+  admission chain runs before any row is touched, so a `reject`-policy webhook
+  can still abort the purge.
+
+  The purge is terminal. Events that produced a session can sit undelivered in
+  a client hook spool for days, and `begin_session` would otherwise recreate
+  the session row when that spool drained — silently undoing a deletion an
+  application had already reported to its user. A `purged_sessions` tombstone
+  (V52) is written in the same transaction as the delete, and ingest refuses to
+  recreate a session that carries one. The tombstone is scoped, so purging an
+  id in one project cannot suppress capture for that id elsewhere.
+
+  The purge is a **logical delete** by default: the session is unreachable
+  through the API and through search, but its bytes stay in free pages of the
+  database file, as with any SQLite delete. `--compact` additionally rebuilds
+  the affected FTS5 indexes and `VACUUM`s. The rebuild is the operative step —
+  measured, an ordinary delete leaves the tokens inside the index segments and
+  `VACUUM` alone does not clear them. `--compact` rewrites the whole database,
+  needs free disk space of about its size, and is **not** forensic erasure: the
+  wiki git history keeps page content in its objects and commit messages, and
+  earlier backups still contain it. `docs/lifecycle-ops.md` states that
+  boundary in a table so it is not inferred from the command name.
+
+- `ai-memory purge-project --compact` and `{"compact": true}` on
+  `POST /admin/delete-workspace` reclaim the bytes a delete frees, reusing the
+  `Compaction` opt-in that `purge-session` gained in the same cycle (#540). Both
+  responses now report `compacted`.
+
+  Compaction rebuilds **all three** FTS5 indexes rather than the two a session
+  purge needs. A managed workstream's `workstream_events` rows leave through the
+  `projects → workstreams → workstream_events` cascade, and a cascade does not
+  fire the `AFTER DELETE` trigger that would drop them from
+  `workstream_events_fts` — so the tokens survive an ordinary delete, and a
+  `VACUUM` alone does not clear them. A test pins this: removing the third
+  rebuild leaves a purged agent transcript's text in the database file.
+
+### Fixed
+- A failed or skipped embed now leaves a durable record. `page_embeddings`
+  stores only successes, and its upsert rewrites `created_at`, so a global
+  `embed --force` erased any signal about which row had been stale. A failure
+  left nothing at all: the inline write path warned and returned success, and
+  the backfill's per-page warnings lived only in container logs that a restart
+  took with them (#528).
+
+  A `page_embed_failures` ledger (V53) records the last attempt that produced
+  no embedding, across all four sites: the inline `write_page` embed, and the
+  backfill's unreadable-page, empty-body and provider-error branches. The
+  empty-body case matters most — a page skipped on every pass was previously
+  indistinguishable from an idle one, which is what made #509 undiagnosable.
+
+  Failure-only by design. A success writes nothing, because a `page_embeddings`
+  row already records it, so the common path pays no extra write and
+  `embed --force` cannot erase the history — it never touches this table.
+  `status` joins the two to report unresolved failures separately from ones a
+  later pass recovered, so a page that failed once and was repaired does not
+  read as an outstanding problem forever. One row per page, cascading with it.
+
+  Designed to @barrosohub's three constraints, who also supplied the
+  measurement that made the gap concrete: of 1,491 embedding rows on their
+  instance, zero predated the `--force` that had overwritten every timestamp.
+
+- The hook drain no longer stalls the whole spool behind one undeliverable
+  entry. A spooled event carries the URL it was captured against, so a spool
+  can hold entries addressed to a port nothing listens on any more — an old
+  `--bind`, or a server that came back on a different port. The drain stopped
+  at the first such entry, charged it a single retry attempt and returned, so
+  every deliverable event queued behind it was never attempted. With a dead
+  head of queue this is not a delay but silent loss: those events sat until the
+  7-day spool window discarded them undelivered, while the drain reported the
+  same `0 sent, N queued, 0 dropped` a healthy idle pass reports.
+
+  A transport failure is now distinguished from a server rejection
+  (`PostOutcome::Unreachable` / `BatchOutcome::Unreachable`). When an endpoint
+  cannot be reached the drain charges one attempt to the entry it actually
+  tried, records the address, skips its remaining siblings without charging
+  them for an attempt they never got, and carries on to entries addressed
+  somewhere that answers. A total outage behaves exactly as before — every
+  entry shares the one dead endpoint, so the pass still ends having burnt a
+  single attempt. Reported by @rob-prado, who traced it to the head of their
+  own 7,949-entry spool being 100% dead-port, and by @swhite1122, whose
+  stand-in courier avoided the stall by continuing past failures (#493).
+
+  An entry frozen against a dead **loopback** port is also now retried once
+  against the address in the store's own `config.toml`, so a server that came
+  back on a different port delivers its backlog instead of merely skipping it.
+  Restricted to loopback because a loopback authority can only ever have meant
+  "this machine", making a stale port unambiguous; a remote host is left alone
+  rather than silently re-pointed. The target is read from that file directly
+  and not through the usual config load, which also merges the environment — a
+  drain honouring `AI_MEMORY_SERVER_URL` would send captured events to whatever
+  address happened to be exported into the process that ran it.
+
+- `purge-project` and `delete-workspace` no longer overstate what they delete
+  (#540). The help text promised "Permanently delete a project and ALL its
+  data", which reads as byte-level removal neither command performed.
+
+  The deletion was never the defect. Rows go and bytes stay in free pages until
+  the file is rewritten — ordinary SQLite behaviour, and the same boundary
+  `purge-session` already documented. Measured on a canary token: delete alone
+  leaves the text on disk, delete + `VACUUM` still leaves it, and only
+  delete + FTS `rebuild` + `VACUUM` removes it. The claim was what needed
+  fixing, so both commands now describe the boundary they actually enforce and
+  offer the same `--compact` opt-in, and `docs/lifecycle-ops.md` covers all
+  three destructive commands in one place instead of documenting the limits of
+  one and overstating the other two.
+
+- The hook-spool drain can now recover events stranded by a rotated auth token
+  (#542). A spooled envelope freezes the bearer it was captured with, so
+  rotating the token left every already-spooled entry authenticating with the
+  old one and failing `401` forever; OIDC already re-resolved per pass, static
+  tokens did not.
+
+  The drain now retries a rejected entry once with the token it was handed by
+  the hook that spawned it, which is current by construction. Bounded three
+  ways: only after the server has already answered `401`, only for a `Static`
+  entry, and only when the live token actually differs from the one that just
+  failed — so a healthy drain never pays for it and an identical credential is
+  not re-sent.
+
+  The token reaches the drain in the child process's **environment**, never on
+  its command line: an argument would publish the credential to the process
+  table for every local user for as long as the drain runs. A test pins that it
+  stays out of argv. `401` also became a distinct `Unauthorized` outcome —
+  previously indistinguishable from any other refusal, so the drain could not
+  tell a stale credential from a bad event.
+
+  No new credential is stored at rest: the drain is handed a token that already
+  exists rather than reading one from a file ai-memory would have to write and
+  protect.
+
+### Docs
+
+- `docs/windows.md` gains **Scenario E**, a persistent-server story for native
+  Windows. Scenarios C and D both ended at `ai-memory serve` in a foreground
+  terminal, while Linux got `Restart=on-failure` from the packaged systemd
+  units; WinSW is now documented as the equivalent supervisor (#530).
+
+  It leads with the trap rather than the recipe. A Scheduled Task whose action
+  is a PowerShell script calling `Start-Process` looks correct and is silently
+  killed at the next reboot: `Start-Process` returns immediately, the script
+  exits, and Task Scheduler tears down the job object the still-running server
+  was never detached from. The only symptom is a permanently green
+  `LastTaskResult = 0`, which is why it costs hours. Reported and root-caused
+  with event-log evidence by @gabrielscharb.
+
+  Also documented: `sc create` against `ai-memory.exe` cannot work (no SCM
+  control-code dispatcher, and none is planned — the resiliency belongs in the
+  supervisor, as it does on Linux); the corrected Task Scheduler shape for
+  anyone who wants one anyway; and why the WinSW config must use absolute paths
+  — a service runs as `LocalSystem`, so `%LOCALAPPDATA%` would resolve to the
+  system profile and quietly serve an empty data directory.
+
+- Scenario E's WinSW steps were executed end to end on real Windows hardware,
+  and the doc now records what they were true for: Windows 11 25H2 (build
+  26200.9168), WinSW v2.12.0, ai-memory v1.38.0, from an elevated PowerShell
+  session against a throwaway service, port and data directory. Install, start,
+  `LocalSystem` + `Automatic`, an MCP `initialize` answered over the bound
+  port, the absolute `--data-dir` honoured, crash recovery ~8s after
+  force-killing the wrapped process, and a clean stop/uninstall all held;
+  the service was configured with `StartType Automatic`, but boot-time
+  startup was not independently exercised (#530).
+
+## [1.38.0] - 2026-08-30
+
+### Added
+- ZCode (z.ai) lifecycle-hook integration as `install-hooks --agent zcode`
+  (alias `zai`), following the Zero model: exec-form native commands
+  (`type: "process"`, no shell) merged into the root `hooks` block of
+  `~/.zcode/cli/config.json` around third-party hooks, covering the six
+  documented triggers (`SessionStart`, `UserPromptSubmit`, `PreToolUse`,
+  `PostToolUse`, `PostToolUseFailure`, `Stop`) with capture exclusions
+  enforced natively (#512). `PermissionRequest` is deliberately not
+  installed — its hook chain races the interactive permission client, so
+  passive capture of that event is unreliable — and there is no true
+  session-end, so finished sessions are closed with
+  `ai-memory finalize-session --agent zcode`. Unlike Pool and Zero,
+  `SessionStart` stdout injection works
+  (`hookSpecificOutput.additionalContext`, verified live against the
+  embedded engine v0.16.5), so the prior session's handoff is delivered
+  automatically.
+
+## [1.37.0] - 2026-08-30
+
+### Added
+- Added `GET /admin/audit-log`, a read-only paginated reader for the existing
+  `audit_log` table. Events resolve workspace, project, page path, and author
+  username through LEFT JOINs (orphans stay `null` — the log has no foreign
+  keys by design), page by keyset (`before_id`) so a live trail cannot skip or
+  duplicate rows, and clamp `limit` to 1..=200 (default 50). The `detail`
+  column is returned for schema fidelity; the only writer still stores the
+  literal `{}`. (#531)
+- `install-mcp --client zcode` registers ai-memory as an MCP server in the
+  ZCode CLI (z.ai). The user-scope config lives at `~/.zcode/cli/config.json`
+  with servers under the nested `mcp.servers` map, and the generated entry is
+  a native streamable-HTTP registration — `type: "http"`, `url`, and an
+  `Authorization` bearer header when a token is configured. ZCode's entry
+  schema is strict (unknown keys make it drop the server silently), so the
+  entry carries exactly those keys and nothing else. `--apply` merges in place
+  preserving sibling servers and is idempotent; uninstall sweeps the same
+  file. MCP-only for now — lifecycle hooks are tracked separately in #512.
+  (#511)
+
+### Fixed
+- Stopped a session summary spending its characters on tool family labels. The
+  summary #477 added names the busiest tools, but for the seven agents that go
+  through `closed_tool_agent` — Claude Code among them — a tool observation's
+  title is written by `safe_tool_title` as `tool <family>`, and `ToolFamily`
+  has four variants. Measured on a live 1,885-page instance, 21,136 of 29,804
+  `PostToolUse` observations (71%) carried one of three such literals against
+  56 real tool names in the other 29%, and every tool mention in every summary
+  there was a family label: `580 completed tool calls across tool non-file,
+  tool unknown and tool file` spent 47 characters to say that some calls
+  touched files and some did not. Family labels are now counted but not named,
+  and a session with nothing else to name drops the clause instead of filling
+  it. The predicate lives beside the writer and is derived from the same serde
+  representation, so a new `ToolFamily` variant cannot escape it. (#527)
+
+## [1.36.0] - 2026-08-29
+
+### Added
+- Bounded raw-observation retention as an opt-in fourth pass of the M8 forget
+  sweep, disabled by default. Nothing in the tree could delete an `observations`
+  row for age: the sweep acts on pages only, so raw capture grew without limit.
+  Measured on a three-month-old install, `observations` plus its FTS shadow and
+  four indexes were ~5.4 GB of a 5.53 GB store (5,236,232 rows), against 0.03 GB
+  of `pages` — the 2,365 compiled pages that hold the durable value. The nightly
+  backup tarball was 2.7 GB, almost all of it capture already distilled into
+  30 MB of Markdown. `decay.observation_retention_days` (default `0` = disabled)
+  now lets an operator bound that, and `decay.observation_prune_batch` (default
+  `5000`) bounds each transaction. (#508)
+
+  The pass deletes an observation only when its session was already consolidated
+  into a summary page that is still live, and the row is older than the
+  configured age. That is three gates on columns the schema already maintains:
+  `sessions.summary_page_id` is written only by the session-end path, so it
+  already implies `ended_at IS NOT NULL`; `pages.superseded_at IS NULL` excludes
+  a session whose page decay has evicted, because that session's raw rows are
+  now the only surviving copy; and a hard-deleted page has already NULLed the
+  pointer through `ON DELETE SET NULL`, so the join finds nothing. The prune
+  therefore runs LAST, after this same run's evictions and hard-deletes, rather
+  than letting raw capture outlive its distillation by one sweep. A session with
+  no `sessions` row, or one still running, matches nothing and can never lose a
+  row.
+
+  Each batch is one transaction sent as its own message to the single-writer
+  actor, so every other pending write interleaves between batches and a
+  multi-million row prune never holds the write lock across the run. Measured on
+  a 300,000-row store built from the shipped migrations: ~23-27 ms per 5,000-row
+  batch including the FTS trigger work, plus ~2-4 ms to commit. The session-end
+  observation watermark (`sessions.ended_observation_count`) is repaired in the
+  same transaction and only downward, so a resumed session's genuinely new work
+  is still read as new work instead of `AlreadyEnded`. One `prune_observations`
+  audit row is written per batch that actually deleted, inside that batch's
+  transaction. Zero migrations: every access is an index seek on
+  `idx_observations_project_created` and `idx_observations_session`, both of
+  which predate this change.
+
+  The cost is stated rather than hidden, and it is not just disk: observations
+  are the input to consolidation, so pruning is irreversible — a pruned session
+  can never be re-consolidated (not with a better model, a better prompt, or a
+  fixed consolidator bug) and its summary page becomes the only surviving
+  account of that session. Concretely: the raw transcript
+  view returns empty, `raw_hits` can no longer match the exact original wording,
+  a manual auto-improve rerun rejects with `too_few_observations`, and a
+  `move_session` with `PagesMode::Regenerate` has nothing left to rebuild the
+  page from. All of it is reachable only by setting a positive age. Note that
+  SQLite does not return freed pages to the OS without `VACUUM`, so the `.db`
+  file will not shrink after the first prune — the `ai-memory backup` tarball
+  will, because it is a fresh online copy.
+
+### Fixed
+- The CHANGELOG frozen-section check no longer fires on a branch that merged
+  `main` after a release. It compared line ranges since the merge base, so a
+  newly released section arriving through the merge read as lines the branch
+  had touched. It now compares the released half of the file directly against
+  the base branch, which is the question it was always asking. Two pipelines
+  also exited 141 under `pipefail` when `head -1` and `grep -q` closed a pipe
+  early, so the check reported "HEAD predates" on a branch that did not.
+- `hook-drain` no longer reports a clean pass when it could not read the spool
+  at all. `list_entries` was `read_dir(spool).ok()?`, so any IO failure —
+  permissions, a missing directory, a transient error — became "no entries" and
+  the drain returned zero sent, zero queued, zero dropped, exit 0, spool files
+  untouched, and not one byte on the wire. That is indistinguishable from a
+  healthy idle queue and cannot be diagnosed from outside the process. The
+  listing error is now reported on stderr, which the detached drainer
+  redirects into `logs/hook-drain.log`, and individual unreadable entries are
+  counted and reported rather than silently shortening the queue (#493).
+- The scheduled embedding backfill now reports how many pages it skipped.
+  It logged `embedded`, `failed` and `errors`, so a tick that passed over
+  every page and a tick with nothing to do produced the same completion
+  line — a page being skipped once an hour was indistinguishable from a
+  quiet, healthy scheduler. The count was already being returned by the
+  backfill and discarded at the caller. Reported by @barrosohub, who also
+  read the source to narrow it down (#509).
+
+
+## [1.35.0] - 2026-08-29
+
+### Added
+- `ai-memory handoffs` lists the open cross-agent handoffs for a project,
+  oldest first, with the id `memory_handoff_cancel` requires. A backlog was
+  previously visible only as a count in `status`: nothing exposed an id, so the
+  one available remedy could not be used. Read-only and content-free —
+  identity, provenance and age, never the handoff body. Automatic expiry
+  deliberately spares manual and sibling-directory handoffs, so a months-old
+  entry appearing here is that policy working as intended; the listing exists
+  so an operator can see it and decide (#513).
+
+### Fixed
+- Documented `ai-memory handoffs`. It shipped listed only in the
+  ARCHITECTURE subcommand block, which a guard test enforces — so the command
+  satisfied the check for being *present* without anyone being told what it
+  does. README and the MCP tool table now name it beside
+  `memory_handoff_cancel`, which is the tool it exists to make usable.
+- Made every "how long ago" in the CLI read the same way. Four separate
+  renderers had accumulated — `show`, `run`, `workstreams` and `handoffs` —
+  so the same elapsed time appeared as `3 hours ago`, `3h ago` or `74 days
+  ago` depending on which command produced it. They now share one helper, and
+  a long-idle native session reads `2 months ago` in `run` as it already did
+  elsewhere. `status`'s spool line is deliberately untouched: it renders a
+  duration (`oldest: 2h 10m`), not an "ago", and answers a different question.
+- `install-mcp --client antigravity-cli` wrote to `~/.gemini/antigravity-cli/mcp_config.json`,
+  but the Antigravity CLI documents its global MCP config at
+  `~/.gemini/config/mcp_config.json`; the `antigravity-cli/` directory is its
+  internal data dir and only holds an internal copy of the file. The default
+  path now targets `~/.gemini/config/mcp_config.json`, which also matches the
+  hooks integration (`~/.gemini/config/hooks.json`) (#510).
+- `install-hooks --agent codex --apply` produced a Windows command every Codex
+  hook rejected. Codex evaluates its `hooks.json` command strings with
+  PowerShell, where a quoted path in command position is a string expression
+  rather than an invocation, so each hook exited 1 with a ParserError and
+  captured nothing. The command now carries PowerShell's `&` call operator.
+  Scoped to Codex deliberately: `&` separates commands under cmd.exe, which is
+  what Claude Code's runner uses, so applying it everywhere would break the
+  integration that works today. A rendering test pins both directions, and
+  `uninstall` still recognises the new form (#515).
+
+## [1.34.0] - 2026-08-28
+
+### Added
+- `EMBEDDING_API_KEY`, an optional embedding-only credential resolved ahead of
+  `OPENAI_API_KEY` and `LLM_API_KEY`. Embeddings are already independently
+  configurable — `AI_MEMORY_EMBEDDING_PROVIDER`, `_MODEL`, `_DIM` and
+  `_BASE_URL` each have their own setting — but there was no key to go with
+  them, so pointing `AI_MEMORY_EMBEDDING_BASE_URL` at a second provider sent it
+  whichever credential the chat model happened to use. `voyage` and
+  `google`/`gemini` were unaffected: they already name their own key. `openai`
+  now resolves `EMBEDDING_API_KEY` → `OPENAI_API_KEY` → `LLM_API_KEY` (the last
+  still only with a custom base URL); `openai-compat` resolves
+  `EMBEDDING_API_KEY` → `LLM_API_KEY` and stays keyless when neither is set.
+  With the new variable absent, resolution is byte-identical to before. Both
+  `NotConfigured` messages name it, since that error is where an operator hits
+  the missing-key path. (#514)
+- The standalone `ai-memory-importer` companion can now replay bounded generic
+  external-conversation JSON into the existing observation/consolidation
+  pipeline. It is dry-run by default; `--apply` sends one ordered `/hook/batch`
+  with the dedicated `external-import` wire identity (stored in core's closed
+  `other` bucket), with extension provenance for assistant and system messages.
+  Full-envelope validation, client-side credential redaction,
+  stable session/event idempotency keys, event/byte caps, and a durable partial
+  failure manifest make interrupted imports safely resumable. Product-specific
+  ChatGPT/Claude export adapters and watch folders remain out of tree. (#483)
+- Added `ai-memory workstreams`, a read-only checkout-local list of recent
+  managed workstreams with the current selection first, linked harnesses,
+  timestamps, and stable ids. Human-readable and `--json` output share the same
+  bounded POST query, which follows `run`'s exact workspace, project,
+  repository, and worktree identity without returning checkout paths,
+  fingerprints, or native session ids. The Docker shell wrapper routes the
+  command through its native host client so repository identity remains
+  correct. (#499)
+### Fixed
+- OpenCode subagent session pages no longer use the fixed `You are a subagent
+  spawned by another session.` preamble as their title. The zero-LLM
+  synthesizer now promotes the first usable task line from the prompt body and
+  falls back to the session identity when the prompt contains only the
+  preamble. Repeated real user requests still remain separate session pages.
+  (#518)
+
+## [1.33.1] - 2026-08-28
+
 ### Fixed
 - CI now rejects a change that writes into an already-released CHANGELOG
   section. `bin/release` renames `## [Unreleased]` to `## [X.Y.Z]`, so a branch
@@ -3892,7 +4312,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Consolidator used server startup default project instead of the
   session's actual project.
 
-[Unreleased]: https://github.com/akitaonrails/ai-memory/compare/v1.33.0...HEAD
+[Unreleased]: https://github.com/akitaonrails/ai-memory/compare/v1.38.0...HEAD
+[1.38.0]: https://github.com/akitaonrails/ai-memory/releases/tag/v1.38.0
+[1.37.0]: https://github.com/akitaonrails/ai-memory/releases/tag/v1.37.0
+[1.36.0]: https://github.com/akitaonrails/ai-memory/releases/tag/v1.36.0
+[1.35.0]: https://github.com/akitaonrails/ai-memory/releases/tag/v1.35.0
+[1.34.0]: https://github.com/akitaonrails/ai-memory/releases/tag/v1.34.0
+[1.33.1]: https://github.com/akitaonrails/ai-memory/releases/tag/v1.33.1
 [1.33.0]: https://github.com/akitaonrails/ai-memory/releases/tag/v1.33.0
 [1.32.2]: https://github.com/akitaonrails/ai-memory/releases/tag/v1.32.2
 [1.32.1]: https://github.com/akitaonrails/ai-memory/releases/tag/v1.32.1
