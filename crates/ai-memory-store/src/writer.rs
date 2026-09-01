@@ -1629,6 +1629,15 @@ impl WriterHandle {
         rx.await.map_err(|_| StoreError::WriterClosed)?
     }
 
+    /// Instantaneous write-queue depth as `(queued, capacity)`. A queue
+    /// pinned near capacity means writers are being backpressured — the
+    /// wedged-writer signal `status` surfaces (2.0 item 7).
+    #[must_use]
+    pub fn queue_depth(&self) -> (usize, usize) {
+        let max = self.inner.tx.max_capacity();
+        (max.saturating_sub(self.inner.tx.capacity()), max)
+    }
+
     /// Record a completed cross-session ("experience") pass for a scope.
     ///
     /// # Errors

@@ -8,6 +8,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- `status` tells more of the truth (2.0 status audit): the wiki-format
+  line (OKF migration state and the pre-migration backup archive while
+  it exists), stored embedding triples by provider/model/dim, typed-edge
+  counts by relation, and a write-queue depth gauge that surfaces a
+  backpressured (wedged) writer — shown only when non-zero.
 - An opt-in cross-session "experience" pass
   (`[auto_improve.scheduler] experience_every_sessions`): every N newly
   completed sessions, the last few session summaries are reviewed side
@@ -83,6 +88,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `docs/okf.md` and `docs/MIGRATION-2.0.md`.
 
 ### Fixed
+- `status` no longer overstates missing embeddings: empty-body pages —
+  which no embedder can ever cover and the backfill skips by rule — are
+  excluded from the "latest pages missing" figure and reported on their
+  own line (observed live as a permanently stuck 427).
 - Natural-language searches no longer surface stopword trash: bare
   queries drop English stopwords before the FTS5 OR-join, so a page
   containing five "the"s cannot outrank the page whose content matches,
