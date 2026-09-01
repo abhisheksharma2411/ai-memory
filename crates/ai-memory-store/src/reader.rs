@@ -946,8 +946,12 @@ pub struct DerivedIndexStatus {
     pub observations_rows: u64,
     /// Rows currently present in the observation FTS5 index.
     pub observations_fts_rows: u64,
-    /// Latest pages without any embedding row.
+    /// Latest pages without any embedding row whose body is non-empty —
+    /// i.e. the pages a backfill can actually act on.
     pub latest_pages_missing_embeddings: u64,
+    /// Latest pages without an embedding whose body is empty; no
+    /// embedder can ever cover these (the backfill skips them by rule).
+    pub latest_pages_unembeddable: u64,
     /// Latest pages whose last embed attempt failed or was skipped and which
     /// still have no embedding. These are the pages an operator can act on.
     pub embed_failures_unresolved: u64,
@@ -959,6 +963,9 @@ pub struct DerivedIndexStatus {
     pub embedding_rows: u64,
     /// Stored embedding triples and row counts.
     pub embedding_triples: Vec<EmbeddingTripleCount>,
+    /// Typed relation edges (`link_type != 'references'`) from latest
+    /// pages, as `(relation, count)` — the 2.0 typed-edge surface.
+    pub typed_links_from_latest_pages: Vec<(String, u64)>,
     /// Outgoing links whose source page is latest.
     pub links_from_latest_pages: u64,
     /// Latest-page outgoing links whose target path has not resolved yet.
@@ -7079,15 +7086,43 @@ impl ReaderPool {
                      JOIN pages pg ON pg.id = f.page_id AND pg.is_latest = 1 \
                      JOIN page_embeddings pe ON pe.page_id = f.page_id",
                 )?,
+                // Aligned with the backfill's own skip rule: an
+                // empty-body page can never be embedded, so counting it
+                // as \"missing\" overstated the actionable number forever
+                // (observed live: a stable 427 that no backfill could
+                // ever clear). Unembeddable pages are reported apart.
                 latest_pages_missing_embeddings: count(
                     conn,
                     "SELECT COUNT(*) \
                      FROM pages pg \
                      LEFT JOIN page_embeddings pe ON pe.page_id = pg.id \
-                     WHERE pg.is_latest = 1 AND pe.page_id IS NULL",
+                     WHERE pg.is_latest = 1 AND pe.page_id IS NULL \
+                       AND TRIM(pg.body) != ''",
+                )?,
+                latest_pages_unembeddable: count(
+                    conn,
+                    "SELECT COUNT(*) \
+                     FROM pages pg \
+                     LEFT JOIN page_embeddings pe ON pe.page_id = pg.id \
+                     WHERE pg.is_latest = 1 AND pe.page_id IS NULL \
+                       AND TRIM(pg.body) = ''",
                 )?,
                 embedding_rows: count(conn, "SELECT COUNT(*) FROM page_embeddings")?,
                 embedding_triples,
+                typed_links_from_latest_pages: {
+                    let mut stmt = conn.prepare(
+                        "SELECT l.link_type, COUNT(*) FROM links l \
+                         JOIN pages fp ON fp.id = l.from_page_id AND fp.is_latest = 1 \
+                         WHERE l.link_type != 'references' \
+                         GROUP BY l.link_type ORDER BY l.link_type",
+                    )?;
+                    let rows: Vec<(String, i64)> = stmt
+                        .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?
+                        .collect::<Result<_, _>>()?;
+                    rows.into_iter()
+                        .map(|(k, v)| (k, u64::try_from(v).unwrap_or(0)))
+                        .collect()
+                },
                 links_from_latest_pages: count(
                     conn,
                     "SELECT COUNT(*) \

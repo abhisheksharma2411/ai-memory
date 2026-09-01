@@ -1083,6 +1083,24 @@ pub struct StatusReport {
     /// Hook-ingestion counters for this server process. Counts and one
     /// timestamp only — never captured content (#428).
     pub ingest: ai_memory_core::IngestMetricsSnapshot,
+    /// Instantaneous write-queue depth `(queued, capacity)` — the
+    /// wedged-writer signal (2.0 item 7).
+    pub write_queue: (usize, usize),
+    /// Wiki-format state: whether the OKF migration has run, and the
+    /// pre-migration backup archive if its receipt still exists.
+    pub wiki_format: WikiFormatStatus,
+}
+
+/// Wiki-format section of [`StatusReport`].
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
+pub struct WikiFormatStatus {
+    /// True once the OKF v0.2 wiki migration has been applied.
+    pub okf_migrated: bool,
+    /// Pre-migration backup archive path, when the receipt exists AND
+    /// the archive file is still on disk.
+    pub backup_archive: Option<String>,
+    /// Size of that archive in bytes.
+    pub backup_archive_bytes: Option<u64>,
 }
 
 /// `GET /admin/projects` — the authoritative list of `(workspace, project)`
@@ -1110,6 +1128,14 @@ async fn handle_status(State(state): State<Arc<AdminState>>) -> impl IntoRespons
                 // Three pragma reads; a failure here must not take down the
                 // whole status response, which is also the health probe.
                 let storage = state.reader.storage_status().await.unwrap_or_default();
+                let okf_migrated = state
+                    .reader
+                    .wiki_migration_names()
+                    .await
+                    .map(|names| names.iter().any(|n| n.contains("okf")))
+                    .unwrap_or(false);
+                let backup = ai_memory_wiki::backup::BackupReceipt::load(&state.data_dir)
+                    .filter(ai_memory_wiki::backup::BackupReceipt::archive_present);
                 let report = StatusReport {
                     version: env!("CARGO_PKG_VERSION").to_string(),
                     data_dir: state.data_dir.display().to_string(),
@@ -1120,6 +1146,14 @@ async fn handle_status(State(state): State<Arc<AdminState>>) -> impl IntoRespons
                     storage,
                     providers: state.provider_health.snapshot(),
                     ingest: state.ingest_metrics.snapshot(),
+                    write_queue: state.writer.queue_depth(),
+                    wiki_format: WikiFormatStatus {
+                        okf_migrated,
+                        backup_archive: backup
+                            .as_ref()
+                            .map(|r| r.archive_path.display().to_string()),
+                        backup_archive_bytes: backup.as_ref().map(|r| r.size_bytes),
+                    },
                 };
                 (
                     StatusCode::OK,
@@ -7192,6 +7226,12 @@ mod tests {
         let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(json["providers"]["llm"]["status"], "disabled");
         assert_eq!(json["providers"]["embedding"]["status"], "disabled");
+        // 2.0 item 7: the report carries the wedged-writer gauge and the
+        // wiki-format state — a fresh store is natively conformant (no
+        // migration ran) with no backup archive.
+        assert!(json["write_queue"].is_array(), "{json}");
+        assert_eq!(json["wiki_format"]["okf_migrated"], false);
+        assert!(json["wiki_format"]["backup_archive"].is_null());
     }
 
     /// The MCP-only complement: per-client tool-call counters served

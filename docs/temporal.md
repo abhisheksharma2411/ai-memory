@@ -38,6 +38,30 @@ insert, and the supersede path closes the outgoing version's windows
 in the same transaction — a link's window can never be open-ended in
 a superseded version.
 
+## When to reach for it
+
+Ordinary `memory_query` answers "what do we know NOW" and is the right
+call 99% of the time. `as_of` is for audits and post-mortems: "what
+did the wiki say when that decision was made", "did we already know
+about this gotcha before the incident".
+
+## A worked example
+
+A project recorded `postgres` as its database, then migrated:
+
+```jsonc
+// June: notes/db.md says "we use postgres"    (entity: postgres)
+// August: the page is superseded — "we migrated to sqlite" (entity: sqlite)
+
+memory_query { "query": "postgres" }
+// → no hits: current knowledge has moved on
+
+memory_query { "query": "postgres", "as_of": "2026-07-01T00:00:00Z" }
+// → the JUNE version of notes/db.md — the page that carried the
+//   `postgres` entity when July began, even though it has since been
+//   superseded
+```
+
 ## Query
 
 `memory_query` accepts `as_of` (ISO-8601). When present the query is
