@@ -64,6 +64,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `docs/okf.md` and `docs/MIGRATION-2.0.md`.
 
 ### Fixed
+- Natural-language searches no longer surface stopword trash: bare
+  queries drop English stopwords before the FTS5 OR-join, so a page
+  containing five "the"s cannot outrank the page whose content matches,
+  and pages matching only stopwords no longer appear at all. Quoted
+  phrases and explicit-operator queries are untouched, and an
+  all-stopword query still searches its literal terms. Guarded by a
+  CI-runnable search-quality suite asserting ranking usefulness, not
+  just machinery.
 - `memory_query` no longer fails with `fts5: syntax error` when the query is
   natural language containing parentheses, apostrophe-quoted phrases, or a
   stray `OR`/`AND` (e.g. *"my visit to the Museum of Modern Art (MoMA) and
