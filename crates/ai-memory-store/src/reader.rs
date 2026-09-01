@@ -378,13 +378,13 @@ pub struct FeedbackFinding {
 /// A page matched by the entity stream, with the inverse-frequency
 /// weight that ranked it and the entity names that matched.
 #[derive(Debug, Clone)]
-pub(crate) struct EntityHit {
+pub struct EntityHit {
     /// The matched page.
-    pub(crate) hit: PageHit,
+    pub hit: PageHit,
     /// Sum of `1 / pages_carrying_entity` over the matched entities.
-    pub(crate) weight: f64,
+    pub weight: f64,
     /// Entity names that matched the query.
-    pub(crate) matched: Vec<String>,
+    pub matched: Vec<String>,
 }
 
 /// Escape a literal for use inside a SQL `LIKE` pattern with
@@ -3415,6 +3415,32 @@ impl ReaderPool {
         limit: usize,
         expiry_cutoff_us: Option<i64>,
     ) -> StoreResult<Vec<EntityHit>> {
+        self.entity_hits_for_project_at(
+            workspace_id,
+            project_id,
+            query,
+            limit,
+            expiry_cutoff_us,
+            None,
+        )
+        .await
+    }
+
+    /// Entity hits with an optional ingestion-time instant
+    /// (docs/temporal.md). `as_of_us: None` = current knowledge (latest
+    /// versions, expiry honoured). `Some(T)` = the page versions whose
+    /// entity-link windows contain `T` — expiry is deliberately ignored
+    /// there: a page valid at `T` that has since expired was still what
+    /// we knew at `T`.
+    pub async fn entity_hits_for_project_at(
+        &self,
+        workspace_id: WorkspaceId,
+        project_id: ProjectId,
+        query: &str,
+        limit: usize,
+        expiry_cutoff_us: Option<i64>,
+        as_of_us: Option<i64>,
+    ) -> StoreResult<Vec<EntityHit>> {
         let tokens = entity_query_tokens(query);
         if tokens.is_empty() || limit == 0 {
             return Ok(Vec::new());
@@ -3447,10 +3473,23 @@ impl ReaderPool {
             }
             sql_params.push(Value::Blob(workspace_id.as_bytes().to_vec()));
             sql_params.push(Value::Blob(project_id.as_bytes().to_vec()));
-            sql_params.push(Value::Integer(cutoff));
-            sql_params.push(Value::Blob(workspace_id.as_bytes().to_vec()));
-            sql_params.push(Value::Blob(project_id.as_bytes().to_vec()));
-            sql_params.push(Value::Integer(cutoff));
+            match as_of_us {
+                Some(t) => {
+                    // freq window + outer window: two params each.
+                    sql_params.push(Value::Integer(t));
+                    sql_params.push(Value::Integer(t));
+                    sql_params.push(Value::Blob(workspace_id.as_bytes().to_vec()));
+                    sql_params.push(Value::Blob(project_id.as_bytes().to_vec()));
+                    sql_params.push(Value::Integer(t));
+                    sql_params.push(Value::Integer(t));
+                }
+                None => {
+                    sql_params.push(Value::Integer(cutoff));
+                    sql_params.push(Value::Blob(workspace_id.as_bytes().to_vec()));
+                    sql_params.push(Value::Blob(project_id.as_bytes().to_vec()));
+                    sql_params.push(Value::Integer(cutoff));
+                }
+            }
             sql_params.push(Value::Integer(i64::try_from(limit).unwrap_or(i64::MAX)));
 
             let mut sql = String::with_capacity(placeholders.len() + 1_200);
@@ -3468,8 +3507,8 @@ impl ReaderPool {
                    SELECT m.entity_id, m.name, COUNT(*) AS pages \
                    FROM matched m \
                    JOIN entity_page_links l ON l.entity_id = m.entity_id \
-                   JOIN pages p ON p.id = l.page_id AND p.is_latest = 1 \
-                   WHERE 1 = 1{freq_not_expired} \
+                   JOIN pages p ON p.id = l.page_id \
+                   WHERE 1 = 1{freq_version_filter} \
                    GROUP BY m.entity_id, m.name \
                  ) \
                  SELECT pg.id, pg.path, pg.title, {descriptor} AS snippet, \
@@ -3479,13 +3518,26 @@ impl ReaderPool {
                  FROM freq f \
                  JOIN entity_page_links l ON l.entity_id = f.entity_id \
                  JOIN pages pg ON pg.id = l.page_id \
-                 WHERE pg.workspace_id = ? AND pg.project_id = ? AND pg.is_latest = 1{not_expired} \
+                 WHERE pg.workspace_id = ? AND pg.project_id = ?{version_filter} \
                  GROUP BY pg.id, pg.path, pg.title \
                  ORDER BY weight DESC, matches DESC, pg.path ASC \
                  LIMIT ?",
                 descriptor = page_descriptor_expr("pg.body", "pg.frontmatter_json"),
-                not_expired = not_expired("pg", "?"),
-                freq_not_expired = not_expired("p", "?"),
+                version_filter = if as_of_us.is_some() {
+                    // Window containment (docs/temporal.md); no expiry.
+                    " AND l.valid_from <= ? \
+                      AND (l.superseded_at IS NULL OR l.superseded_at > ?)"
+                        .to_string()
+                } else {
+                    format!(" AND pg.is_latest = 1{}", not_expired("pg", "?"))
+                },
+                freq_version_filter = if as_of_us.is_some() {
+                    " AND l.valid_from <= ? \
+                      AND (l.superseded_at IS NULL OR l.superseded_at > ?)"
+                        .to_string()
+                } else {
+                    format!(" AND p.is_latest = 1{}", not_expired("p", "?"))
+                },
             )
             .expect("writing SQL into String cannot fail");
 

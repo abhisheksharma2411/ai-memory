@@ -346,6 +346,7 @@ diagram, crate breakdown, schema notes, and invariants.
 - [`docs/ROADMAP-2.0.md`](docs/ROADMAP-2.0.md) - the plan for the 2.0 release, one item at a time.
 - [`docs/okf.md`](docs/okf.md) - the wiki is natively an Open Knowledge Format (OKF v0.2) bundle; design and field mapping.
 - [`docs/typed-edges.md`](docs/typed-edges.md) - typed relation edges (`causes` / `fixes` / `contradicts`) and how lint uses them.
+- [`docs/temporal.md`](docs/temporal.md) - ingestion-time validity on the entity index and `as_of` time-travel queries.
 - [`docs/MIGRATION-2.0.md`](docs/MIGRATION-2.0.md) - upgrading an existing store to 2.0: the backup-gated automatic migration and how to restore.
 - [`docs/benchmarks/`](docs/benchmarks/README.md) - published retrieval-quality numbers with provenance, reproducible from the in-repo harness.
 - [`docs/ROADMAP-2.0.md`](docs/ROADMAP-2.0.md) - the 2.0 plan.
