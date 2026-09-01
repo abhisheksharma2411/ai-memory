@@ -331,7 +331,7 @@ pub struct DrainLock {
 #[cfg(windows)]
 const ERROR_LOCK_VIOLATION: i32 = 33;
 
-fn is_drain_lock_busy_error(err: &std::io::Error) -> bool {
+pub(crate) fn is_drain_lock_busy_error(err: &std::io::Error) -> bool {
     if err.kind() == std::io::ErrorKind::WouldBlock {
         return true;
     }

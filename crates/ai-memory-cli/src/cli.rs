@@ -2132,6 +2132,14 @@ pub struct ServeArgs {
     /// Skip the filesystem watcher; useful for transient debugging.
     #[arg(long)]
     pub no_watcher: bool,
+    /// DANGEROUS: start even when another process holds the single-instance
+    /// serve lock.
+    ///
+    /// Only for an operator who is certain the previous server is gone (a
+    /// hung holder, or a mount with unreliable locking): two live servers on
+    /// one data directory corrupt wiki and index state.
+    #[arg(long)]
+    pub force: bool,
     /// Workspace name (auto-created).
     ///
     /// Not marker-aware, unlike the client commands: the server has no

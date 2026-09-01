@@ -48,6 +48,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   deliberate well-formed operator queries are preserved as before. Found by
   the new LongMemEval retrieval harness on its first full run.
 
+- `ai-memory serve` now takes an exclusive lock on `<data-dir>/.serve.lock`
+  before opening the store, so a second server pointed at the same data
+  directory refuses at startup and names the holding process instead of
+  silently contending the single-writer actor, the wiki git handle, and the
+  active-project pointer. The OS releases the lock when the process exits,
+  so a crashed server never leaves the operator locked out; `--force` starts
+  unguarded for an operator who knows the previous server is gone, and a
+  filesystem that cannot lock at all downgrades the guard to a warning
+  instead of refusing to start. (#563)
+
 ## [1.39.0] - 2026-09-01
 
 ### Added
