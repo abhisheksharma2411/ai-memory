@@ -1464,6 +1464,36 @@ async fn start_maintenance_scheduler(
         }));
     }
 
+    // One-shot startup backfill (2.0): with an embedder present, pages
+    // written before it existed - a fresh upgrade onto the default local
+    // embedder, or a provider switch - get their vectors without any
+    // maintenance config. Skips already-embedded pages, so a settled
+    // store logs one cheap no-op pass. Runs in the background; startup
+    // is never blocked on it.
+    if let Some(embedder) = embedder.clone() {
+        let reader = reader.clone();
+        let writer = writer.clone();
+        let wiki = wiki.clone();
+        tasks.push(tokio::spawn(async move {
+            let started = std::time::Instant::now();
+            match run_scheduled_embedding_backfill_tick(&reader, &writer, &wiki, &embedder).await {
+                Ok(outcome) if outcome.embedded > 0 || outcome.failed > 0 || outcome.errors > 0 => {
+                    info!(
+                        scopes = outcome.scopes,
+                        embedded = outcome.embedded,
+                        skipped = outcome.skipped,
+                        failed = outcome.failed,
+                        errors = outcome.errors,
+                        elapsed_ms = started.elapsed().as_millis(),
+                        "startup embedding backfill completed"
+                    );
+                }
+                Ok(_) => {}
+                Err(e) => tracing::warn!(error = %e, "startup embedding backfill failed"),
+            }
+        }));
+    }
+
     if maintenance_enabled && embedding_backfill_interval_secs > 0 {
         if let Some(embedder) = embedder {
             let reader = reader.clone();
@@ -1509,6 +1539,13 @@ async fn start_maintenance_scheduler(
             require_approval: auto_improve.require_approval,
             min_session_age_secs: scheduler.min_session_age_secs,
             max_sessions_per_tick: scheduler.max_sessions_per_tick,
+            experience: (scheduler.experience_every_sessions > 0).then(|| {
+                ai_memory_consolidate::ExperienceConfig {
+                    sessions: scheduler.experience_sessions.max(1),
+                    min_new_sessions: scheduler.experience_every_sessions,
+                    ..ai_memory_consolidate::ExperienceConfig::default()
+                }
+            }),
         };
         match ai_memory_consolidate::initialize_auto_improve_scheduler_scopes(&reader, &writer)
             .await
@@ -1784,7 +1821,61 @@ async fn configure_embedder(
     let provider_name = cfg.provider.name().to_string();
     let model = cfg.model.clone();
     let dim = cfg.dim;
-    let embedder = build_embedder(cfg).context("building embedder from config")?;
+    let defaulted = cfg.defaulted;
+    // Local embeddings: fetch the model once, checksum-pinned, before
+    // the loader runs (docs/local-embeddings.md). Offline installs drop
+    // the files into models/ by hand and never hit the network.
+    if cfg.provider == ai_memory_llm::EmbedderChoice::Local
+        && let Some(models_dir) = cfg.models_dir.as_deref()
+        && !ai_memory_llm::model_present(models_dir)
+    {
+        if defaulted {
+            // Best-effort default (docs/local-embeddings.md): never
+            // block startup on an ~87 MB download. Fetch in the
+            // background; THIS boot runs without an embedder (the
+            // pre-2.0 behaviour), the next start finds the files and
+            // enables hybrid search. Offline hosts just log the warn.
+            let models_dir = models_dir.to_path_buf();
+            tokio::spawn(async move {
+                tracing::info!(
+                    dir = %models_dir.display(),
+                    "fetching the default local embedding model in the \
+                     background (~87 MB, one time); hybrid search enables \
+                     on the next start"
+                );
+                if let Err(e) = ai_memory_llm::fetch_model(&models_dir).await {
+                    tracing::warn!(
+                        error = %e,
+                        "default local embedding model fetch failed; running \
+                         without an embedder. Set embedding_provider = \"none\" \
+                         to opt out, or install offline per \
+                         docs/local-embeddings.md"
+                    );
+                }
+            });
+            return Ok((wiki, None));
+        }
+        tracing::info!(
+            dir = %models_dir.display(),
+            "local embedding model not present; fetching (~87 MB, one time)"
+        );
+        ai_memory_llm::fetch_model(models_dir).await.context(
+            "fetching the local embedding model (set up offline per \
+             docs/local-embeddings.md if this host has no network)",
+        )?;
+    }
+    let embedder = match build_embedder(cfg) {
+        Ok(e) => e,
+        Err(e) if defaulted => {
+            tracing::warn!(
+                error = %e,
+                "default local embeddings unavailable (model load failed); \
+                 continuing without an embedder"
+            );
+            return Ok((wiki, None));
+        }
+        Err(e) => return Err(e).context("building embedder from config"),
+    };
     let mismatch = store
         .reader
         .embedding_meta_for_mismatch(

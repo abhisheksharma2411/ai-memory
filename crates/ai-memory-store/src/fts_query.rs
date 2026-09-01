@@ -28,8 +28,24 @@ pub fn prepare_fts5_query(raw: &str) -> String {
             .any(|t| matches!(t, "OR" | "AND" | "NOT" | "NEAR"));
     let tokens: Vec<String> = raw
         .split_whitespace()
+        // Bare natural-language queries drop stopwords before the
+        // OR-join: with no tokenizer-level stopword list, "the/of/a"
+        // match nearly every page and BM25 term frequency lets a page
+        // with five "the"s outrank the page whose CONTENT matches (seen
+        // live: a release-procedure page beaten for a deploy question).
+        // Explicit-syntax queries and quoted phrases are untouched, and
+        // a query that is ONLY stopwords keeps them all — returning the
+        // user's literal terms beats returning nothing.
+        .filter(|t| explicit_syntax || !is_stopword(t))
         .flat_map(prepare_fts5_token)
         .collect();
+    let tokens = if tokens.is_empty() && !explicit_syntax {
+        raw.split_whitespace()
+            .flat_map(prepare_fts5_token)
+            .collect()
+    } else {
+        tokens
+    };
     if tokens.is_empty() {
         return String::new();
     }
@@ -82,6 +98,73 @@ fn fts5_query_parses(query: &str) -> bool {
         |row| row.get::<_, i64>(0),
     )
     .is_ok()
+}
+
+/// English stopwords excluded from bare-query OR-joins. Deliberately
+/// small and boring: high-document-frequency function words that carry
+/// no retrieval signal but dominate BM25 through term frequency. Words
+/// inside quoted phrases and explicit-operator queries never pass
+/// through this filter.
+fn is_stopword(token: &str) -> bool {
+    matches!(
+        token.to_ascii_lowercase().as_str(),
+        "a" | "an"
+            | "and"
+            | "are"
+            | "as"
+            | "at"
+            | "be"
+            | "been"
+            | "but"
+            | "by"
+            | "can"
+            | "could"
+            | "did"
+            | "do"
+            | "does"
+            | "for"
+            | "from"
+            | "had"
+            | "has"
+            | "have"
+            | "how"
+            | "i"
+            | "if"
+            | "in"
+            | "is"
+            | "it"
+            | "its"
+            | "me"
+            | "my"
+            | "of"
+            | "on"
+            | "or"
+            | "our"
+            | "she"
+            | "should"
+            | "so"
+            | "that"
+            | "the"
+            | "their"
+            | "them"
+            | "they"
+            | "this"
+            | "to"
+            | "was"
+            | "we"
+            | "were"
+            | "what"
+            | "when"
+            | "where"
+            | "which"
+            | "who"
+            | "why"
+            | "will"
+            | "with"
+            | "would"
+            | "you"
+            | "your"
+    )
 }
 
 fn prepare_fts5_token(token: &str) -> Vec<String> {

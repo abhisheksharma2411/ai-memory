@@ -8,6 +8,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- An opt-in cross-session "experience" pass
+  (`[auto_improve.scheduler] experience_every_sessions`): every N newly
+  completed sessions, the last few session summaries are reviewed side
+  by side and knowledge visible only ACROSS trajectories — repeated
+  workflows, re-stated preferences, architecture facts every session
+  re-discovers, contradictions with stored decisions — is proposed
+  through the identical schema-constrained, validated, eval-gated,
+  pending-writes staging path as per-session auto-improve. Evidence
+  must span at least two sessions; off by default and LLM-hosted, so
+  the zero-LLM path is untouched. See `docs/experience.md`.
+- `AI_MEMORY_EMBEDDING_PROVIDER=local` — in-process sentence embeddings
+  (pure-Rust candle BERT, `all-MiniLM-L6-v2`, 384-dim) with no API key
+  and no external server. The ~87 MB model is fetched once into
+  `<data_dir>/models/` with source-pinned sha256s (offline installs drop
+  the files in manually); vectors coexist with any provider's via the
+  stored `(provider, model, dim)` triple, and switching is a config
+  change. Feature-gated (`local-embeddings`, default on). The eval
+  harness gained `--embeddings local` and publishes the hybrid
+  LongMemEval row next to the zero-LLM baseline. See
+  `docs/local-embeddings.md`.
 - The entity index carries ingestion-time validity windows
   (bi-temporal-lite): entity links open at their page version's creation
   and close when the version is superseded, backfilled for existing
@@ -39,6 +59,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   pinned sha256; baselines are published under `docs/benchmarks/`. The
   existing LLM A/B harness moved to the `ab` subcommand.
 ### Changed
+- Hybrid retrieval is on by default: an install with no
+  `embedding_provider` configured now gets in-process local embeddings
+  best-effort — the model downloads in the background on first start
+  (hybrid search enables on the next restart), existing pages are
+  backfilled by a one-shot startup pass, and hosts that cannot fetch
+  the model keep the previous FTS-only behaviour with a warning. Opt
+  out with `embedding_provider = "none"`; configured providers are
+  never overridden. Measured on LongMemEval-S: overall hit@5 rises
+  from 0.617 (FTS-only) to 0.779 with local embeddings.
 - The wiki's on-disk format is now natively the Open Knowledge Format
   (OKF) v0.2: every page write fills the spec's `type`, `generated`,
   `sources` and `stale_after` keys (ai-memory's own fields ride along as
@@ -54,6 +83,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `docs/okf.md` and `docs/MIGRATION-2.0.md`.
 
 ### Fixed
+- Natural-language searches no longer surface stopword trash: bare
+  queries drop English stopwords before the FTS5 OR-join, so a page
+  containing five "the"s cannot outrank the page whose content matches,
+  and pages matching only stopwords no longer appear at all. Quoted
+  phrases and explicit-operator queries are untouched, and an
+  all-stopword query still searches its literal terms. Guarded by a
+  CI-runnable search-quality suite asserting ranking usefulness, not
+  just machinery.
 - `memory_query` no longer fails with `fts5: syntax error` when the query is
   natural language containing parentheses, apostrophe-quoted phrases, or a
   stray `OR`/`AND` (e.g. *"my visit to the Museum of Modern Art (MoMA) and
