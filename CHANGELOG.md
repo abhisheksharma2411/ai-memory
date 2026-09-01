@@ -8,6 +8,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- The entity index carries ingestion-time validity windows
+  (bi-temporal-lite): entity links open at their page version's creation
+  and close when the version is superseded, backfilled for existing
+  stores by an additive migration. `memory_query` gains an `as_of`
+  ISO-8601 argument that turns the call into an entity-timeline lookup —
+  "what did we know about X then" — returning the page versions valid at
+  that instant, including ones superseded since. Ingestion time only,
+  documented honestly as such. See `docs/temporal.md`.
 - Pages can declare typed relation edges in `relations:` frontmatter —
   a closed `causes` / `fixes` / `contradicts` vocabulary riding the
   existing `links.link_type` column (no schema migration). Declared
