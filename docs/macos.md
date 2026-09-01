@@ -64,14 +64,37 @@ cd ~/Applications/ai-memory
 ./ai-memory install-mcp --client claude-code --apply
 ```
 
+Optionally, once hooks are wired, put the binary on `PATH` so later commands
+(`ai-memory status`, a fresh terminal tab, the checklist below) don't need
+`cd`/`./`:
+
+```bash
+sudo ln -sf ~/Applications/ai-memory/ai-memory /usr/local/bin/ai-memory
+```
+
+Do this *after* `install-hooks`, not before: on macOS `install-hooks`
+auto-discovers the sibling `hooks/` directory by walking up from the running
+binary's own path, and that walk does not currently resolve through a
+symlink (tracked in [#546](https://github.com/akitaonrails/ai-memory/issues/546)).
+Running `install-hooks` through the `/usr/local/bin` symlink instead of the
+extracted `./ai-memory` sends discovery to the wrong parent directories. On a
+machine with no prior ai-memory install this fails outright; on a machine
+that already has a hooks cache under `~/Library/Application Support/ai-memory`
+from an earlier run, discovery can silently fall back to *that* — reporting
+success while wiring whatever hook version happens to be cached there,
+possibly not the one you just extracted. `ai-memory serve`/`status`/etc. are
+unaffected either way.
+
 Notes:
 
 - The MCP endpoint, capture hooks, and `ai-memory status` work without a token
   in this single-user loopback setup. If you explicitly configure
   `AI_MEMORY_AUTH_TOKEN` for the server, pass the same token with `--auth-token`
   or export it for CLI commands.
-- Keep the extracted `ai-memory` at a stable path; the hook commands reference
-  it. Re-run `install-hooks` if you move it.
+- Keep the extracted `ai-memory` at a stable path; the hook commands (and the
+  symlink, if you made one) reference it. Re-run `install-hooks` — via the
+  extracted path, per the caution above — and re-point the symlink if you move
+  it.
 
 ## Scenario B: Source Build
 
@@ -96,12 +119,27 @@ automatically (no `--source` needed from the repo root):
 ./target/release/ai-memory install-mcp   --client claude-code --apply
 ```
 
+If you symlink the built binary onto `PATH` for convenience (e.g.
+`ln -sf "$(pwd)/target/release/ai-memory" ~/.local/bin/ai-memory`), do it
+*after* the `install-hooks` call above, not before — see the `install-hooks`
+symlink caution in Scenario A
+([#546](https://github.com/akitaonrails/ai-memory/issues/546)); it applies
+here too and is the exact layout that bug was filed against.
+
 ## Scenario C: Docker Wrapper
 
 Use this when you want the server data in a Docker volume while the agent still
 runs as a native macOS process. The wrapper renders host-side agent config with
 `http://127.0.0.1:49374`, but its own thin-client commands reach the server from
 inside a helper container via Docker Desktop's `host.docker.internal` alias.
+
+This assumes the `ai-memory` thin-client wrapper is already on `PATH`; if
+`ai-memory --version` doesn't resolve yet, install it first via the
+[README Docker quick-start](../README.md#docker) (downloads a small shell
+script to `~/.local/bin/ai-memory`). On a stock macOS Terminal `~/.local/bin`
+is **not** on `PATH` by default — add
+`export PATH="$HOME/.local/bin:$PATH"` to `~/.zshrc` if `which ai-memory`
+comes up empty after installing the wrapper.
 
 ```bash
 # Start the server. The image default allowlist includes host.docker.internal so
@@ -114,6 +152,9 @@ docker run -d --name ai-memory --restart unless-stopped \
 ai-memory install-mcp   --client claude-code --apply
 ai-memory install-hooks --agent  claude-code --apply
 ```
+
+The wrapper is a shell script, not the native binary, so the `install-hooks`
+symlink caution above (#546) does not apply here.
 
 The published Docker image includes both `linux/amd64` and `linux/arm64`, so
 Apple Silicon pulls the native arm64 image without `--platform linux/amd64`.
@@ -149,10 +190,27 @@ wrapper's `posix` shell-script path does not. Re-run `install-hooks --agent
   `hooks/` directory automatically.
 - **Platform-mismatch warning on Apple Silicon:** update to a current Docker
   tag. Tagged releases publish a multi-arch manifest with `linux/arm64`.
+- **`ai-memory: command not found` in a new terminal tab:** Scenario A/B's
+  `./ai-memory`/`./target/release/ai-memory` is a relative path, so it only
+  resolves from inside the install/build directory. Either keep `cd`-ing there
+  first, or symlink the binary onto `PATH` once you're done wiring hooks (see
+  the Scenario A/B notes above) so plain `ai-memory` works everywhere.
+- **`install-hooks` wires the wrong (or no) `hooks/` bundle even though the
+  tarball was extracted whole:** if the binary is reached through a symlink
+  (e.g. you put it on `PATH` before running `install-hooks`), macOS discovery
+  does not resolve the symlink and searches the wrong parent directories —
+  see [#546](https://github.com/akitaonrails/ai-memory/issues/546). On a
+  clean machine this fails outright; if a hooks cache from an earlier install
+  already exists under `~/Library/Application Support/ai-memory`, it can
+  silently reuse that stale copy instead and report success. Run
+  `install-hooks` via the real extracted/built path instead of the symlink
+  until that's fixed.
 
 ## Suggested Test Checklist
 
-1. `ai-memory serve --bind 127.0.0.1:49374` starts and logs `bind=127.0.0.1:49374`.
+1. `ai-memory serve --bind 127.0.0.1:49374` starts and logs `bind=127.0.0.1:49374`
+   (`./ai-memory serve …`, or `./target/release/ai-memory serve …` for
+   Scenario B, if you haven't put it on `PATH` yet).
 2. `curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:49374/mcp` returns
    `405` (reachable; GET not allowed), confirming the loopback server is up.
 3. `install-hooks --agent claude-code --apply` writes hook commands that
