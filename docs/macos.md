@@ -210,6 +210,22 @@ rm ~/Library/LaunchAgents/com.github.akitaonrails.ai-memory.plist
 Nothing rotates the two log files; they grow without bound. Add a
 `newsyslog.d` entry or truncate them periodically if that matters to you.
 
+> **Validated on** macOS 26.6.2 (build 25G83, Apple Silicon) with ai-memory
+> v1.38.0 installed per Scenario A, and separately with v1.21.0 to confirm the
+> agent does not depend on a recently added flag. Confirmed: `launchctl
+> bootstrap`; the job `running` with `last exit code = (never exited)` rather
+> than crash-looping; the launchd child (`PPID 1`) owning `127.0.0.1:49374`, so
+> the reply came from the agent rather than a foreground server left over on the
+> same port; `~/Library/Application Support/ai-memory` resolved and logged as
+> the data dir with no `--data-dir` passed; `405` from `GET /mcp` on the bound
+> port; `KeepAlive` — the served process was `SIGKILL`ed and a replacement was
+> answering about a second later, with `runs` incrementing; and a clean
+> `launchctl bootout`. Start-at-login was configured but not independently
+> exercised, since that needs a logout. `ThrottleInterval` is left at its 10s
+> default, so a crash within 10s of startup is respawned after that delay rather
+> than immediately. Corrections from anyone on a different macOS version are
+> welcome.
+
 ## Hook Platform on macOS
 
 `AI_MEMORY_HOOK_PLATFORM` selects how hook commands are rendered. On macOS the
