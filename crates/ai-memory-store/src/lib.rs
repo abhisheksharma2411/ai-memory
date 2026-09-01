@@ -57,13 +57,14 @@ pub use ops::{
 pub use reader::{
     ActivityWindow, AgentSessionCount, AuditEvent, AuditLogFilter, AutoImproveCandidateSession,
     BriefPageBody, BriefingPage, BriefingSnapshot, ClientActivity, ContaminationFinding,
-    ContaminationReport, ContaminationSummary, DecayCandidate, DecayTombstone, DerivedIndexStatus,
-    EmbeddingTripleCount, FeedbackFinding, GraphVia, HealthDetail, HealthPage, ObservationHit,
-    ObservationOrder, ObservationPage, ObservationPageResult, ObservationRecord, OpenSession,
-    PageAuthor, PageHit, PageHitWithMeta, PageLinks, PageMeta, PageSummary, ProjectSummary,
-    ReaderPool, ReindexTargetStatus, RelatedPage, RrfContributions, ScopeRow, SearchExplain,
-    SessionDependentRows, SessionEndDisposition, SessionSummary, StatusCounts, StorageStatus,
-    StoredEmbedding, StoredPageBody, WorkspaceScopeRow, WorkspaceSummary, f32_vec_to_bytes,
+    ContaminationReport, ContaminationSummary, ContradictionEdge, DecayCandidate, DecayTombstone,
+    DerivedIndexStatus, EmbeddingTripleCount, FeedbackFinding, GraphVia, HealthDetail, HealthPage,
+    ObservationHit, ObservationOrder, ObservationPage, ObservationPageResult, ObservationRecord,
+    OpenSession, PageAuthor, PageHit, PageHitWithMeta, PageLinks, PageMeta, PageSummary,
+    ProjectSummary, ReaderPool, ReindexTargetStatus, RelatedPage, RrfContributions, ScopeRow,
+    SearchExplain, SessionDependentRows, SessionEndDisposition, SessionSummary, StatusCounts,
+    StorageStatus, StoredEmbedding, StoredPageBody, WorkspaceScopeRow, WorkspaceSummary,
+    f32_vec_to_bytes,
 };
 pub use scope::{
     ResolvedScope, ScopeName, ScopeResolutionError, ScopeResolver, WORKSPACE_PROJECT_PAIR_REQUIRED,
@@ -1882,11 +1883,13 @@ mod tests {
                 workspace: None,
                 project: Some("infra".into()),
                 path: PagePath::new("runbooks/02.md").unwrap(),
+                relation: None,
             },
             LinkTarget {
                 workspace: None,
                 project: Some("nope".into()),
                 path: PagePath::new("ghost.md").unwrap(),
+                relation: None,
             },
         ];
         store.writer.upsert_page(dep).await.unwrap();

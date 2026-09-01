@@ -167,6 +167,50 @@ pub struct LinkTarget {
     pub project: Option<String>,
     /// Wiki path within the target project (root-relative).
     pub path: PagePath,
+    /// Typed relation carried by this edge; `None` = a plain reference.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub relation: Option<Relation>,
+}
+
+/// The closed typed-edge vocabulary (2.0 item 3). Declared in a page's
+/// `relations:` frontmatter; anything outside this set stays a plain
+/// reference. Closed on purpose: a free-text relation column becomes an
+/// unqueryable folksonomy, and `contradicts` feeds the lint pass.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Relation {
+    /// The source page describes a cause of the target.
+    Causes,
+    /// The source page fixes the problem the target describes.
+    Fixes,
+    /// The source page contradicts the target (lint surfaces these).
+    Contradicts,
+}
+
+impl Relation {
+    /// Stored `links.link_type` value.
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Causes => "causes",
+            Self::Fixes => "fixes",
+            Self::Contradicts => "contradicts",
+        }
+    }
+
+    /// Parse a frontmatter `relations:` key. Unknown names → `None`.
+    #[must_use]
+    pub fn parse(s: &str) -> Option<Self> {
+        match s {
+            "causes" => Some(Self::Causes),
+            "fixes" => Some(Self::Fixes),
+            "contradicts" => Some(Self::Contradicts),
+            _ => None,
+        }
+    }
+
+    /// Every relation, for schema/docs enumeration.
+    pub const ALL: [Self; 3] = [Self::Causes, Self::Fixes, Self::Contradicts];
 }
 
 impl LinkTarget {
@@ -177,6 +221,7 @@ impl LinkTarget {
             workspace: None,
             project: None,
             path,
+            relation: None,
         }
     }
 

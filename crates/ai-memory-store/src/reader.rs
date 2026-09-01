@@ -1261,6 +1261,21 @@ pub struct CrossProjectEdge {
     pub to_path: String,
 }
 
+/// One typed `contradicts` edge between two latest pages, surfaced as a
+/// lint finding (2.0 item 3): the declaration IS the signal — no LLM
+/// needed to notice that two pages disagree once an author or the
+/// consolidator said so.
+#[derive(Debug, Clone, Serialize)]
+pub struct ContradictionEdge {
+    /// Wiki path of the page declaring the contradiction.
+    pub from_path: String,
+    /// Wiki path of the contradicted page (as declared; the target may
+    /// be unresolved, in which case `resolved` is false).
+    pub to_path: String,
+    /// Whether the target currently resolves to a latest page.
+    pub resolved: bool,
+}
+
 /// An unresolved cross-project link — a declared dependency on another
 /// project's page that does not resolve. Surfaced by `memory_lint`.
 #[derive(Debug, Clone, Serialize)]
@@ -5574,6 +5589,41 @@ impl ReaderPool {
                         project: row.get(2)?,
                         path: row.get(3)?,
                         project_exists: exists != 0,
+                    })
+                },
+            )?;
+            let mut out = Vec::new();
+            for r in rows {
+                out.push(r?);
+            }
+            Ok(out)
+        })
+        .await
+    }
+
+    /// Typed `contradicts` edges declared by latest pages of one project
+    /// (docs/okf.md relations vocabulary). Each row feeds one rule-based
+    /// lint finding.
+    ///
+    /// # Errors
+    /// Propagates SQL errors from the read pool.
+    pub async fn contradiction_edges(
+        &self,
+        workspace_id: WorkspaceId,
+        project_id: ProjectId,
+    ) -> StoreResult<Vec<ContradictionEdge>> {
+        self.with_conn(move |conn| {
+            let mut stmt = conn.prepare(
+                "SELECT fp.path, l.to_path,                         l.to_page_id IS NOT NULL AS resolved                  FROM links l                  JOIN pages fp ON fp.id = l.from_page_id                      AND fp.workspace_id = ?1 AND fp.project_id = ?2 AND fp.is_latest = 1                  WHERE l.link_type = 'contradicts'                  ORDER BY fp.path, l.to_path",
+            )?;
+            let rows = stmt.query_map(
+                params![workspace_id.as_bytes(), project_id.as_bytes()],
+                |row| {
+                    let resolved: i64 = row.get(2)?;
+                    Ok(ContradictionEdge {
+                        from_path: row.get(0)?,
+                        to_path: row.get(1)?,
+                        resolved: resolved != 0,
                     })
                 },
             )?;

@@ -19,7 +19,7 @@ use crate::admission::{AdmissionChain, AdmissionContext, AdmissionOp};
 use crate::atomic;
 use crate::error::{WikiError, WikiResult};
 use crate::git::{Checkpoint, GitAdapter};
-use crate::markdown::{Markdown, derive_title, emit, extract_links, parse};
+use crate::markdown::{Markdown, derive_title, emit, parse};
 use crate::watcher::is_pending_path;
 
 /// Summary of a [`Wiki::reindex_all`] run.
@@ -544,7 +544,7 @@ impl Wiki {
         })?;
         let md = parse(&raw)?;
         let title = derive_title(&md.frontmatter, &md.body, &path);
-        let links = extract_links(&md.body, &path);
+        let links = crate::markdown::extract_all_links(&md.frontmatter, &md.body, &path);
         let meta = derive_index_metadata(&path, &md.frontmatter)?;
 
         let _guard = self.mutation_lock.read().await;
@@ -1202,7 +1202,8 @@ impl Wiki {
         markdown.body = self.sanitizer.scrub(&markdown.body);
         scrub_frontmatter_strings(&mut markdown.frontmatter, &self.sanitizer);
         let title = self.sanitizer.scrub(&detail.summary.title);
-        let links = extract_links(&markdown.body, &path);
+        let links =
+            crate::markdown::extract_all_links(&markdown.frontmatter, &markdown.body, &path);
         let expires_at = parse_expires_at(&path, &markdown.frontmatter)?;
         let entities = parse_entities(&path, &markdown.frontmatter)?;
         let emitted = emit(&markdown)?;
@@ -1312,7 +1313,7 @@ impl Wiki {
         }
         let md = self.read_page(workspace_id, project_id, &path)?;
         let title = derive_title(&md.frontmatter, &md.body, &path);
-        let links = extract_links(&md.body, &path);
+        let links = crate::markdown::extract_all_links(&md.frontmatter, &md.body, &path);
         // Markdown is the source of truth: preserve explicit tier/pinned
         // metadata on reindex instead of forcing every page back to semantic.
         let meta = derive_index_metadata(&path, &md.frontmatter)?;
@@ -1610,7 +1611,11 @@ impl Wiki {
                         tier: req.tier,
                         frontmatter_json: req.frontmatter.clone(),
                         pinned: req.pinned,
-                        links: extract_links(&req.body, &req.path),
+                        links: crate::markdown::extract_all_links(
+                            &req.frontmatter,
+                            &req.body,
+                            &req.path,
+                        ),
                         author_id: req.author_id,
                         expires_at: parse_expires_at(&req.path, &req.frontmatter)?,
                         entities: parse_entities(&req.path, &req.frontmatter)?,
@@ -1754,7 +1759,8 @@ impl Wiki {
             .clone()
             .map(|t| self.sanitizer.scrub(&t))
             .unwrap_or_else(|| derive_title(&markdown.frontmatter, &markdown.body, &path));
-        let links = extract_links(&markdown.body, &path);
+        let links =
+            crate::markdown::extract_all_links(&markdown.frontmatter, &markdown.body, &path);
         let expires_at = parse_expires_at(&path, &markdown.frontmatter)?;
         let entities = parse_entities(&path, &markdown.frontmatter)?;
 
