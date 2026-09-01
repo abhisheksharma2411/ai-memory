@@ -774,6 +774,12 @@ pub struct AutoImproveSchedulerSettings {
     pub max_sessions_per_tick: usize,
     /// Minimum age after SessionEnd before a session becomes eligible.
     pub min_session_age_secs: u64,
+    /// Cross-session ("experience") pass: run after this many NEW
+    /// completed sessions per project. `0` (default) disables the pass —
+    /// it is opt-in and shaped by docs/experience.md.
+    pub experience_every_sessions: u64,
+    /// How many recent session summary pages one experience pass reads.
+    pub experience_sessions: usize,
 }
 
 impl Default for AutoImproveSchedulerSettings {
@@ -783,6 +789,8 @@ impl Default for AutoImproveSchedulerSettings {
             interval_secs: 3_600,
             max_sessions_per_tick: 1,
             min_session_age_secs: 600,
+            experience_every_sessions: 0,
+            experience_sessions: 10,
         }
     }
 }
@@ -1140,18 +1148,26 @@ impl Config {
     /// Returns [`LlmError::NotConfigured`] for unknown providers, missing API
     /// keys, or invalid dimensions.
     pub fn embedder_config(&self) -> LlmResult<Option<EmbedderConfig>> {
-        let Some(provider_raw) = non_empty(self.embedding_provider.as_deref()) else {
-            return Ok(None);
+        // 2.0 default: hybrid retrieval out of the box. An unset provider
+        // selects in-process `local` embeddings BEST-EFFORT (the serve
+        // layer degrades to no-embedder if the model cannot be fetched or
+        // loaded); `embedding_provider = "none"` opts out entirely, and an
+        // explicitly configured provider keeps hard-failure semantics.
+        let (provider_raw, defaulted) = match non_empty(self.embedding_provider.as_deref()) {
+            Some("none" | "off" | "disabled") => return Ok(None),
+            Some(raw) => (raw, false),
+            None => ("local", true),
         };
         let provider = match provider_raw {
             "openai" => EmbedderChoice::OpenAi,
             "voyage" => EmbedderChoice::Voyage,
             "google" | "gemini" => EmbedderChoice::Google,
             "openai-compat" | "openai_compat" => EmbedderChoice::OpenAiCompat,
+            "local" => EmbedderChoice::Local,
             other => {
                 return Err(LlmError::NotConfigured(format!(
                     "AI_MEMORY_EMBEDDING_PROVIDER={other} not one of \
-                     openai|voyage|google|gemini|openai-compat"
+                     openai|voyage|google|gemini|openai-compat|local|none"
                 )));
             }
         };
@@ -1168,6 +1184,7 @@ impl Config {
                             .into(),
                     ));
                 }
+                EmbedderChoice::Local => ai_memory_llm::LOCAL_MODEL.to_string(),
             },
         };
         let dim = match self.embedding_dim {
@@ -1206,6 +1223,8 @@ impl Config {
                 .clone()
                 .or_else(|| self.runtime_env.llm_api_key.clone())
                 .unwrap_or_else(|| SecretString::from(String::new())),
+            // In-process: no key, ever.
+            EmbedderChoice::Local => SecretString::from(String::new()),
         };
         let base_url = self.embedding_base_url.clone();
         if provider == EmbedderChoice::OpenAiCompat && non_empty(base_url.as_deref()).is_none() {
@@ -1219,6 +1238,8 @@ impl Config {
             dim,
             api_key,
             base_url,
+            models_dir: Some(self.data_dir.join("models")),
+            defaulted,
         }))
     }
 

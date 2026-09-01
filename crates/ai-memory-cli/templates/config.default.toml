@@ -96,6 +96,17 @@ log_level = "info"
 # will not shrink after the first prune; the `ai-memory backup` tarball will.
 #   - A quarter of raw capture: observation_retention_days = 90
 #   - Smaller transactions on a slow disk: observation_prune_batch = 2000
+# --- Embeddings (hybrid retrieval) ---------------------------------------
+# Unset = the 2.0 default: in-process local embeddings (all-MiniLM-L6-v2,
+# 384-dim), no API key, no data egress. The ~87 MB model is fetched once
+# into <data_dir>/models/ in the background (checksum-pinned; hybrid search
+# enables on the next start), and existing pages are backfilled
+# automatically at startup. See docs/local-embeddings.md.
+#   embedding_provider = "none"           # opt out (FTS + entity + graph only)
+#   embedding_provider = "openai"         # or voyage | google | openai-compat
+#   embedding_model    = "..."            # provider-specific override
+#   embedding_dim      = 384              # must match the model
+
 [decay]
 lambda = 0.02
 sigma = 0.6
@@ -195,6 +206,14 @@ targets = ["_rules", "procedures"]
 min_delta = 0.0
 
 [auto_improve.scheduler]
+# Cross-session "experience" pass (2.0, docs/experience.md): every N new
+# completed sessions, read the last few session summaries side by side and
+# stage proposals for knowledge only visible ACROSS sessions (repeated
+# workflows, re-stated preferences, contradictions with stored decisions).
+# Same review/staging/approval path as per-session auto-improve. 0 = off
+# (the default; opt in once per-session auto-improve is working for you).
+#   experience_every_sessions = 5
+#   experience_sessions = 10
 enabled = true
 interval_secs = 3600
 max_sessions_per_tick = 1 # per project

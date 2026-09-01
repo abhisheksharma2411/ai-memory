@@ -117,6 +117,12 @@ pub enum EmbedderChoice {
     /// OpenAI-compatible embeddings endpoint (Ollama / LM Studio /
     /// vLLM). Keyless-capable; base URL, model, and dim are required.
     OpenAiCompat,
+    /// In-process pure-Rust embeddings (all-MiniLM-L6-v2, 384-dim) —
+    /// no API key, no server. Requires the model files under
+    /// `<data_dir>/models/` (fetched at serve startup or dropped in
+    /// manually; docs/local-embeddings.md).
+    #[cfg(feature = "local-embeddings")]
+    Local,
 }
 
 impl EmbedderChoice {
@@ -129,6 +135,8 @@ impl EmbedderChoice {
             Self::Voyage => "voyage",
             Self::Google => "google",
             Self::OpenAiCompat => "openai-compat",
+            #[cfg(feature = "local-embeddings")]
+            Self::Local => "local",
         }
     }
 }
@@ -148,6 +156,14 @@ pub struct EmbedderConfig {
     pub api_key: SecretString,
     /// Optional base URL override. Required for openai-compat.
     pub base_url: Option<String>,
+    /// `<data_dir>/models/` root, required by the `local` provider.
+    pub models_dir: Option<std::path::PathBuf>,
+    /// True when no provider was configured and `local` was chosen as
+    /// the 2.0 default. Best-effort semantics: a defaulted embedder
+    /// that cannot fetch or load its model degrades to no-embedder with
+    /// a warning instead of refusing to start; an explicitly configured
+    /// one still fails hard.
+    pub defaulted: bool,
 }
 
 /// Construct an `Arc<dyn Embedder>` from the config.
@@ -195,6 +211,13 @@ pub fn build_embedder(config: EmbedderConfig) -> LlmResult<Arc<dyn Embedder>> {
                 config.dim,
             )?)
         }
+        #[cfg(feature = "local-embeddings")]
+        EmbedderChoice::Local => {
+            let models_dir = config.models_dir.ok_or_else(|| {
+                LlmError::NotConfigured("local embeddings need the data dir's models/ root".into())
+            })?;
+            Arc::new(crate::local::LocalEmbedder::load(&models_dir)?)
+        }
     };
     Ok(arc)
 }
@@ -218,6 +241,8 @@ pub fn try_default_embedding_dim(provider: EmbedderChoice, model: &str) -> Optio
         (EmbedderChoice::OpenAi, _) => Some(1536),
         (EmbedderChoice::Voyage, "voyage-3-large") => Some(1024),
         (EmbedderChoice::Voyage, _) => Some(1024),
+        #[cfg(feature = "local-embeddings")]
+        (EmbedderChoice::Local, _) => Some(crate::local::LOCAL_DIM),
         (EmbedderChoice::Google, "gemini-embedding-2") => Some(768),
         (EmbedderChoice::Google, "gemini-embedding-001") => Some(768),
         (EmbedderChoice::Google, _) => Some(768),

@@ -13,16 +13,28 @@ cargo run --release -p ai-memory-eval -- retrieval --fetch
 
 | date | dataset | mode | overall hit@5 | file |
 |---|---|---|---|---|
-| 2026-09-01 | LongMemEval-S (v1) | zero-llm (FTS only) | 0.617 | [longmemeval-s-2026-09-01.md](longmemeval-s-2026-09-01.md) |
+| 2026-09-01 | LongMemEval-S (v1) | **local embeddings (2.0 default)** | **0.823** | [longmemeval-s-2026-09-01-local.md](longmemeval-s-2026-09-01-local.md) |
+| 2026-09-01 | LongMemEval-S (v1) | zero-llm, stopword-filtered FTS | 0.668 | [longmemeval-s-2026-09-01-fts.md](longmemeval-s-2026-09-01-fts.md) |
+| 2026-09-01 | LongMemEval-S (v1) | zero-llm (pre-2.0 FTS) | 0.617 | [longmemeval-s-2026-09-01.md](longmemeval-s-2026-09-01.md) |
+
+The 2.0 retrieval work moved overall hit@5 from **0.617 → 0.823**
+(+20.6 points; hit@1 0.449 → 0.536, recall@5 0.472 → 0.680) in two
+measured steps: dropping stopwords from bare-query FTS OR-joins
+(+5.1 hit@5, +8.5 hit@1), then the in-process local embedder with
+correct masked-mean pooling — the pooling fix alone was worth ~6.6
+points over a padded-attention implementation, caught by the
+calibration tests. Every intermediate number was measured on this
+harness before the next change landed. For context, published
+embedding-based numbers on this dataset: agentmemory 0.967 R@5
+(hybrid + reranking), doobidoo/mcp-memory-service 0.804 R@5.
 
 ## Reading the numbers
 
-- **mode: zero-llm** is the deterministic floor: no consolidation LLM, no
-  embedder, no reranker — pure FTS5 + entity/graph fusion over
-  hook-captured observations. It is the configuration every install has
-  with no API key at all. Embedding-assisted modes are expected to score
-  higher and will be published alongside when the local-embedding work
-  lands (roadmap item 5).
+- **mode: local embeddings** is the 2.0 default: the in-process
+  all-MiniLM embedder (no API key, no egress) fused with FTS5 + entity +
+  graph. **mode: zero-llm** is the deterministic floor (`embedding_provider
+  = "none"`, or any host where the model cannot load): FTS5 +
+  entity/graph only.
 - **Comparability.** Published numbers from other systems on this dataset
   (agentmemory 0.967 R@5, doobidoo/mcp-memory-service 0.804 R@5) are
   embedding-based retrieval over raw chat logs. Our `hit@5` is the

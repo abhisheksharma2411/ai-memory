@@ -5653,6 +5653,22 @@ impl ReaderPool {
         .await
     }
 
+    /// Cross-session pass cadence probe: completed sessions newer than
+    /// the pass's last run for this scope (docs/experience.md).
+    ///
+    /// # Errors
+    /// Propagates SQL errors from the read pool.
+    pub async fn experience_pass_due(
+        &self,
+        workspace_id: WorkspaceId,
+        project_id: ProjectId,
+    ) -> StoreResult<(u64, i64)> {
+        self.with_conn(move |conn| {
+            crate::auto_improve::experience_pass_due(conn, workspace_id, project_id)
+        })
+        .await
+    }
+
     /// Typed `contradicts` edges declared by latest pages of one project
     /// (docs/okf.md relations vocabulary). Each row feeds one rule-based
     /// lint finding.
