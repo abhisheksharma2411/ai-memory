@@ -33,6 +33,7 @@ use crate::session_consolidation::SessionConsolidationJob;
 use crate::users::{self, TOKEN_HASH_LEN};
 use crate::workstream::{
     FinishWorkstreamRun, FinishedWorkstreamRun, PrepareWorkstreamRun, PreparedWorkstreamRun,
+    RenameWorkstream, RenamedWorkstream,
 };
 
 /// Result of atomically claiming the startup context assembled for one hook.
@@ -194,6 +195,24 @@ pub(crate) enum WriteCmd {
         acceptance: HandoffAcceptance,
         reply: oneshot::Sender<StoreResult<bool>>,
     },
+    /// Expire every open handoff in one scope (#513). See
+    /// [`ops::expire_open_handoffs`] for why this ignores the automatic
+    /// sweep's exemptions.
+    ExpireOpenHandoffs {
+        workspace_id: WorkspaceId,
+        project_id: ProjectId,
+        owner_filter: OwnerFilter,
+        older_than_us: Option<i64>,
+        author_id: Option<ai_memory_core::UserId>,
+        reply: oneshot::Sender<StoreResult<u64>>,
+    },
+    /// Record that an embed attempt produced no embedding (#528).
+    RecordEmbedFailure {
+        page_id: PageId,
+        outcome: crate::ops::EmbedOutcome,
+        detail: Option<String>,
+        reply: oneshot::Sender<StoreResult<()>>,
+    },
     CancelHandoff {
         handoff_id: HandoffId,
         workspace_id: WorkspaceId,
@@ -277,9 +296,12 @@ pub(crate) enum WriteCmd {
         dim: u32,
         reply: oneshot::Sender<StoreResult<u64>>,
     },
-    /// Delete a project and all its data (pages, sessions, observations,
-    /// handoffs, embeddings) in one transaction. Returns the paths of
-    /// every page file that must be removed from disk by the caller.
+    /// Delete a project's rows (pages, sessions, observations, handoffs,
+    /// embeddings) in one transaction. Returns the paths of every page file
+    /// that must be removed from disk by the caller.
+    ///
+    /// A logical delete unless `compaction` is [`ops::Compaction::Reclaim`]:
+    /// freed bytes stay in the file until it is rewritten.
     PurgeProject {
         workspace_id: WorkspaceId,
         project_id: ProjectId,
@@ -290,13 +312,34 @@ pub(crate) enum WriteCmd {
         author_id: Option<ai_memory_core::UserId>,
         /// Purge even when a managed workstream still holds a live run lease.
         force: bool,
+        /// Whether to reclaim the freed bytes afterwards (`VACUUM`).
+        compaction: crate::ops::Compaction,
         reply: oneshot::Sender<StoreResult<PurgeSummary>>,
+    },
+    /// Delete one session and everything derived from it, inside a single
+    /// `(workspace, project)` scope. See [`ops::purge_session`].
+    PurgeSession {
+        workspace_id: WorkspaceId,
+        project_id: ProjectId,
+        session_id: SessionId,
+        /// Authenticated operator recorded in the `audit_log` row.
+        author_id: Option<ai_memory_core::UserId>,
+        /// Whether to reclaim the freed bytes afterwards (`VACUUM`).
+        compaction: crate::ops::Compaction,
+        reply: oneshot::Sender<StoreResult<crate::ops::PurgeSessionSummary>>,
+    },
+    /// Reclaim free pages on demand: rebuild the FTS indexes and `VACUUM`,
+    /// deleting nothing. See [`ops::compact`].
+    Compact {
+        reply: oneshot::Sender<StoreResult<crate::ops::CompactSummary>>,
     },
     /// Delete a workspace row (its `workspace_id` FKs cascade projects/pages/
     /// sessions/…). Refused when non-empty unless `force`.
     DeleteWorkspace {
         workspace_id: WorkspaceId,
         force: bool,
+        /// Whether to reclaim the freed bytes afterwards (`VACUUM`).
+        compaction: crate::ops::Compaction,
         reply: oneshot::Sender<StoreResult<DeleteWorkspaceSummary>>,
     },
     /// Rename a workspace's `name` column (UUID-keyed dir doesn't move).
@@ -437,6 +480,10 @@ pub(crate) enum WriteCmd {
     FinishWorkstreamRun {
         input: FinishWorkstreamRun,
         reply: oneshot::Sender<StoreResult<FinishedWorkstreamRun>>,
+    },
+    RenameWorkstream {
+        input: RenameWorkstream,
+        reply: oneshot::Sender<StoreResult<RenamedWorkstream>>,
     },
     Shutdown,
 }
@@ -919,6 +966,63 @@ impl WriterHandle {
         rx.await.map_err(|_| StoreError::WriterClosed)?
     }
 
+    /// Expire every open handoff in one scope, optionally only those older
+    /// than `older_than_us`. Returns how many changed.
+    ///
+    /// Unlike the automatic sweep this does not spare manual or
+    /// different-directory handoffs: those are precisely what a leftover
+    /// backlog is made of. It is a state change, not a delete — the summary
+    /// and provenance survive.
+    ///
+    /// # Errors
+    /// [`StoreError::WriterClosed`], or a propagated SQL error.
+    pub async fn expire_open_handoffs(
+        &self,
+        workspace_id: WorkspaceId,
+        project_id: ProjectId,
+        owner_filter: OwnerFilter,
+        older_than_us: Option<i64>,
+        author_id: Option<ai_memory_core::UserId>,
+    ) -> StoreResult<u64> {
+        let (tx, rx) = oneshot::channel();
+        self.send(WriteCmd::ExpireOpenHandoffs {
+            workspace_id,
+            project_id,
+            owner_filter,
+            older_than_us,
+            author_id,
+            reply: tx,
+        })
+        .await?;
+        rx.await.map_err(|_| StoreError::WriterClosed)?
+    }
+
+    /// Record that an embed attempt on `page_id` did not produce an
+    /// embedding, so a failed or skipped page is attributable afterwards
+    /// rather than only in container logs (#528).
+    ///
+    /// Success records nothing — that is already implied by a
+    /// `page_embeddings` row — so the common path pays no extra write.
+    ///
+    /// # Errors
+    /// [`StoreError::WriterClosed`], or a propagated SQL error.
+    pub async fn record_embed_failure(
+        &self,
+        page_id: PageId,
+        outcome: crate::ops::EmbedOutcome,
+        detail: Option<String>,
+    ) -> StoreResult<()> {
+        let (tx, rx) = oneshot::channel();
+        self.send(WriteCmd::RecordEmbedFailure {
+            page_id,
+            outcome,
+            detail,
+            reply: tx,
+        })
+        .await?;
+        rx.await.map_err(|_| StoreError::WriterClosed)?
+    }
+
     /// Mark an open handoff expired so it will no longer be consumed.
     ///
     /// Returns `true` when an open handoff was changed, `false` when the id was
@@ -1186,7 +1290,8 @@ impl WriterHandle {
         rx.await.map_err(|_| StoreError::WriterClosed)?
     }
 
-    /// Delete a project and all its data in one atomic transaction.
+    /// Delete a project's rows in one atomic transaction. Logical unless
+    /// `compaction` is [`ops::Compaction::Reclaim`].
     ///
     /// ON DELETE CASCADE propagates the delete through pages, sessions,
     /// observations, handoffs, and page_embeddings automatically. The
@@ -1203,6 +1308,7 @@ impl WriterHandle {
         label: impl Into<String>,
         author_id: Option<ai_memory_core::UserId>,
         force: bool,
+        compaction: crate::ops::Compaction,
     ) -> StoreResult<PurgeSummary> {
         let (tx, rx) = oneshot::channel();
         self.send(WriteCmd::PurgeProject {
@@ -1211,6 +1317,39 @@ impl WriterHandle {
             label: label.into(),
             author_id,
             force,
+            compaction,
+            reply: tx,
+        })
+        .await?;
+        rx.await.map_err(|_| StoreError::WriterClosed)?
+    }
+
+    /// Delete one session by id, with everything derived from it, inside a
+    /// single `(workspace, project)` scope.
+    ///
+    /// Scope is enforced in the store: a session that does not belong to the
+    /// named workspace and project is [`StoreError::NotFound`] and nothing is
+    /// deleted. See [`ops::purge_session`] for what is and is not removed —
+    /// in particular, handoffs this session *accepted* are left alone.
+    ///
+    /// # Errors
+    /// [`StoreError::NotFound`] when the session is absent from that scope,
+    /// [`StoreError::WriterClosed`], or a propagated SQL error.
+    pub async fn purge_session(
+        &self,
+        workspace_id: WorkspaceId,
+        project_id: ProjectId,
+        session_id: SessionId,
+        author_id: Option<ai_memory_core::UserId>,
+        compaction: crate::ops::Compaction,
+    ) -> StoreResult<crate::ops::PurgeSessionSummary> {
+        let (tx, rx) = oneshot::channel();
+        self.send(WriteCmd::PurgeSession {
+            workspace_id,
+            project_id,
+            session_id,
+            author_id,
+            compaction,
             reply: tx,
         })
         .await?;
@@ -1228,14 +1367,31 @@ impl WriterHandle {
         &self,
         workspace_id: WorkspaceId,
         force: bool,
+        compaction: crate::ops::Compaction,
     ) -> StoreResult<DeleteWorkspaceSummary> {
         let (tx, rx) = oneshot::channel();
         self.send(WriteCmd::DeleteWorkspace {
             workspace_id,
             force,
+            compaction,
             reply: tx,
         })
         .await?;
+        rx.await.map_err(|_| StoreError::WriterClosed)?
+    }
+
+    /// Reclaim free pages on demand, deleting nothing.
+    ///
+    /// Runs through the writer actor like every other exclusive operation, so
+    /// it cannot overlap a write: `VACUUM` takes an exclusive lock and would
+    /// otherwise contend with one.
+    ///
+    /// # Errors
+    /// Returns [`StoreError::WriterClosed`] if the actor has shut down, or
+    /// propagates the SQL error from the rebuild or `VACUUM`.
+    pub async fn compact(&self) -> StoreResult<crate::ops::CompactSummary> {
+        let (tx, rx) = oneshot::channel();
+        self.send(WriteCmd::Compact { reply: tx }).await?;
         rx.await.map_err(|_| StoreError::WriterClosed)?
     }
 
@@ -1760,6 +1916,18 @@ impl WriterHandle {
         rx.await.map_err(|_| StoreError::WriterClosed)?
     }
 
+    /// Retitle one checkout-local workstream, leaving its selection and
+    /// activity timestamps untouched.
+    pub async fn rename_workstream(
+        &self,
+        input: RenameWorkstream,
+    ) -> StoreResult<RenamedWorkstream> {
+        let (tx, rx) = oneshot::channel();
+        self.send(WriteCmd::RenameWorkstream { input, reply: tx })
+            .await?;
+        rx.await.map_err(|_| StoreError::WriterClosed)?
+    }
+
     async fn send(&self, cmd: WriteCmd) -> StoreResult<()> {
         self.inner
             .tx
@@ -2038,6 +2206,33 @@ fn worker_loop(mut conn: Connection, mut rx: mpsc::Receiver<WriteCmd>) {
                 let result = ops::accept_handoff(&mut conn, &acceptance);
                 send_or_warn(reply, result, "accept_handoff");
             }
+            WriteCmd::ExpireOpenHandoffs {
+                workspace_id,
+                project_id,
+                owner_filter,
+                older_than_us,
+                author_id,
+                reply,
+            } => {
+                let result = ops::expire_open_handoffs(
+                    &mut conn,
+                    &workspace_id,
+                    &project_id,
+                    &owner_filter,
+                    older_than_us,
+                    author_id,
+                );
+                send_or_warn(reply, result, "expire_open_handoffs");
+            }
+            WriteCmd::RecordEmbedFailure {
+                page_id,
+                outcome,
+                detail,
+                reply,
+            } => {
+                let result = ops::record_embed_failure(&conn, &page_id, outcome, detail.as_deref());
+                send_or_warn(reply, result, "record_embed_failure");
+            }
             WriteCmd::CancelHandoff {
                 handoff_id,
                 workspace_id,
@@ -2199,6 +2394,7 @@ fn worker_loop(mut conn: Connection, mut rx: mpsc::Receiver<WriteCmd>) {
                 label,
                 author_id,
                 force,
+                compaction,
                 reply,
             } => {
                 let result = ops::purge_project(
@@ -2208,15 +2404,39 @@ fn worker_loop(mut conn: Connection, mut rx: mpsc::Receiver<WriteCmd>) {
                     &label,
                     author_id,
                     force,
+                    compaction,
                 );
                 send_or_warn(reply, result, "purge_project");
+            }
+            WriteCmd::PurgeSession {
+                workspace_id,
+                project_id,
+                session_id,
+                author_id,
+                compaction,
+                reply,
+            } => {
+                let result = ops::purge_session(
+                    &mut conn,
+                    workspace_id,
+                    project_id,
+                    session_id,
+                    author_id,
+                    compaction,
+                );
+                send_or_warn(reply, result, "purge_session");
+            }
+            WriteCmd::Compact { reply } => {
+                let result = ops::compact(&mut conn);
+                send_or_warn(reply, result, "compact");
             }
             WriteCmd::DeleteWorkspace {
                 workspace_id,
                 force,
+                compaction,
                 reply,
             } => {
-                let result = ops::delete_workspace(&mut conn, &workspace_id, force);
+                let result = ops::delete_workspace(&mut conn, &workspace_id, force, compaction);
                 send_or_warn(reply, result, "delete_workspace");
             }
             WriteCmd::RenameWorkspace {
@@ -2446,6 +2666,10 @@ fn worker_loop(mut conn: Connection, mut rx: mpsc::Receiver<WriteCmd>) {
             WriteCmd::FinishWorkstreamRun { input, reply } => {
                 let result = crate::workstream::finish_run(&mut conn, &input);
                 send_or_warn(reply, result, "finish_workstream_run");
+            }
+            WriteCmd::RenameWorkstream { input, reply } => {
+                let result = crate::workstream::rename(&mut conn, &input);
+                send_or_warn(reply, result, "rename_workstream");
             }
         }
     }

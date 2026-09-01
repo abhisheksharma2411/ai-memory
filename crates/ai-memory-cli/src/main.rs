@@ -97,6 +97,7 @@ async fn main() -> Result<()> {
         }
         Command::Handoffs(args) => commands::handoffs::run(&config, args).await,
         Command::Workstreams(args) => commands::workstreams::run(&config, args).await,
+        Command::RenameWorkstream(args) => commands::rename_workstream::run(&config, args).await,
         Command::WorkstreamSearch(args) => commands::workstream_search::run(&config, args).await,
         Command::AuditContamination(args) => {
             commands::audit_contamination::run(&config, args).await
@@ -107,6 +108,7 @@ async fn main() -> Result<()> {
         Command::DeletePage(args) => commands::delete_page::run(&config, args).await,
         Command::Serve(args) => commands::serve::run(&config, args).await,
         Command::Reset(args) => commands::reset::run(&config, args),
+        Command::Compact(args) => commands::compact::run(&config, args).await,
         Command::Backup(args) => commands::backup::run(&config, args).await,
         Command::Restore(args) => commands::restore::run(&config, args),
         Command::Reindex(args) => commands::reindex::run(&config, args).await,
@@ -136,6 +138,7 @@ async fn main() -> Result<()> {
         Command::InstallSkills(args) => commands::install_skills::run(&config, args),
         Command::Reorg(args) => commands::reorg::run(&config, args).await,
         Command::PurgeProject(args) => commands::purge_project::run(&config, args).await,
+        Command::PurgeSession(args) => commands::purge_session::run(&config, args).await,
         Command::RenameProject(args) => commands::rename_project::run(&config, args).await,
         Command::MoveProject(args) => commands::move_project::run(&config, args).await,
         Command::MoveSession(args) => commands::move_session::run(&config, args).await,

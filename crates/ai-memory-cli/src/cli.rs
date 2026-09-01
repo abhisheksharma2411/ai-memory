@@ -47,6 +47,10 @@ pub enum Command {
     Handoffs(HandoffsArgs),
     /// List recent managed workstreams selectable from the current checkout.
     Workstreams(WorkstreamsArgs),
+    /// Rename a managed workstream in the current checkout. Metadata only:
+    /// the ledger, linked harnesses, and which workstream a bare
+    /// `ai-memory run` resumes are all unchanged.
+    RenameWorkstream(RenameWorkstreamArgs),
     /// Search the complete visible event ledger for a managed workstream.
     WorkstreamSearch(WorkstreamSearchArgs),
     /// Audit the store for likely cross-project contamination (read-only,
@@ -70,6 +74,14 @@ pub enum Command {
     Serve(ServeArgs),
     /// Wipe the data directory's wiki/, db/, raw/ contents.
     Reset(ResetArgs),
+    /// Reclaim free database pages. Deletes nothing.
+    ///
+    /// Rebuilds the FTS indexes and VACUUMs, returning free pages to the
+    /// filesystem. `ai-memory status` reports how much there is to reclaim —
+    /// check it first: this takes an exclusive lock and rewrites the whole
+    /// database, so every write blocks until it finishes and it needs free
+    /// disk space of roughly the database's own size.
+    Compact(CompactArgs),
     /// Snapshot wiki/, db/, and config.toml into a gzipped tarball.
     Backup(BackupArgs),
     /// Restore a backup tarball into the data directory.
@@ -145,10 +157,24 @@ pub enum Command {
     /// `is_latest=false` (they were a multi-project mash-up) so the
     /// next consolidation can regenerate them per-project. Idempotent.
     Reorg(ReorgArgs),
-    /// Permanently delete a project and ALL its data (pages, sessions,
-    /// observations, handoffs, embeddings, on-disk wiki files).
-    /// This is irreversible — requires `--confirm`.
+    /// Delete a project: its pages, sessions, observations, handoffs,
+    /// embeddings, managed workstreams and on-disk wiki files.
+    ///
+    /// Irreversible — requires `--confirm`. By default this is a logical
+    /// delete: the rows are gone and nothing can reach them through the API
+    /// or search, but their bytes remain in free pages of the database file
+    /// until it is rewritten, as with any SQLite delete. `--compact`
+    /// reclaims them; neither mode is forensic erasure, because the wiki git
+    /// history and any earlier backup still hold the content.
     PurgeProject(PurgeProjectArgs),
+    /// Permanently delete ONE session and everything derived from it.
+    ///
+    /// Removes the session row, its observations, the handoffs it authored,
+    /// its derived wiki page (every version) and their embeddings — scoped
+    /// strictly to the named workspace and project. Handoffs this session
+    /// only *accepted* are left alone: their text belongs to the session that
+    /// wrote them.
+    PurgeSession(PurgeSessionArgs),
     /// Rename a project within its workspace. No files move on disk —
     /// the wiki is flat and pages are differentiated by project_id only.
     /// Useful after renaming the project's directory on disk so the hook
@@ -324,6 +350,24 @@ pub struct HandoffsArgs {
     /// Emit JSON instead of the human listing.
     #[arg(long)]
     pub json: bool,
+    /// Expire every open handoff in the scope instead of listing them.
+    ///
+    /// Unlike the automatic sweep this does NOT spare manual handoffs or ones
+    /// from another directory — those exemptions are exactly what a leftover
+    /// backlog is made of, so honouring them would clear nothing. Pair with
+    /// `--older-than-days` to keep recent batons.
+    ///
+    /// This is a state change, not a delete: the summary and provenance
+    /// survive and the handoff simply stops being consumable. Requires
+    /// `--confirm`.
+    #[arg(long)]
+    pub expire_all: bool,
+    /// With `--expire-all`, only expire handoffs at least this many days old.
+    #[arg(long)]
+    pub older_than_days: Option<u32>,
+    /// REQUIRED by `--expire-all`.
+    #[arg(long)]
+    pub confirm: bool,
 }
 
 #[derive(Debug, Args)]
@@ -339,6 +383,33 @@ pub struct WorkstreamsArgs {
     #[arg(long, default_value_t = 20, value_parser = clap::value_parser!(u8).range(1..=100))]
     pub limit: u8,
     /// Emit JSON instead of readable rows.
+    #[arg(long)]
+    pub json: bool,
+}
+
+/// Arguments for `rename-workstream`.
+#[derive(Debug, Args)]
+pub struct RenameWorkstreamArgs {
+    /// Workspace containing the managed workstream. Defaults to the nearest
+    /// `.ai-memory.toml` marker's `workspace`, else `default`.
+    #[arg(long)]
+    pub workspace: Option<String>,
+    /// Project override. Defaults to the current repository project.
+    #[arg(long)]
+    pub project: Option<String>,
+    /// Current name of the workstream to rename. Names are unique within one
+    /// checkout, so this is unambiguous wherever `run --workstream` works.
+    #[arg(long, conflicts_with = "workstream_id")]
+    pub from: Option<String>,
+    /// Stable id of the workstream to rename, as printed by `workstreams`.
+    /// Useful when the current name is awkward to retype.
+    #[arg(long, conflicts_with = "from")]
+    pub workstream_id: Option<ai_memory_core::WorkstreamId>,
+    /// New name. Same rules as `run --new`: non-empty, at most 128
+    /// characters, no control characters, no slashes.
+    #[arg(long)]
+    pub to: String,
+    /// Emit JSON instead of a readable line.
     #[arg(long)]
     pub json: bool,
 }
@@ -581,6 +652,15 @@ pub struct ReorgArgs {
     pub dry_run: bool,
 }
 
+/// Arguments for `compact`.
+#[derive(Debug, Args)]
+pub struct CompactArgs {
+    /// REQUIRED. Not because compaction destroys anything — it deletes
+    /// nothing — but because it blocks every write for as long as it runs.
+    #[arg(long)]
+    pub confirm: bool,
+}
+
 /// Arguments for `purge-project`.
 #[derive(Debug, Args)]
 pub struct PurgeProjectArgs {
@@ -601,6 +681,52 @@ pub struct PurgeProjectArgs {
     /// out — purging is destructive and irreversible.
     #[arg(long)]
     pub confirm: bool,
+    /// Also reclaim the freed bytes: rebuild the FTS indexes and VACUUM the
+    /// database after the delete commits.
+    ///
+    /// Without this the purge is a logical delete — the project is gone from
+    /// the API and from search, but its bytes stay in free pages of the
+    /// database file until it is next rewritten, as with any SQLite delete.
+    ///
+    /// This rewrites the WHOLE database and needs free disk space of about
+    /// its size, so it takes minutes on a large store. It also does NOT make
+    /// the content forensically unrecoverable: the wiki git history and any
+    /// backup taken before the purge still contain it.
+    #[arg(long)]
+    pub compact: bool,
+}
+
+/// Arguments for `purge-session`.
+#[derive(Debug, Args)]
+pub struct PurgeSessionArgs {
+    /// Full session UUID, exactly as `sessions.id` stores it.
+    #[arg(long)]
+    pub session_id: String,
+    /// Workspace name. Defaults to the nearest `.ai-memory.toml` marker's
+    /// `workspace`, else `default`.
+    #[arg(long)]
+    pub workspace: Option<String>,
+    /// Project name. When omitted, auto-derived from the basename of
+    /// the current git repo root (or CWD if no git repo).
+    #[arg(long)]
+    pub project: Option<String>,
+    /// REQUIRED for the purge to run. Without this flag the CLI errors
+    /// out — purging is destructive and irreversible.
+    #[arg(long)]
+    pub confirm: bool,
+    /// Also reclaim the freed bytes: rebuild the affected FTS indexes and
+    /// VACUUM the database after the delete commits.
+    ///
+    /// Without this the purge is a logical delete — the session is gone from
+    /// the API and from search, but its bytes stay in free pages of the
+    /// database file until it is next rewritten, as with any SQLite delete.
+    ///
+    /// This rewrites the WHOLE database and needs free disk space of about
+    /// its size, so it takes minutes on a large store. It also does NOT make
+    /// the content forensically unrecoverable: the wiki git history and any
+    /// backup taken before the purge still contain it.
+    #[arg(long)]
+    pub compact: bool,
 }
 
 /// Arguments for `rename-project`.
