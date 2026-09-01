@@ -13,7 +13,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   of the systemd user unit, shipped in both macOS release tarballs and
   documented in [`docs/macos.md`](docs/macos.md). Until now macOS had no
   documented way to keep the server running once the terminal that started it
-  closed, which silently stopped hook delivery.
+  closed, which silently stopped hook delivery. (#569)
 
   launchd expands nothing, so the template carries explicit
   `__AI_MEMORY_BIN__` / `__HOME__` placeholders rather than a home specifier,
