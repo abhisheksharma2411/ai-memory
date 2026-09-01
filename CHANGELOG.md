@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.39.0] - 2026-09-01
+
 ### Added
 - Added `ai-memory resume`, an interactive picker for recent managed
   workstreams from the current checkout and validated client-local links. It
@@ -4507,7 +4509,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Consolidator used server startup default project instead of the
   session's actual project.
 
-[Unreleased]: https://github.com/akitaonrails/ai-memory/compare/v1.38.0...HEAD
+[Unreleased]: https://github.com/akitaonrails/ai-memory/compare/v1.39.0...HEAD
+[1.39.0]: https://github.com/akitaonrails/ai-memory/releases/tag/v1.39.0
 [1.38.0]: https://github.com/akitaonrails/ai-memory/releases/tag/v1.38.0
 [1.37.0]: https://github.com/akitaonrails/ai-memory/releases/tag/v1.37.0
 [1.36.0]: https://github.com/akitaonrails/ai-memory/releases/tag/v1.36.0
