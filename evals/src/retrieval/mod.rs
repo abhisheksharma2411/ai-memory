@@ -60,6 +60,12 @@ pub struct RetrievalArgs {
     /// Keep the server's temp data dir for post-mortem inspection.
     #[arg(long)]
     keep_data_dir: bool,
+
+    /// Embedding mode: `none` (zero-LLM, the default) or `local`
+    /// (in-process all-MiniLM-L6-v2; the model is fetched once into
+    /// `evals/models/`, checksum-pinned).
+    #[arg(long, default_value = "none")]
+    embeddings: String,
 }
 
 pub async fn run(args: RetrievalArgs) -> Result<()> {
@@ -90,7 +96,29 @@ pub async fn run(args: RetrievalArgs) -> Result<()> {
             args.server_bin.display()
         );
     }
-    let server = EvalServer::launch(&args.server_bin, args.keep_data_dir).await?;
+    let (embeddings, mode, models_root) = match args.embeddings.as_str() {
+        "none" => (server::EvalEmbeddings::None, "zero-llm", None),
+        "local" => {
+            let root = PathBuf::from("evals/models");
+            if !ai_memory_llm::model_present(&root) {
+                tracing::info!("fetching the local embedding model into evals/models (~87 MB)");
+                ai_memory_llm::fetch_model(&root).await?;
+            }
+            (
+                server::EvalEmbeddings::Local,
+                "local-embeddings",
+                Some(root),
+            )
+        }
+        other => bail!("--embeddings must be `none` or `local`, got {other}"),
+    };
+    let server = EvalServer::launch(
+        &args.server_bin,
+        args.keep_data_dir,
+        embeddings,
+        models_root.as_deref(),
+    )
+    .await?;
     tracing::info!(url = server.base_url, data_dir = %server.data_dir_path.display(), "eval server up");
 
     let client = reqwest::Client::builder()
@@ -177,7 +205,7 @@ pub async fn run(args: RetrievalArgs) -> Result<()> {
         hardware: report::hardware(),
         dataset: "longmemeval_s",
         dataset_sha256: dataset::LONGMEMEVAL_S_SHA256,
-        mode: "zero-llm",
+        mode,
         questions_scored: scores.len(),
         abstention_excluded: abstention.len(),
         ks: args.ks.clone(),

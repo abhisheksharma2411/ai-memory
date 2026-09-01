@@ -1704,6 +1704,21 @@ async fn configure_embedder(
     let provider_name = cfg.provider.name().to_string();
     let model = cfg.model.clone();
     let dim = cfg.dim;
+    // Local embeddings: fetch the model once, checksum-pinned, before
+    // the loader runs (docs/local-embeddings.md). Offline installs drop
+    // the files into models/ by hand and never hit the network.
+    if cfg.provider == ai_memory_llm::EmbedderChoice::Local
+        && let Some(models_dir) = cfg.models_dir.as_deref()
+        && !ai_memory_llm::model_present(models_dir)
+    {
+        tracing::info!(
+            dir = %models_dir.display(),
+            "local embedding model not present; fetching (~87 MB, one time)"
+        );
+        ai_memory_llm::fetch_model(models_dir)
+            .await
+            .context("fetching the local embedding model (set up offline per docs/local-embeddings.md if this host has no network)")?;
+    }
     let embedder = build_embedder(cfg).context("building embedder from config")?;
     let mismatch = store
         .reader

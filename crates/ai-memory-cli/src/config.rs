@@ -1148,10 +1148,11 @@ impl Config {
             "voyage" => EmbedderChoice::Voyage,
             "google" | "gemini" => EmbedderChoice::Google,
             "openai-compat" | "openai_compat" => EmbedderChoice::OpenAiCompat,
+            "local" => EmbedderChoice::Local,
             other => {
                 return Err(LlmError::NotConfigured(format!(
                     "AI_MEMORY_EMBEDDING_PROVIDER={other} not one of \
-                     openai|voyage|google|gemini|openai-compat"
+                     openai|voyage|google|gemini|openai-compat|local"
                 )));
             }
         };
@@ -1168,6 +1169,7 @@ impl Config {
                             .into(),
                     ));
                 }
+                EmbedderChoice::Local => ai_memory_llm::LOCAL_MODEL.to_string(),
             },
         };
         let dim = match self.embedding_dim {
@@ -1206,6 +1208,8 @@ impl Config {
                 .clone()
                 .or_else(|| self.runtime_env.llm_api_key.clone())
                 .unwrap_or_else(|| SecretString::from(String::new())),
+            // In-process: no key, ever.
+            EmbedderChoice::Local => SecretString::from(String::new()),
         };
         let base_url = self.embedding_base_url.clone();
         if provider == EmbedderChoice::OpenAiCompat && non_empty(base_url.as_deref()).is_none() {
@@ -1219,6 +1223,7 @@ impl Config {
             dim,
             api_key,
             base_url,
+            models_dir: Some(self.data_dir.join("models")),
         }))
     }
 

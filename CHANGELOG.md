@@ -8,6 +8,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- `AI_MEMORY_EMBEDDING_PROVIDER=local` — in-process sentence embeddings
+  (pure-Rust candle BERT, `all-MiniLM-L6-v2`, 384-dim) with no API key
+  and no external server. The ~87 MB model is fetched once into
+  `<data_dir>/models/` with source-pinned sha256s (offline installs drop
+  the files in manually); vectors coexist with any provider's via the
+  stored `(provider, model, dim)` triple, and switching is a config
+  change. Feature-gated (`local-embeddings`, default on). The eval
+  harness gained `--embeddings local` and publishes the hybrid
+  LongMemEval row next to the zero-LLM baseline. See
+  `docs/local-embeddings.md`.
 - The entity index carries ingestion-time validity windows
   (bi-temporal-lite): entity links open at their page version's creation
   and close when the version is superseded, backfilled for existing
