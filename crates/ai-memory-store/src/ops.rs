@@ -767,6 +767,13 @@ pub(crate) fn upsert_page_in_tx(
             "UPDATE pages SET is_latest = 0 WHERE id = ?1",
             params![&existing.id],
         )?;
+        // Close the superseded version's entity-link windows at the new
+        // version's birth instant (docs/temporal.md).
+        tx.execute(
+            "UPDATE entity_page_links SET superseded_at = ?2 \
+             WHERE page_id = ?1 AND superseded_at IS NULL",
+            params![&existing.id, now],
+        )?;
         tx.execute(
             "INSERT INTO pages \
              (id, workspace_id, project_id, path, path_search, title, tier, body, body_sha256, \
@@ -792,7 +799,7 @@ pub(crate) fn upsert_page_in_tx(
             ],
         )?;
         replace_links_in_tx(tx, &new_id, page)?;
-        attach_entities_in_tx(tx, &new_id, page)?;
+        attach_entities_in_tx(tx, &new_id, page, now)?;
         refresh_incoming_links_for_path(tx, page, &new_id)?;
         audit(
             tx,
@@ -832,7 +839,7 @@ pub(crate) fn upsert_page_in_tx(
         ],
     )?;
     replace_links_in_tx(tx, &new_id, page)?;
-    attach_entities_in_tx(tx, &new_id, page)?;
+    attach_entities_in_tx(tx, &new_id, page, now)?;
     refresh_incoming_links_for_path(tx, page, &new_id)?;
     audit(
         tx,
@@ -855,6 +862,7 @@ fn attach_entities_in_tx(
     tx: &rusqlite::Transaction<'_>,
     page_id: &PageId,
     page: &NewPage,
+    version_created_at: i64,
 ) -> StoreResult<()> {
     if page.entities.is_empty() {
         return Ok(());
@@ -877,10 +885,14 @@ fn attach_entities_in_tx(
             ],
             |row| row.get(0),
         )?;
+        // Bi-temporal-lite (docs/temporal.md): the link's window opens
+        // when its page version was created and stays open until the
+        // version is superseded (closed in `upsert_page_in_tx`).
         tx.execute(
-            "INSERT INTO entity_page_links (entity_id, page_id) VALUES (?1, ?2) \
+            "INSERT INTO entity_page_links (entity_id, page_id, valid_from) \
+             VALUES (?1, ?2, ?3) \
              ON CONFLICT (entity_id, page_id) DO NOTHING",
-            params![entity_id, page_id.as_bytes()],
+            params![entity_id, page_id.as_bytes(), version_created_at],
         )?;
     }
     Ok(())
@@ -898,10 +910,14 @@ fn replace_links_in_tx(
 
     let mut seen = BTreeSet::new();
     for link in &page.links {
+        // The relation joins the dedupe key (and the table's PK): a
+        // typed edge and a plain reference to the same target are two
+        // different rows, mirroring `link_type` in the schema.
         let key = (
             link.workspace.clone(),
             link.project.clone(),
             link.path.as_str().to_string(),
+            link.relation,
         );
         if !seen.insert(key) {
             continue;
@@ -911,13 +927,15 @@ fn replace_links_in_tx(
         tx.execute(
             "INSERT INTO links \
                  (from_page_id, to_page_id, to_workspace, to_project, to_path, link_type) \
-             VALUES (?1, ?2, ?3, ?4, ?5, 'references')",
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
             params![
                 from_page_id.as_bytes(),
                 to_page_blob,
                 link.workspace,
                 link.project,
                 link.path.as_str(),
+                link.relation
+                    .map_or("references", ai_memory_core::Relation::as_str),
             ],
         )?;
     }
@@ -6208,6 +6226,7 @@ pub(crate) mod tests {
             workspace: None,
             project: Some("infra".into()),
             path: PagePath::new("runbooks/02.md").unwrap(),
+            relation: None,
         }];
         let source_id = upsert_page(&mut conn, &source).unwrap();
 
