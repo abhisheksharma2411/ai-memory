@@ -159,6 +159,9 @@ allowlist = []
 # operator's bounded namespace and only shared plus own slots are injected into
 # that operator's session brief and consolidation prompt. Exact page reads and
 # searches remain project-wide: this is context-injection isolation, not RBAC.
+# Slots are the few always-loaded pages (project context, invariants)
+# injected into every session brief. Adjust only if briefs feel bloated
+# (lower the caps) or your project context page keeps getting clipped.
 [slots]
 per_user = false
 
@@ -166,6 +169,10 @@ per_user = false
 # differ by provider and model. Their sum must fit the model's context window;
 # leave additional headroom for tokenizer variance. Small local models must
 # lower both values together. Startup minimums are 6000 input and 1000 output.
+# Consolidation turns a finished session's raw observations into wiki
+# pages. Off (zero-LLM) you still get session pages + search; with an
+# LLM you get distilled concept/gotcha/rule pages. Reach for these knobs
+# when summaries feel too chatty (lower max tokens) or truncated (raise).
 [consolidation]
 max_input_tokens = 100000
 max_output_tokens = 32000

@@ -70,7 +70,7 @@ isolation.
 
 ```toml
 [auto_scope]
-mode = "single"           # "single" (default) | "per_session" | "per_actor"
+mode = "per_actor"        # "per_actor" (default since v1.39) | "per_session" | "single"
 session_ttl_secs = 3600   # TTL for per-key entries (default 1 h)
 max_entries = 4096        # hard cap; oldest insertions evicted first
 ```

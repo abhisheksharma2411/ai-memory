@@ -12,6 +12,26 @@ relations:
 ---
 ```
 
+## When to bother — and when not to
+
+Plain `[[wikilinks]]` remain the default and are enough for "these
+pages are related". Typed edges earn their keep in one specific loop —
+**contradictions you want lint to chase**:
+
+1. A gotcha page exists: `gotchas/linker-oom.md` ("the linker OOMs on
+   machines under 32 GB").
+2. Months later a session fixes it; the consolidator (or you) writes
+   `notes/linker-fix.md` with `relations: { fixes:
+   ["gotchas/linker-oom.md"] }` — the gotcha's page history now shows
+   what resolved it.
+3. Later still, new evidence disagrees with a stored decision; the new
+   page declares `contradicts:` — and `memory_lint` reports the pair as
+   a `contradiction` finding until someone reconciles them. No LLM
+   involved: the declaration IS the signal.
+
+If you are not using lint and don't need fix/cause chains, skip the
+frontmatter entirely; nothing else changes.
+
 ## The vocabulary (closed)
 
 | relation | meaning |
