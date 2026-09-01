@@ -774,6 +774,12 @@ pub struct AutoImproveSchedulerSettings {
     pub max_sessions_per_tick: usize,
     /// Minimum age after SessionEnd before a session becomes eligible.
     pub min_session_age_secs: u64,
+    /// Cross-session ("experience") pass: run after this many NEW
+    /// completed sessions per project. `0` (default) disables the pass —
+    /// it is opt-in and shaped by docs/experience.md.
+    pub experience_every_sessions: u64,
+    /// How many recent session summary pages one experience pass reads.
+    pub experience_sessions: usize,
 }
 
 impl Default for AutoImproveSchedulerSettings {
@@ -783,6 +789,8 @@ impl Default for AutoImproveSchedulerSettings {
             interval_secs: 3_600,
             max_sessions_per_tick: 1,
             min_session_age_secs: 600,
+            experience_every_sessions: 0,
+            experience_sessions: 10,
         }
     }
 }

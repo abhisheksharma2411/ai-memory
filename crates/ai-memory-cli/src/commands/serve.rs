@@ -1459,6 +1459,13 @@ async fn start_maintenance_scheduler(
             require_approval: auto_improve.require_approval,
             min_session_age_secs: scheduler.min_session_age_secs,
             max_sessions_per_tick: scheduler.max_sessions_per_tick,
+            experience: (scheduler.experience_every_sessions > 0).then(|| {
+                ai_memory_consolidate::ExperienceConfig {
+                    sessions: scheduler.experience_sessions.max(1),
+                    min_new_sessions: scheduler.experience_every_sessions,
+                    ..ai_memory_consolidate::ExperienceConfig::default()
+                }
+            }),
         };
         match ai_memory_consolidate::initialize_auto_improve_scheduler_scopes(&reader, &writer)
             .await

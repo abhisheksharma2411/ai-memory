@@ -8,6 +8,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- An opt-in cross-session "experience" pass
+  (`[auto_improve.scheduler] experience_every_sessions`): every N newly
+  completed sessions, the last few session summaries are reviewed side
+  by side and knowledge visible only ACROSS trajectories — repeated
+  workflows, re-stated preferences, architecture facts every session
+  re-discovers, contradictions with stored decisions — is proposed
+  through the identical schema-constrained, validated, eval-gated,
+  pending-writes staging path as per-session auto-improve. Evidence
+  must span at least two sessions; off by default and LLM-hosted, so
+  the zero-LLM path is untouched. See `docs/experience.md`.
 - `AI_MEMORY_EMBEDDING_PROVIDER=local` — in-process sentence embeddings
   (pure-Rust candle BERT, `all-MiniLM-L6-v2`, 384-dim) with no API key
   and no external server. The ~87 MB model is fetched once into

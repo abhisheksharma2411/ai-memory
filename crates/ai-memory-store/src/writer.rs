@@ -394,6 +394,12 @@ pub(crate) enum WriteCmd {
     OkfNonconformantCount {
         reply: oneshot::Sender<StoreResult<u64>>,
     },
+    /// Record a completed cross-session ("experience") pass for a scope.
+    MarkExperiencePassRun {
+        workspace_id: WorkspaceId,
+        project_id: ProjectId,
+        reply: oneshot::Sender<StoreResult<()>>,
+    },
     /// Record a successfully-applied wiki-structure migration.
     InsertWikiMigration {
         name: String,
@@ -1620,6 +1626,26 @@ impl WriterHandle {
         let (tx, rx) = oneshot::channel();
         self.send(WriteCmd::OkfMigrateLatestPages { reply: tx })
             .await?;
+        rx.await.map_err(|_| StoreError::WriterClosed)?
+    }
+
+    /// Record a completed cross-session ("experience") pass for a scope.
+    ///
+    /// # Errors
+    /// Returns [`StoreError::WriterClosed`] if the actor has shut down, or
+    /// propagates the SQL error.
+    pub async fn mark_experience_pass_run(
+        &self,
+        workspace_id: WorkspaceId,
+        project_id: ProjectId,
+    ) -> StoreResult<()> {
+        let (tx, rx) = oneshot::channel();
+        self.send(WriteCmd::MarkExperiencePassRun {
+            workspace_id,
+            project_id,
+            reply: tx,
+        })
+        .await?;
         rx.await.map_err(|_| StoreError::WriterClosed)?
     }
 
@@ -2903,6 +2929,18 @@ fn worker_loop(mut conn: Connection, mut rx: mpsc::Receiver<WriteCmd>) {
             WriteCmd::OkfNonconformantCount { reply } => {
                 let result = ops::okf_nonconformant_latest_pages(&conn);
                 send_or_warn(reply, result, "okf_nonconformant_count");
+            }
+            WriteCmd::MarkExperiencePassRun {
+                workspace_id,
+                project_id,
+                reply,
+            } => {
+                let result = crate::auto_improve::mark_experience_pass_run(
+                    &mut conn,
+                    workspace_id,
+                    project_id,
+                );
+                send_or_warn(reply, result, "mark_experience_pass_run");
             }
             WriteCmd::InsertWikiMigration {
                 name,
