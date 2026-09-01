@@ -1140,8 +1140,15 @@ impl Config {
     /// Returns [`LlmError::NotConfigured`] for unknown providers, missing API
     /// keys, or invalid dimensions.
     pub fn embedder_config(&self) -> LlmResult<Option<EmbedderConfig>> {
-        let Some(provider_raw) = non_empty(self.embedding_provider.as_deref()) else {
-            return Ok(None);
+        // 2.0 default: hybrid retrieval out of the box. An unset provider
+        // selects in-process `local` embeddings BEST-EFFORT (the serve
+        // layer degrades to no-embedder if the model cannot be fetched or
+        // loaded); `embedding_provider = "none"` opts out entirely, and an
+        // explicitly configured provider keeps hard-failure semantics.
+        let (provider_raw, defaulted) = match non_empty(self.embedding_provider.as_deref()) {
+            Some("none" | "off" | "disabled") => return Ok(None),
+            Some(raw) => (raw, false),
+            None => ("local", true),
         };
         let provider = match provider_raw {
             "openai" => EmbedderChoice::OpenAi,
@@ -1152,7 +1159,7 @@ impl Config {
             other => {
                 return Err(LlmError::NotConfigured(format!(
                     "AI_MEMORY_EMBEDDING_PROVIDER={other} not one of \
-                     openai|voyage|google|gemini|openai-compat|local"
+                     openai|voyage|google|gemini|openai-compat|local|none"
                 )));
             }
         };
@@ -1224,6 +1231,7 @@ impl Config {
             api_key,
             base_url,
             models_dir: Some(self.data_dir.join("models")),
+            defaulted,
         }))
     }
 

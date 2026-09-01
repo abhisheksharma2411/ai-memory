@@ -85,6 +85,7 @@ async fn factory_builds_compat_embedder_and_requires_base_url() {
         api_key: SecretString::from(String::new()),
         base_url: Some("http://localhost:11434/v1".into()),
         models_dir: None,
+        defaulted: false,
     })
     .expect("factory builds compat embedder");
     assert_eq!(ok.provider(), "openai-compat");
@@ -97,6 +98,7 @@ async fn factory_builds_compat_embedder_and_requires_base_url() {
         api_key: SecretString::from(String::new()),
         base_url: None,
         models_dir: None,
+        defaulted: false,
     }) {
         Ok(_) => panic!("compat embedder must not build without a base URL"),
         Err(err) => err,
@@ -113,6 +115,7 @@ async fn factory_builds_compat_embedder_and_requires_base_url() {
         api_key: SecretString::from(String::new()),
         base_url: Some("http://localhost:11434/v1".into()),
         models_dir: None,
+        defaulted: false,
     });
     assert!(
         matches!(zero_dim, Err(LlmError::NotConfigured(ref msg)) if msg.contains("greater than zero")),

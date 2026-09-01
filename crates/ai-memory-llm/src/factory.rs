@@ -158,6 +158,12 @@ pub struct EmbedderConfig {
     pub base_url: Option<String>,
     /// `<data_dir>/models/` root, required by the `local` provider.
     pub models_dir: Option<std::path::PathBuf>,
+    /// True when no provider was configured and `local` was chosen as
+    /// the 2.0 default. Best-effort semantics: a defaulted embedder
+    /// that cannot fetch or load its model degrades to no-embedder with
+    /// a warning instead of refusing to start; an explicitly configured
+    /// one still fails hard.
+    pub defaulted: bool,
 }
 
 /// Construct an `Arc<dyn Embedder>` from the config.

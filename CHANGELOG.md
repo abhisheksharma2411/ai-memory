@@ -49,6 +49,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   pinned sha256; baselines are published under `docs/benchmarks/`. The
   existing LLM A/B harness moved to the `ab` subcommand.
 ### Changed
+- Hybrid retrieval is on by default: an install with no
+  `embedding_provider` configured now gets in-process local embeddings
+  best-effort — the model downloads in the background on first start
+  (hybrid search enables on the next restart), existing pages are
+  backfilled by a one-shot startup pass, and hosts that cannot fetch
+  the model keep the previous FTS-only behaviour with a warning. Opt
+  out with `embedding_provider = "none"`; configured providers are
+  never overridden. Measured on LongMemEval-S: overall hit@5 rises
+  from 0.617 (FTS-only) to 0.779 with local embeddings.
 - The wiki's on-disk format is now natively the Open Knowledge Format
   (OKF) v0.2: every page write fills the spec's `type`, `generated`,
   `sources` and `stale_after` keys (ai-memory's own fields ride along as

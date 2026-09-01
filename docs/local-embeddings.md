@@ -6,9 +6,19 @@ required. Pure-Rust BERT inference (candle) with
 `all-MiniLM-L6-v2` (384-dim), the sentence-transformers workhorse the
 comparable memory servers ship by default.
 
+**As of 2.0 this is the default**: an install with no
+`embedding_provider` configured gets local embeddings automatically —
+best-effort. The model downloads in the background on the first start
+(hybrid search enables on the next restart), existing pages are
+backfilled automatically, and a host that cannot fetch the model (or a
+slim build without the feature) simply keeps the FTS-only behaviour
+with a warning. Opt out with `embedding_provider = "none"`; an
+explicitly configured provider is never overridden.
+
 ```toml
-# config.toml
-embedding_provider = "local"     # model/dim default correctly
+# config.toml — all optional as of 2.0
+embedding_provider = "local"     # explicit: hard-fails if unavailable
+# embedding_provider = "none"    # opt out of vectors entirely
 ```
 
 ## Why: semantic recall without data egress

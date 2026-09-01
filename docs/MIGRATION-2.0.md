@@ -38,6 +38,18 @@ The migration is idempotent: restarting the server re-runs nothing and
 never takes a second backup. Fresh installs skip all of it, including
 the backup.
 
+## Embeddings on by default
+
+2.0 also turns on [local embeddings](local-embeddings.md) for installs
+that never configured an embedding provider: the first start downloads
+the ~87 MB model in the background (checksum-pinned, to
+`<data_dir>/models/`), the next start enables hybrid search, and
+existing pages are embedded automatically by a startup backfill. No
+data leaves the machine — inference is in-process. Hosts that cannot
+fetch the model keep the old FTS-only behaviour with a warning. Opt
+out with `embedding_provider = "none"`; installs with a configured
+provider are untouched.
+
 ## Running in a server or container (docker deploys)
 
 Inside a container the home directory is **ephemeral** — it lives in

@@ -69,6 +69,9 @@ pub struct RetrievalArgs {
 }
 
 pub async fn run(args: RetrievalArgs) -> Result<()> {
+    // Captured at launch: a long run must not stamp its report with a
+    // commit that landed while it was in flight.
+    let commit = report::commit_sha();
     if args.fetch && !args.dataset.exists() {
         dataset::fetch(&args.dataset).await?;
     }
@@ -201,7 +204,7 @@ pub async fn run(args: RetrievalArgs) -> Result<()> {
 
     let rep = report::Report {
         generated_at: Timestamp::now().to_string(),
-        commit: report::commit_sha(),
+        commit,
         hardware: report::hardware(),
         dataset: "longmemeval_s",
         dataset_sha256: dataset::LONGMEMEVAL_S_SHA256,
