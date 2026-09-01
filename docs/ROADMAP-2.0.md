@@ -235,6 +235,11 @@ AGENTS.md "CI pacing"). 2.0 is cut when:
   restore drill from the pre-migration backup archive**;
 - README/ARCHITECTURE reflect 2.0 reality;
 - the eval numbers are re-run and published for the final tree;
+- a **pr-post-audit over the whole 2.0 range** (v1.39.0 → the
+  release candidate) has run clean: every item PR re-verified against
+  the final combined tree, cross-PR interactions swept, documentation
+  ledger checked — findings fixed and re-audited before anything else
+  proceeds;
 - the full macOS/Windows CI matrix is green on the release-candidate
   SHA (dispatched, not assumed), and **the user has reviewed the summary
   of everything done and explicitly approved the release** — 2.0 is
