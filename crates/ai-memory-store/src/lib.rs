@@ -6537,6 +6537,77 @@ mod tests {
         }
     }
 
+    /// Item 7 truthfulness: "missing embeddings" counts only pages a
+    /// backfill can act on; empty-body pages are reported apart instead
+    /// of inflating the actionable number forever.
+    #[tokio::test]
+    async fn missing_embeddings_excludes_unembeddable_pages() {
+        let tmp = TempDir::new().unwrap();
+        let store = Store::open(tmp.path()).unwrap();
+        let ws = store
+            .writer
+            .get_or_create_workspace("default")
+            .await
+            .unwrap();
+        let proj = store
+            .writer
+            .get_or_create_project(ws, "s", None)
+            .await
+            .unwrap();
+        store
+            .writer
+            .upsert_page(sample_page(ws, proj, "notes/real.md", "actual content"))
+            .await
+            .unwrap();
+        store
+            .writer
+            .upsert_page(sample_page(ws, proj, "notes/empty.md", "   "))
+            .await
+            .unwrap();
+        let derived = store.reader.derived_index_status().await.unwrap();
+        assert_eq!(derived.latest_pages_missing_embeddings, 1, "{derived:?}");
+        assert_eq!(derived.latest_pages_unembeddable, 1, "{derived:?}");
+    }
+
+    /// Typed edges surface in the derived status by relation.
+    #[tokio::test]
+    async fn typed_links_are_counted_by_relation() {
+        let tmp = TempDir::new().unwrap();
+        let store = Store::open(tmp.path()).unwrap();
+        let ws = store
+            .writer
+            .get_or_create_workspace("default")
+            .await
+            .unwrap();
+        let proj = store
+            .writer
+            .get_or_create_project(ws, "s", None)
+            .await
+            .unwrap();
+        let mut page = sample_page(ws, proj, "notes/a.md", "body");
+        page.links = vec![
+            ai_memory_core::LinkTarget {
+                workspace: None,
+                project: None,
+                path: ai_memory_core::PagePath::new("notes/b.md").unwrap(),
+                relation: Some(ai_memory_core::Relation::Fixes),
+            },
+            ai_memory_core::LinkTarget {
+                workspace: None,
+                project: None,
+                path: ai_memory_core::PagePath::new("notes/c.md").unwrap(),
+                relation: None,
+            },
+        ];
+        store.writer.upsert_page(page).await.unwrap();
+        let derived = store.reader.derived_index_status().await.unwrap();
+        assert_eq!(
+            derived.typed_links_from_latest_pages,
+            vec![("fixes".to_string(), 1)],
+            "{derived:?}"
+        );
+    }
+
     #[tokio::test]
     async fn entity_stream_finds_and_weights_pages() {
         let tmp = TempDir::new().unwrap();

@@ -33,6 +33,31 @@ young — cross-session patterns need sessions to cross — or when no LLM
 is configured: the pass is LLM-hosted and the zero-LLM default path
 never runs it.
 
+## What a proposal looks like
+
+After eight sessions in which the operator repeatedly rebuilt the
+release binary before running the eval harness, the pass might stage:
+
+```markdown
+# _pending/auto-improve/…-procedures-eval-run.md   (confidence 0.86)
+
+## Proposed: procedures/eval-run.md
+
+Before benchmarking, rebuild the release server first — the harness
+spawns `target/release/ai-memory`, and a stale binary silently
+benchmarks old code.
+
+    cargo build --release -p ai-memory-cli
+    cargo run --release -p ai-memory-eval -- retrieval
+
+Evidence: sessions 2026-08-28 ("rebuilt release, numbers changed"),
+2026-08-30 ("forgot the rebuild again — rerun").
+```
+
+It stays in `_pending/` (with `require_approval = true`) until a human
+approves it — the same review flow as every other auto-improve
+proposal.
+
 ## What it costs and what guards it
 
 One LLM call per project per cadence trigger, prompt-bounded like the

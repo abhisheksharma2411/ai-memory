@@ -50,6 +50,22 @@ struct Report {
     /// Passive process-scoped provider health.
     #[serde(default)]
     providers: ProviderHealthSnapshot,
+    /// Write-queue depth `(queued, capacity)` (2.0 servers).
+    #[serde(default)]
+    write_queue: Option<(usize, usize)>,
+    /// Wiki-format state (2.0 servers).
+    #[serde(default)]
+    wiki_format: Option<WikiFormatReport>,
+}
+
+#[derive(Debug, Default, Deserialize, Serialize)]
+struct WikiFormatReport {
+    #[serde(default)]
+    okf_migrated: bool,
+    #[serde(default)]
+    backup_archive: Option<String>,
+    #[serde(default)]
+    backup_archive_bytes: Option<u64>,
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -67,6 +83,10 @@ struct Derived {
     observations_rows: u64,
     observations_fts_rows: u64,
     latest_pages_missing_embeddings: u64,
+    #[serde(default)]
+    latest_pages_unembeddable: u64,
+    #[serde(default)]
+    typed_links_from_latest_pages: Vec<(String, u64)>,
     #[serde(default)]
     embed_failures_unresolved: u64,
     #[serde(default)]
@@ -230,6 +250,18 @@ pub async fn run(config: &Config, args: StatusArgs) -> Result<()> {
             "  embeddings:   {} rows; {} latest pages missing",
             report.derived.embedding_rows, report.derived.latest_pages_missing_embeddings
         );
+        if report.derived.latest_pages_unembeddable > 0 {
+            println!(
+                "    unembeddable: {} (empty body; no embedder can cover these)",
+                report.derived.latest_pages_unembeddable
+            );
+        }
+        for triple in &report.derived.embedding_triples {
+            println!(
+                "    {}/{} dim {}: {} rows",
+                triple.provider, triple.model, triple.dim, triple.count
+            );
+        }
         // Only shown when there is something to act on. A recovered count with
         // no outstanding failures is history, not a problem.
         if report.derived.embed_failures_unresolved > 0 {
@@ -265,6 +297,36 @@ pub async fn run(config: &Config, args: StatusArgs) -> Result<()> {
             report.derived.unresolved_links_from_latest_pages,
             report.derived.stale_links_from_latest_pages
         );
+        if !report.derived.typed_links_from_latest_pages.is_empty() {
+            let typed: Vec<String> = report
+                .derived
+                .typed_links_from_latest_pages
+                .iter()
+                .map(|(k, v)| format!("{k}: {v}"))
+                .collect();
+            println!("    typed edges: {}", typed.join(", "));
+        }
+        if let Some(wiki) = &report.wiki_format {
+            let migrated = if wiki.okf_migrated {
+                "OKF v0.2 (migrated)"
+            } else {
+                "OKF v0.2 (native, no migration needed)"
+            };
+            match (&wiki.backup_archive, wiki.backup_archive_bytes) {
+                (Some(path), Some(bytes)) => println!(
+                    "  wiki format:  {migrated}; pre-migration backup still on disk: \
+                     {path} ({})",
+                    super::compact::human_bytes(bytes)
+                ),
+                _ => println!("  wiki format:  {migrated}"),
+            }
+        }
+        if let Some((queued, capacity)) = report.write_queue {
+            // A queue pinned near capacity is the wedged-writer signal.
+            if queued > 0 {
+                println!("  write queue:  {queued}/{capacity}");
+            }
+        }
         println!("  spool:");
         println!("    pending:    {}", spool.pending);
         println!("    oldest:     {}", spool_age_line(spool.oldest_age_ms));

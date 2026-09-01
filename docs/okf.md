@@ -1,5 +1,28 @@
 # OKF conformance (2.0)
 
+## What this buys you
+
+Your memory is portable beyond ai-memory. Hand a project bundle to a
+teammate who runs a *different* OKF-aware tool — or no tool at all —
+and they read your decisions, gotchas and procedures as ordinary
+markdown with standard metadata:
+
+```bash
+ai-memory export-okf --project myproject -o myproject-bundle.tar.gz
+```
+
+The receiving side unpacks a directory of `.md` files where every page
+declares its `type`, provenance (`generated`, `sources`) and freshness
+(`stale_after`) in the vocabulary Google's Open Knowledge Format
+standardized — greppable, Obsidian-openable, importable by anything
+OKF-aware. Nothing is held hostage: the export is a validated copy of
+the files ai-memory already lives on.
+
+The rest of this page is the design: how conformance is enforced and
+how existing stores migrate.
+
+---
+
 ai-memory's wiki is natively an **Open Knowledge Format** bundle from
 2.0 on: every page a consumer reads off disk is a conformant OKF
 concept file, and a project's wiki directory is a conformant bundle.
