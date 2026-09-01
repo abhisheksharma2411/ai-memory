@@ -177,6 +177,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   exists rather than reading one from a file ai-memory would have to write and
   protect.
 
+- Gave `ai-memory mcp-bridge` a TLS backend so it can reach an `https://` MCP
+  server. `ai-memory-cli` enabled rmcp's `transport-streamable-http-client-reqwest`
+  feature, which pulls reqwest in via `__reqwest = ["dep:reqwest"]` and stops
+  there — no `rustls`, no `native-tls`, no TLS at all. reqwest with no TLS
+  feature refuses any non-`http` scheme, so every bridge run against an HTTPS
+  server URL failed at connect with `invalid URL, scheme is not http`, and the
+  only URL that worked was plaintext `http://` — which is also the transport
+  the bridge attaches its bearer token to. Enabling rmcp's `reqwest` feature
+  the bridge now uses rmcp's `reqwest-tls-no-provider`
+  (`reqwest?/rustls-no-provider`), which supplies the platform certificate
+  verifier without pinning a crypto provider, and installs `ring` — already
+  compiled for this binary via the workspace's reqwest 0.12 — as the process
+  default. rmcp's plain `reqwest` feature would have pinned `aws-lc-rs`,
+  adding a compiled C dependency to every build for a bridge most users never
+  enable. The workspace-client half of #492 landed in #496; this is the MCP
+  transport, which is a second, independent copy of reqwest ([#497]).
+
 ### Docs
 
 - `docs/windows.md` gains **Scenario E**, a persistent-server story for native
@@ -453,22 +470,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   returned, and processing swallows its errors, so a store rejecting every
   event — read-only database, exhausted disk, a failed migration — still
   reported a fresh write time and looked healthy (#516).
-- Gave `ai-memory mcp-bridge` a TLS backend so it can reach an `https://` MCP
-  server. `ai-memory-cli` enabled rmcp's `transport-streamable-http-client-reqwest`
-  feature, which pulls reqwest in via `__reqwest = ["dep:reqwest"]` and stops
-  there — no `rustls`, no `native-tls`, no TLS at all. reqwest with no TLS
-  feature refuses any non-`http` scheme, so every bridge run against an HTTPS
-  server URL failed at connect with `invalid URL, scheme is not http`, and the
-  only URL that worked was plaintext `http://` — which is also the transport
-  the bridge attaches its bearer token to. Enabling rmcp's `reqwest` feature
-  the bridge now uses rmcp's `reqwest-tls-no-provider`
-  (`reqwest?/rustls-no-provider`), which supplies the platform certificate
-  verifier without pinning a crypto provider, and installs `ring` — already
-  compiled for this binary via the workspace's reqwest 0.12 — as the process
-  default. rmcp's plain `reqwest` feature would have pinned `aws-lc-rs`,
-  adding a compiled C dependency to every build for a bridge most users never
-  enable. The workspace-client half of #492 landed in #496; this is the MCP
-  transport, which is a second, independent copy of reqwest ([#497]).
 
 
 ## [1.33.0] - 2026-08-28
