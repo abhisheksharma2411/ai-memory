@@ -78,12 +78,20 @@ binary's own path, and that walk does not currently resolve through a
 symlink (tracked in [#546](https://github.com/akitaonrails/ai-memory/issues/546)).
 Running `install-hooks` through the `/usr/local/bin` symlink instead of the
 extracted `./ai-memory` sends discovery to the wrong parent directories. On a
-machine with no prior ai-memory install this fails outright; on a machine
-that already has a hooks cache under `~/Library/Application Support/ai-memory`
-from an earlier run, discovery can silently fall back to *that* — reporting
-success while wiring whatever hook version happens to be cached there,
-possibly not the one you just extracted. `ai-memory serve`/`status`/etc. are
-unaffected either way.
+machine with no prior ai-memory install (verified with a clean `$HOME`) this
+fails outright:
+
+```
+Error: could not locate hooks directory. Tried: ["/…/hooks/claude-code",
+"/usr/local/share/ai-memory/hooks/claude-code", "/usr/share/ai-memory/hooks/claude-code",
+"…/Library/Application Support/ai-memory/hooks/claude-code"]
+```
+
+On a machine that already has a hooks cache under
+`~/Library/Application Support/ai-memory` from an earlier run, discovery can
+instead silently fall back to *that* — reporting success while wiring
+whatever hook version happens to be cached there, possibly not the one you
+just extracted. `ai-memory serve`/`status`/etc. are unaffected either way.
 
 Notes:
 
@@ -200,10 +208,11 @@ wrapper's `posix` shell-script path does not. Re-run `install-hooks --agent
   (e.g. you put it on `PATH` before running `install-hooks`), macOS discovery
   does not resolve the symlink and searches the wrong parent directories —
   see [#546](https://github.com/akitaonrails/ai-memory/issues/546). On a
-  clean machine this fails outright; if a hooks cache from an earlier install
-  already exists under `~/Library/Application Support/ai-memory`, it can
-  silently reuse that stale copy instead and report success. Run
-  `install-hooks` via the real extracted/built path instead of the symlink
+  clean machine this fails outright with `Error: could not locate hooks
+  directory. Tried: [...]`; if a hooks cache from an earlier install already
+  exists under `~/Library/Application Support/ai-memory`, it can silently
+  reuse that stale copy instead and report success. Run `install-hooks` via
+  the real extracted/built path instead of the symlink
   until that's fixed.
 
 ## Suggested Test Checklist
