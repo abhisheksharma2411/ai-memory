@@ -4,6 +4,7 @@ use anyhow::{Context, Result, anyhow, bail};
 
 use crate::config::Config;
 
+pub mod api_key;
 pub mod apply_shared;
 pub mod audit_contamination;
 pub mod auth;
@@ -53,6 +54,7 @@ pub mod reorg;
 pub mod reset;
 pub mod restore;
 pub mod restore_page;
+pub mod resume;
 pub mod run;
 pub mod search;
 pub mod serve;

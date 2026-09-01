@@ -334,11 +334,39 @@ pub fn run(config: &Config, mut args: InstallHooksArgs) -> Result<()> {
         .clone()
         .or_else(|| config.auth.bearer_token.clone())
         .or_else(|| inferred.as_ref().and_then(|mcp| mcp.auth_token.clone()));
-    let auth = auth_token_owned.as_deref();
+    // #552: persist the bearer under the data dir (0600) and keep it OUT of
+    // the rendered config. Before this it went onto every hook's command line —
+    // as `--auth-token <token>` for native hooks, as an `AI_MEMORY_AUTH_TOKEN=`
+    // shell prefix for the script hooks — so it was readable through
+    // `/proc/<pid>/cmdline` by any local user for as long as each hook ran, on
+    // every tool call.
+    //
+    // Only `--apply` persists: a printed snippet is the operator's to place, and
+    // writing a credential as a side effect of a dry run would be a surprise.
+    let persisted = if args.apply
+        && let Some(token) = auth_token_owned.as_deref()
+    {
+        crate::config::store_hook_auth_token(&config.data_dir, token).with_context(|| {
+            format!(
+                "storing the hook auth token under {}",
+                config.data_dir.display()
+            )
+        })?;
+        true
+    } else {
+        false
+    };
+    // Renderers take `Option<&str>` and omit the credential entirely when it is
+    // `None`, so one decision here covers every agent instead of twenty edits.
+    let auth = if persisted {
+        None
+    } else {
+        auth_token_owned.as_deref()
+    };
     // P1.8 multi-user attribution: `--as-user` is metadata only — the
     // token stamped into the hook env block is whatever the operator
-    // passed via `--auth-token` (typically the per-user token from
-    // `ai-memory user add`). We surface the username to stderr so the
+    // passed via `--auth-token` (typically a native key from
+    // `ai-memory api-key add`). We surface the username to stderr so the
     // operator can confirm which identity their writes will attribute
     // to. Mismatch between `--as-user` and the actual token's owner is
     // the operator's concern; we don't reach back to the server to
@@ -415,7 +443,8 @@ pub fn run(config: &Config, mut args: InstallHooksArgs) -> Result<()> {
             AgentChoice::Pi => apply_to_pi_extension(&server_url, auth, &args),
             AgentChoice::Omp => apply_to_omp_extension(&server_url, auth, &args),
             AgentChoice::ClaudeCode => {
-                let hooks_dir = resolve_hooks_dir(args.hooks_dir.as_deref(), args.agent)?;
+                let hooks_dir =
+                    resolve_hooks_dir(args.hooks_dir.as_deref(), args.agent, &config.data_dir)?;
                 apply_to_claude_code_settings(
                     &hooks_dir,
                     &server_url,
@@ -425,11 +454,13 @@ pub fn run(config: &Config, mut args: InstallHooksArgs) -> Result<()> {
                 )
             }
             AgentChoice::Codex => {
-                let hooks_dir = resolve_hooks_dir(args.hooks_dir.as_deref(), args.agent)?;
+                let hooks_dir =
+                    resolve_hooks_dir(args.hooks_dir.as_deref(), args.agent, &config.data_dir)?;
                 apply_to_codex_settings(&hooks_dir, &server_url, auth, &config.data_dir, &args)
             }
             AgentChoice::CommandCode => {
-                let hooks_dir = resolve_hooks_dir(args.hooks_dir.as_deref(), args.agent)?;
+                let hooks_dir =
+                    resolve_hooks_dir(args.hooks_dir.as_deref(), args.agent, &config.data_dir)?;
                 apply_to_command_code_settings(
                     &hooks_dir,
                     &server_url,
@@ -439,15 +470,18 @@ pub fn run(config: &Config, mut args: InstallHooksArgs) -> Result<()> {
                 )
             }
             AgentChoice::Cursor => {
-                let hooks_dir = resolve_hooks_dir(args.hooks_dir.as_deref(), args.agent)?;
+                let hooks_dir =
+                    resolve_hooks_dir(args.hooks_dir.as_deref(), args.agent, &config.data_dir)?;
                 apply_to_cursor_settings(&hooks_dir, &server_url, auth, &config.data_dir, &args)
             }
             AgentChoice::GeminiCli => {
-                let hooks_dir = resolve_hooks_dir(args.hooks_dir.as_deref(), args.agent)?;
+                let hooks_dir =
+                    resolve_hooks_dir(args.hooks_dir.as_deref(), args.agent, &config.data_dir)?;
                 apply_to_gemini_settings(&hooks_dir, &server_url, auth, &config.data_dir, &args)
             }
             AgentChoice::AntigravityCli => {
-                let hooks_dir = resolve_hooks_dir(args.hooks_dir.as_deref(), args.agent)?;
+                let hooks_dir =
+                    resolve_hooks_dir(args.hooks_dir.as_deref(), args.agent, &config.data_dir)?;
                 apply_to_antigravity_settings(
                     &hooks_dir,
                     &server_url,
@@ -457,22 +491,26 @@ pub fn run(config: &Config, mut args: InstallHooksArgs) -> Result<()> {
                 )
             }
             AgentChoice::Grok => {
-                let hooks_dir = resolve_hooks_dir(args.hooks_dir.as_deref(), args.agent)?;
+                let hooks_dir =
+                    resolve_hooks_dir(args.hooks_dir.as_deref(), args.agent, &config.data_dir)?;
                 apply_to_grok_settings(&hooks_dir, &server_url, auth, &config.data_dir, &args)
             }
             AgentChoice::Zero => apply_to_zero_hooks(&server_url, auth, &config.data_dir, &args),
             AgentChoice::Zcode => apply_to_zcode_hooks(&server_url, auth, &config.data_dir, &args),
             AgentChoice::Devin => {
-                let hooks_dir = resolve_hooks_dir(args.hooks_dir.as_deref(), args.agent)?;
+                let hooks_dir =
+                    resolve_hooks_dir(args.hooks_dir.as_deref(), args.agent, &config.data_dir)?;
                 apply_to_devin_settings(&hooks_dir, &server_url, auth, &config.data_dir, &args)
             }
             AgentChoice::Openclaw => openclaw_plugin::apply(&server_url, auth, &args),
             AgentChoice::KimiCode => {
-                let hooks_dir = resolve_hooks_dir(args.hooks_dir.as_deref(), args.agent)?;
+                let hooks_dir =
+                    resolve_hooks_dir(args.hooks_dir.as_deref(), args.agent, &config.data_dir)?;
                 apply_to_kimi_code_config(&hooks_dir, &server_url, auth, &config.data_dir, &args)
             }
             AgentChoice::KiroCli => {
-                let hooks_dir = resolve_hooks_dir(args.hooks_dir.as_deref(), args.agent)?;
+                let hooks_dir =
+                    resolve_hooks_dir(args.hooks_dir.as_deref(), args.agent, &config.data_dir)?;
                 apply_to_kiro_cli_agent_configs(
                     &hooks_dir,
                     &server_url,
@@ -482,11 +520,13 @@ pub fn run(config: &Config, mut args: InstallHooksArgs) -> Result<()> {
                 )
             }
             AgentChoice::KiroCliV3 => {
-                let hooks_dir = resolve_hooks_dir(args.hooks_dir.as_deref(), args.agent)?;
+                let hooks_dir =
+                    resolve_hooks_dir(args.hooks_dir.as_deref(), args.agent, &config.data_dir)?;
                 apply_to_kiro_cli_v3_hooks(&hooks_dir, &server_url, auth, &config.data_dir, &args)
             }
             AgentChoice::Pool => {
-                let hooks_dir = resolve_hooks_dir(args.hooks_dir.as_deref(), args.agent)?;
+                let hooks_dir =
+                    resolve_hooks_dir(args.hooks_dir.as_deref(), args.agent, &config.data_dir)?;
                 apply_to_pool(&hooks_dir, &server_url, auth, &config.data_dir, &args)
             }
         };
@@ -499,7 +539,8 @@ pub fn run(config: &Config, mut args: InstallHooksArgs) -> Result<()> {
             render_omp_extension(&server_url, auth, strategy, args.profile.as_deref())
         }
         AgentChoice::ClaudeCode => {
-            let hooks_dir = resolve_hooks_dir(args.hooks_dir.as_deref(), args.agent)?;
+            let hooks_dir =
+                resolve_hooks_dir(args.hooks_dir.as_deref(), args.agent, &config.data_dir)?;
             let settings_path = match &args.config_file {
                 Some(p) => p.clone(),
                 None => claude_settings_path()?,
@@ -518,7 +559,8 @@ pub fn run(config: &Config, mut args: InstallHooksArgs) -> Result<()> {
             )
         }
         AgentChoice::Codex => {
-            let hooks_dir = resolve_hooks_dir(args.hooks_dir.as_deref(), args.agent)?;
+            let hooks_dir =
+                resolve_hooks_dir(args.hooks_dir.as_deref(), args.agent, &config.data_dir)?;
             render_agent(
                 "codex",
                 &hooks_dir,
@@ -529,7 +571,8 @@ pub fn run(config: &Config, mut args: InstallHooksArgs) -> Result<()> {
             )
         }
         AgentChoice::CommandCode => {
-            let hooks_dir = resolve_hooks_dir(args.hooks_dir.as_deref(), args.agent)?;
+            let hooks_dir =
+                resolve_hooks_dir(args.hooks_dir.as_deref(), args.agent, &config.data_dir)?;
             render_agent(
                 "command-code",
                 &hooks_dir,
@@ -540,7 +583,8 @@ pub fn run(config: &Config, mut args: InstallHooksArgs) -> Result<()> {
             )
         }
         AgentChoice::Cursor => {
-            let hooks_dir = resolve_hooks_dir(args.hooks_dir.as_deref(), args.agent)?;
+            let hooks_dir =
+                resolve_hooks_dir(args.hooks_dir.as_deref(), args.agent, &config.data_dir)?;
             render_agent(
                 "cursor",
                 &hooks_dir,
@@ -551,7 +595,8 @@ pub fn run(config: &Config, mut args: InstallHooksArgs) -> Result<()> {
             )
         }
         AgentChoice::GeminiCli => {
-            let hooks_dir = resolve_hooks_dir(args.hooks_dir.as_deref(), args.agent)?;
+            let hooks_dir =
+                resolve_hooks_dir(args.hooks_dir.as_deref(), args.agent, &config.data_dir)?;
             render_agent(
                 "gemini-cli",
                 &hooks_dir,
@@ -562,7 +607,8 @@ pub fn run(config: &Config, mut args: InstallHooksArgs) -> Result<()> {
             )
         }
         AgentChoice::AntigravityCli => {
-            let hooks_dir = resolve_hooks_dir(args.hooks_dir.as_deref(), args.agent)?;
+            let hooks_dir =
+                resolve_hooks_dir(args.hooks_dir.as_deref(), args.agent, &config.data_dir)?;
             render_agent(
                 "antigravity-cli",
                 &hooks_dir,
@@ -573,13 +619,15 @@ pub fn run(config: &Config, mut args: InstallHooksArgs) -> Result<()> {
             )
         }
         AgentChoice::Grok => {
-            let hooks_dir = resolve_hooks_dir(args.hooks_dir.as_deref(), args.agent)?;
+            let hooks_dir =
+                resolve_hooks_dir(args.hooks_dir.as_deref(), args.agent, &config.data_dir)?;
             render_grok(&hooks_dir, &server_url, auth, &config.data_dir, strategy)
         }
         AgentChoice::Zero => render_zero(&server_url, auth, &config.data_dir, strategy),
         AgentChoice::Zcode => render_zcode(&server_url, auth, &config.data_dir, strategy),
         AgentChoice::Devin => {
-            let hooks_dir = resolve_hooks_dir(args.hooks_dir.as_deref(), args.agent)?;
+            let hooks_dir =
+                resolve_hooks_dir(args.hooks_dir.as_deref(), args.agent, &config.data_dir)?;
             render_devin(&hooks_dir, &server_url, auth, &config.data_dir, strategy)
         }
         AgentChoice::Openclaw => {
@@ -587,19 +635,23 @@ pub fn run(config: &Config, mut args: InstallHooksArgs) -> Result<()> {
             Ok(())
         }
         AgentChoice::KimiCode => {
-            let hooks_dir = resolve_hooks_dir(args.hooks_dir.as_deref(), args.agent)?;
+            let hooks_dir =
+                resolve_hooks_dir(args.hooks_dir.as_deref(), args.agent, &config.data_dir)?;
             render_kimi_code(&hooks_dir, &server_url, auth, &config.data_dir, strategy)
         }
         AgentChoice::KiroCli => {
-            let hooks_dir = resolve_hooks_dir(args.hooks_dir.as_deref(), args.agent)?;
+            let hooks_dir =
+                resolve_hooks_dir(args.hooks_dir.as_deref(), args.agent, &config.data_dir)?;
             render_kiro_cli(&hooks_dir, &server_url, auth, &config.data_dir, strategy)
         }
         AgentChoice::KiroCliV3 => {
-            let hooks_dir = resolve_hooks_dir(args.hooks_dir.as_deref(), args.agent)?;
+            let hooks_dir =
+                resolve_hooks_dir(args.hooks_dir.as_deref(), args.agent, &config.data_dir)?;
             render_kiro_cli_v3(&hooks_dir, &server_url, auth, &config.data_dir, strategy)
         }
         AgentChoice::Pool => {
-            let hooks_dir = resolve_hooks_dir(args.hooks_dir.as_deref(), args.agent)?;
+            let hooks_dir =
+                resolve_hooks_dir(args.hooks_dir.as_deref(), args.agent, &config.data_dir)?;
             render_pool(&hooks_dir, &server_url, auth, &config.data_dir, strategy)
         }
     }
@@ -877,7 +929,7 @@ fn validate_as_user(as_user: Option<&str>, auth_token: Option<&str>) -> Result<(
     if auth_token.map(str::trim).is_none_or(str::is_empty) {
         anyhow::bail!(
             "--as-user '{user}' requires --auth-token \
-             (the token printed by `ai-memory user add --username {user}`)"
+             (issue one with `ai-memory api-key add --username {user} --label <label>`)"
         );
     }
     Ok(())
@@ -1391,7 +1443,7 @@ fn apply_to_claude_code_settings(
     data_dir: &Path,
     args: &InstallHooksArgs,
 ) -> Result<()> {
-    let staged = stage_hook_scripts(hooks_dir, "claude-code")?;
+    let staged = stage_hook_scripts(hooks_dir, "claude-code", data_dir)?;
     apply_to_claude_code_settings_with_staged(&staged, server_url, auth_token, data_dir, args)
 }
 
@@ -1510,7 +1562,7 @@ fn apply_to_grok_settings(
         Some(p) => p.clone(),
         None => grok_hooks_path()?,
     };
-    let staged = stage_hook_scripts(hooks_dir, "grok")?;
+    let staged = stage_hook_scripts(hooks_dir, "grok", data_dir)?;
     let command_dir = staged_command_dir(&staged, "grok");
     let strategy = args.project_strategy.and_then(ProjectStrategyArg::baked);
     let payload = build_grok_payload_with_data_dir(
@@ -1562,7 +1614,7 @@ fn apply_to_devin_settings(
     data_dir: &Path,
     args: &InstallHooksArgs,
 ) -> Result<()> {
-    let staged = stage_hook_scripts(hooks_dir, "devin")?;
+    let staged = stage_hook_scripts(hooks_dir, "devin", data_dir)?;
     apply_to_devin_settings_with_staged(&staged, server_url, auth_token, data_dir, args)
 }
 
@@ -1652,7 +1704,7 @@ fn apply_to_command_code_settings(
     data_dir: &Path,
     args: &InstallHooksArgs,
 ) -> Result<()> {
-    let staged = stage_hook_scripts(hooks_dir, "command-code")?;
+    let staged = stage_hook_scripts(hooks_dir, "command-code", data_dir)?;
     apply_to_command_code_settings_with_staged(&staged, server_url, auth_token, data_dir, args)
 }
 
@@ -1768,7 +1820,7 @@ fn apply_to_codex_settings(
     data_dir: &Path,
     args: &InstallHooksArgs,
 ) -> Result<()> {
-    let staged = stage_hook_scripts(hooks_dir, "codex")?;
+    let staged = stage_hook_scripts(hooks_dir, "codex", data_dir)?;
     apply_to_codex_settings_with_staged(&staged, server_url, auth_token, data_dir, args)
 }
 
@@ -1929,7 +1981,7 @@ fn apply_to_cursor_settings(
         Some(p) => p.clone(),
         None => cursor_hooks_path()?,
     };
-    let staged = stage_hook_scripts(hooks_dir, "cursor")?;
+    let staged = stage_hook_scripts(hooks_dir, "cursor", data_dir)?;
     let command_dir = staged_command_dir(&staged, "cursor");
     let strategy = args.project_strategy.and_then(ProjectStrategyArg::baked);
     let outcome = merge_cursor_hooks(
@@ -2021,7 +2073,7 @@ fn apply_to_gemini_settings(
         Some(p) => p.clone(),
         None => gemini_settings_path()?,
     };
-    let staged = stage_hook_scripts(hooks_dir, "gemini-cli")?;
+    let staged = stage_hook_scripts(hooks_dir, "gemini-cli", data_dir)?;
     let command_dir = staged_command_dir(&staged, "gemini-cli");
     let strategy = args.project_strategy.and_then(ProjectStrategyArg::baked);
     let outcome = merge_gemini_hooks(
@@ -2105,7 +2157,7 @@ fn apply_to_antigravity_settings(
         Some(p) => p.clone(),
         None => antigravity_hooks_path()?,
     };
-    let staged = stage_hook_scripts(hooks_dir, "antigravity-cli")?;
+    let staged = stage_hook_scripts(hooks_dir, "antigravity-cli", data_dir)?;
     let command_dir = staged_command_dir(&staged, "antigravity-cli");
     let strategy = args.project_strategy.and_then(ProjectStrategyArg::baked);
     let outcome = merge_antigravity_hooks(
@@ -2195,7 +2247,7 @@ fn apply_to_kimi_code_config(
         Some(p) => p.clone(),
         None => kimi_code_config_path()?,
     };
-    let staged = stage_hook_scripts(hooks_dir, "kimi-code")?;
+    let staged = stage_hook_scripts(hooks_dir, "kimi-code", data_dir)?;
     let command_dir = staged_command_dir(&staged, "kimi-code");
     let strategy = args.project_strategy.and_then(ProjectStrategyArg::baked);
     let outcome = merge_kimi_code_hooks(
@@ -2337,7 +2389,7 @@ fn apply_to_kiro_cli_agent_configs(
         args.project_strategy,
     )?;
 
-    let staged = stage_hook_scripts(hooks_dir, "kiro-cli")?;
+    let staged = stage_hook_scripts(hooks_dir, "kiro-cli", data_dir)?;
     let command_dir = staged_command_dir(&staged, "kiro-cli");
     for (path, strategy) in prepared {
         let outcome = merge_kiro_cli_agent_hooks(
@@ -2475,7 +2527,7 @@ fn apply_to_kiro_cli_v3_hooks(
         &existing, hooks_dir, server_url, auth_token, data_dir, strategy, &path,
     )?;
 
-    let staged = stage_hook_scripts(hooks_dir, "kiro-cli")?;
+    let staged = stage_hook_scripts(hooks_dir, "kiro-cli", data_dir)?;
     let command_dir = staged_command_dir(&staged, "kiro-cli");
     let outcome = merge_kiro_cli_v3_hooks(
         &command_dir,
@@ -3991,21 +4043,17 @@ fn manual_agent_project_strategy_instruction(project_strategy: Option<&str>) -> 
 ///
 /// Errors propagate when source is missing, the staging dir
 /// can't be created, or any file copy fails.
-fn stage_hook_scripts(source_dir: &Path, agent_label: &str) -> Result<PathBuf> {
-    let data_dir = dirs::data_local_dir()
-        .context("could not locate the user data-local directory (e.g. ~/.local/share)")?;
-    stage_hook_scripts_in(source_dir, agent_label, &data_dir)
+fn stage_hook_scripts(source_dir: &Path, agent_label: &str, data_dir: &Path) -> Result<PathBuf> {
+    stage_hook_scripts_in(source_dir, agent_label, data_dir)
 }
 
-fn stage_hook_scripts_in(
-    source_dir: &Path,
-    agent_label: &str,
-    data_local_dir: &Path,
-) -> Result<PathBuf> {
-    let dest_root = data_local_dir
-        .join("ai-memory")
-        .join("hooks")
-        .join(agent_label);
+fn stage_hook_scripts_in(source_dir: &Path, agent_label: &str, data_dir: &Path) -> Result<PathBuf> {
+    // `<data_dir>/hooks/<agent>`, not `<platform default>/ai-memory/hooks/…`.
+    // Byte-identical for a default install, since `default_data_dir()` *is*
+    // `data_local_dir()/ai-memory` — but it now follows `--data-dir` and
+    // `AI_MEMORY_DATA_DIR` instead of populating a directory the operator is
+    // not using (#554).
+    let dest_root = data_dir.join("hooks").join(agent_label);
 
     fs::create_dir_all(&dest_root)
         .with_context(|| format!("creating staging dir {}", dest_root.display()))?;
@@ -4159,7 +4207,11 @@ fn is_hook_script_file(path: &Path) -> bool {
     )
 }
 
-fn resolve_hooks_dir(explicit: Option<&Path>, agent: AgentChoice) -> Result<PathBuf> {
+fn resolve_hooks_dir(
+    explicit: Option<&Path>,
+    agent: AgentChoice,
+    data_dir: &Path,
+) -> Result<PathBuf> {
     let Some(sub) = agent.script_hook_subdir() else {
         anyhow::bail!("{agent:?} uses a generated integration, not a hook script directory")
     };
@@ -4176,7 +4228,7 @@ fn resolve_hooks_dir(explicit: Option<&Path>, agent: AgentChoice) -> Result<Path
         sub,
         repo_root_guess(),
         exe_dir_guess(),
-        dirs::data_local_dir(),
+        Some(data_dir.to_path_buf()),
     );
     for path in &candidates {
         if !path.as_os_str().is_empty() && path.is_dir() {
@@ -4193,7 +4245,7 @@ fn hook_source_candidates(
     sub: &str,
     repo_root: Option<PathBuf>,
     exe_dir: Option<PathBuf>,
-    data_local_dir: Option<PathBuf>,
+    data_dir: Option<PathBuf>,
 ) -> Vec<PathBuf> {
     let mut candidates = Vec::with_capacity(5);
     // Cargo-run from the repo.
@@ -4212,9 +4264,10 @@ fn hook_source_candidates(
     )));
     // Native Linux packages install hook sources under /usr/share.
     candidates.push(PathBuf::from(format!("/usr/share/ai-memory/hooks/{sub}")));
-    // Local install honourable mention.
-    if let Some(dir) = data_local_dir {
-        candidates.push(dir.join("ai-memory/hooks").join(sub));
+    // Local install honourable mention: the bundle a previous `--apply`, or
+    // docker `setup-agent`, staged under the data dir actually in use.
+    if let Some(dir) = data_dir {
+        candidates.push(dir.join("hooks").join(sub));
     }
     candidates
 }
@@ -4935,7 +4988,7 @@ fn apply_to_pool(
     data_dir: &Path,
     args: &InstallHooksArgs,
 ) -> Result<()> {
-    let staged = stage_hook_scripts(hooks_dir, "pool")?;
+    let staged = stage_hook_scripts(hooks_dir, "pool", data_dir)?;
     let command_dir = staged_command_dir(&staged, "pool");
     let strategy = args.project_strategy.and_then(ProjectStrategyArg::baked);
     print!(
@@ -5173,7 +5226,10 @@ mod tests {
                 "stop.sh",
             ],
         );
-        let staging = TempDir::new().unwrap();
+        let staging_root = TempDir::new().unwrap();
+        // A real data dir ends in `ai-memory`; the entry-matching below keys
+        // off that, so inject a realistic one rather than a bare temp path.
+        let staging = staging_root.path().join("ai-memory");
         let config_dir = TempDir::new().unwrap();
         let config_path = config_dir.path().join("settings.json");
         fs::write(
@@ -5200,7 +5256,7 @@ mod tests {
             "http://memory:49374",
             Some("token"),
             config_dir.path(),
-            staging.path(),
+            &staging,
             &args,
         )
         .unwrap();
@@ -5210,7 +5266,7 @@ mod tests {
             "http://memory:49374",
             Some("token"),
             config_dir.path(),
-            staging.path(),
+            &staging,
             &args,
         )
         .unwrap();
@@ -5803,7 +5859,7 @@ command = "AI_MEMORY_HOOK_URL=http://h AI_MEMORY_PROJECT_STRATEGY=repo-root /x/a
         fs::create_dir_all(tmp.path().join("grok")).unwrap();
         fs::create_dir_all(tmp.path().join("claude-code")).unwrap();
 
-        let resolved = resolve_hooks_dir(Some(tmp.path()), AgentChoice::Grok).unwrap();
+        let resolved = resolve_hooks_dir(Some(tmp.path()), AgentChoice::Grok, tmp.path()).unwrap();
         assert_eq!(resolved, tmp.path().join("grok"));
     }
 
@@ -5813,7 +5869,7 @@ command = "AI_MEMORY_HOOK_URL=http://h AI_MEMORY_PROJECT_STRATEGY=repo-root /x/a
         fs::create_dir_all(tmp.path().join("pool")).unwrap();
         fs::create_dir_all(tmp.path().join("claude-code")).unwrap();
 
-        let resolved = resolve_hooks_dir(Some(tmp.path()), AgentChoice::Pool).unwrap();
+        let resolved = resolve_hooks_dir(Some(tmp.path()), AgentChoice::Pool, tmp.path()).unwrap();
         assert_eq!(resolved, tmp.path().join("pool"));
     }
 
@@ -6205,7 +6261,7 @@ command = "AI_MEMORY_HOOK_URL=http://h AI_MEMORY_PROJECT_STRATEGY=repo-root /x/a
         fs::create_dir_all(tmp.path().join("devin")).unwrap();
         fs::create_dir_all(tmp.path().join("claude-code")).unwrap();
 
-        let resolved = resolve_hooks_dir(Some(tmp.path()), AgentChoice::Devin).unwrap();
+        let resolved = resolve_hooks_dir(Some(tmp.path()), AgentChoice::Devin, tmp.path()).unwrap();
         assert_eq!(resolved, tmp.path().join("devin"));
     }
 
@@ -6627,9 +6683,9 @@ model = "gpt-5"
         let tmp = TempDir::new().unwrap();
         let data_dir = tmp.path().join("data");
         let agent_label = "stage-in-place";
-        // Simulate "scripts already extracted into the data-local
-        // hooks dir by a prior `setup-agent` run".
-        let in_place = data_dir.join("ai-memory/hooks").join(agent_label);
+        // Simulate "scripts already extracted into the data dir's hooks
+        // dir by a prior `setup-agent` run".
+        let in_place = data_dir.join("hooks").join(agent_label);
         fs::create_dir_all(&in_place).unwrap();
         stub_scripts(&in_place, &["session-start.sh", "post-tool-use.sh"]);
 
@@ -6660,7 +6716,10 @@ model = "gpt-5"
         let tmp = TempDir::new().unwrap();
         let data_dir = tmp.path().join("data");
         let agent_label = "stage-empty-in-place";
-        let in_place = data_dir.join("ai-memory/hooks").join(agent_label);
+        // Must equal what `stage_hook_scripts_in` computes, or this stops
+        // being the source==dest case it exists to cover and duplicates the
+        // different-paths test below (#554 moved the destination shape).
+        let in_place = data_dir.join("hooks").join(agent_label);
         fs::create_dir_all(&in_place).unwrap();
         // Intentionally no scripts in `in_place`.
 
@@ -6695,13 +6754,124 @@ model = "gpt-5"
         assert!(format!("{err:#}").contains("no hook scripts"));
     }
 
+    /// #554: with `AI_MEMORY_DATA_DIR` set, `install-hooks` probed and staged
+    /// under the *platform default* instead of the data dir in use — so the
+    /// server logged one path while `--apply` reported staging into another,
+    /// silently populating a directory the operator was not using.
+    #[test]
+    fn a_configured_data_dir_is_where_the_bundle_is_probed_and_staged() {
+        let tmp = TempDir::new().unwrap();
+        let data_dir = tmp.path().join("custom-data");
+        let source = tmp.path().join("bundle");
+        fs::create_dir_all(&source).unwrap();
+        fs::write(source.join("session-start.sh"), b"#!/bin/sh\n").unwrap();
+
+        // Staged into the configured dir…
+        let staged = stage_hook_scripts_in(&source, "claude-code", &data_dir).unwrap();
+        assert_eq!(staged, data_dir.join("hooks").join("claude-code"));
+        assert!(staged.join("session-start.sh").is_file());
+        assert!(
+            !tmp.path().join("ai-memory").exists(),
+            "nothing may be written under a platform-default path"
+        );
+
+        // …and the probe looks in the same place, so the two halves agree.
+        let candidates = hook_source_candidates("claude-code", None, None, Some(data_dir.clone()));
+        assert!(
+            candidates.contains(&data_dir.join("hooks").join("claude-code")),
+            "the configured data dir must be probed; got {candidates:?}"
+        );
+    }
+
+    /// The default install must be byte-identical to the old behaviour:
+    /// `default_data_dir()` is `data_local_dir()/ai-memory`, so
+    /// `<data_dir>/hooks/<agent>` is the same path the previous
+    /// `<data_local>/ai-memory/hooks/<agent>` produced.
+    #[test]
+    fn the_default_data_dir_stages_to_the_same_path_as_before() {
+        let tmp = TempDir::new().unwrap();
+        let data_local = tmp.path().join(".local").join("share");
+        let default_data_dir = data_local.join("ai-memory");
+        let source = tmp.path().join("bundle");
+        fs::create_dir_all(&source).unwrap();
+        fs::write(source.join("session-start.sh"), b"#!/bin/sh\n").unwrap();
+
+        let staged = stage_hook_scripts_in(&source, "claude-code", &default_data_dir).unwrap();
+        assert_eq!(
+            staged,
+            data_local
+                .join("ai-memory")
+                .join("hooks")
+                .join("claude-code"),
+            "existing installs must keep staging exactly where they did"
+        );
+    }
+
+    /// #552, the regression guard: `--apply` must persist the bearer under the
+    /// data dir and leave it out of the agent config entirely.
+    ///
+    /// Before this, the token was written into the rendered command — as
+    /// `--auth-token <token>` for native hooks — so it sat in the agent's
+    /// config file *and* in `/proc/<pid>/cmdline` for the lifetime of every
+    /// hook, on every tool call.
+    #[test]
+    fn apply_persists_the_bearer_and_keeps_it_out_of_the_agent_config() {
+        let home = TempDir::new().unwrap();
+        let cfg_dir = TempDir::new().unwrap();
+        let settings = cfg_dir.path().join("settings.json");
+        std::fs::write(&settings, "{}").unwrap();
+
+        let config = crate::config::Config::load(None, Some(home.path().to_path_buf())).unwrap();
+        let args = InstallHooksArgs {
+            agent: AgentChoice::ClaudeCode,
+            apply: true,
+            server_url: Some("http://127.0.0.1:49374".to_string()),
+            auth_token: Some("SEKRIT-BEARER-552".to_string()),
+            config_file: Some(settings.clone()),
+            // Point at the repo's bundle explicitly. Without this the test
+            // leans on hook-dir discovery, which from `target/debug/deps`
+            // walks to `<repo>/target` and then falls through to whatever the
+            // machine happens to have staged — passing for a reason that has
+            // nothing to do with what is under test.
+            hooks_dir: Some(
+                std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../hooks"),
+            ),
+            ..default_hook_args()
+        };
+
+        run(&config, args).expect("apply should succeed");
+
+        let rendered = std::fs::read_to_string(&settings).unwrap();
+        assert!(
+            !rendered.contains("SEKRIT-BEARER-552"),
+            "the bearer must not be written into the agent config: {rendered}"
+        );
+        assert!(
+            !rendered.contains("--auth-token"),
+            "no --auth-token flag may reach a hook command line: {rendered}"
+        );
+
+        assert_eq!(
+            crate::config::read_hook_auth_token(&config.data_dir).as_deref(),
+            Some("SEKRIT-BEARER-552"),
+            "the bearer must be persisted where the hook can read it"
+        );
+        assert!(
+            std::fs::read_to_string(crate::config::hook_auth_header_path_in(&config.data_dir))
+                .unwrap()
+                .contains("SEKRIT-BEARER-552"),
+            "the curl header file must carry it too"
+        );
+    }
+
     #[test]
     fn hook_source_candidates_include_native_package_dir() {
         let candidates = hook_source_candidates(
             "claude-code",
             Some(PathBuf::from("/repo")),
             Some(PathBuf::from("/opt/ai-memory")),
-            Some(PathBuf::from("/home/alice/.local/share")),
+            // The resolved data dir, not the platform data-local root (#554).
+            Some(PathBuf::from("/home/alice/.local/share/ai-memory")),
         );
 
         assert_eq!(candidates[0], PathBuf::from("/repo/hooks/claude-code"));
@@ -7696,7 +7866,6 @@ model = "gpt-5"
 
         let staged_script = staging_tmp
             .path()
-            .join("ai-memory")
             .join("hooks")
             .join("codex")
             .join("session-start.sh");
@@ -8183,7 +8352,6 @@ command = "AI_MEMORY_HOOK_URL=http://old:1 /old/ai-memory/hooks/kimi-code/sessio
 
         let staged_script = staging_tmp
             .path()
-            .join("ai-memory")
             .join("hooks")
             .join("claude-code")
             .join("session-start.sh");

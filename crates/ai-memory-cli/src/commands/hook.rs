@@ -615,7 +615,14 @@ where
     // mode is decided without a round-trip: an explicit `--auth-token` is
     // stored inline; otherwise a present OIDC token marks the event `oidc`
     // (resolved + refreshed at drain time); otherwise anonymous.
-    let oidc_present = args.auth_token.is_none()
+    // #552: the bearer is no longer rendered onto the hook's command line, so
+    // fall back to the copy `install-hooks --apply` persisted under the data
+    // dir. An explicit `--auth-token` still wins, which keeps every config
+    // written before this change working exactly as it did.
+    let persisted_token = crate::config::read_hook_auth_token(&dd);
+    let effective_token = args.auth_token.as_deref().or(persisted_token.as_deref());
+
+    let oidc_present = effective_token.is_none()
         && OidcToken::load(&dd.join("auth.json"))
             .ok()
             .flatten()
@@ -638,12 +645,7 @@ where
         "{base}/hook?event={}&agent={}{}{}&ingest_key={ingest_key}",
         args.event, args.agent, hook_qs, capture_qs
     );
-    let entry = hook_spool::entry_for(
-        event_url,
-        payload.clone(),
-        args.auth_token.as_deref(),
-        oidc_present,
-    );
+    let entry = hook_spool::entry_for(event_url, payload.clone(), effective_token, oidc_present);
     if hook_spool::enqueue(&spool, &entry).is_err() {
         eprintln!(
             "ai-memory hook warning: failed to spool lifecycle event; capture for this event was skipped"
@@ -690,7 +692,7 @@ where
         // handoff on demand via the MCP `memory_handoff_accept` tool.
         if agent_kind.session_start_injects_handoff() {
             let client = build_client();
-            let bearer = hook_spool::resolve_bearer(&client, &dd, args.auth_token.as_deref()).await;
+            let bearer = hook_spool::resolve_bearer(&client, &dd, effective_token).await;
             let native_session_qs = canonical_session_id.as_deref().map_or_else(
                 || session_qs.clone(),
                 |session_id| format!("&session_id={}", url_encode(session_id)),
@@ -728,7 +730,7 @@ where
         && AgentKind::from_wire(&args.agent).user_prompt_injects_handoff()
     {
         let client = build_client();
-        let bearer = hook_spool::resolve_bearer(&client, &dd, args.auth_token.as_deref()).await;
+        let bearer = hook_spool::resolve_bearer(&client, &dd, effective_token).await;
         let native_session_qs = canonical_session_id
             .as_deref()
             .map_or_else(String::new, |session_id| {
@@ -797,11 +799,13 @@ where
     if should_spawn_background_drainer(&args.event)
         && let Err(err) = after_background_drain_event_enqueue(
             &dd,
-            // The hook's own token: current by definition, since the agent
-            // config it came from was rendered by the last `install-hooks`.
-            // The drain uses it only to retry an entry the server has already
-            // rejected with 401 (#542).
-            args.auth_token.as_deref(),
+            // The hook's own token, resolved the same way it authenticates
+            // its own request: `--auth-token`, else the environment, else the
+            // copy `install-hooks --apply` persisted under the data dir
+            // (#552). Current by construction either way. The drain uses it
+            // only to retry an entry the server has already rejected with 401
+            // (#542).
+            effective_token,
             spawn_background_drainer,
         )
     {

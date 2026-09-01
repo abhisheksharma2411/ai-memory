@@ -19,6 +19,7 @@ path (docker + Claude Code). This page covers everything else:
 - [LLM provider tiers + self-hosted Ollama](#llm-provider-tiers)
 - [Common subcommands](#common-subcommands)
 - [Managed routing snippets and Agent Skills](#managed-routing-snippets-and-agent-skills)
+- [Human password bootstrap and recovery](#human-password-bootstrap-and-recovery)
 - [Operating without auth](#operating-without-auth) (local-only)
 - [Keeping ai-memory up to date](#keeping-ai-memory-up-to-date)
 
@@ -1808,6 +1809,7 @@ docker run --rm akitaonrails/ai-memory:latest --help     # full subcommand tree
 | `run [harness] [args...]` | host wrapper or native binary | Opt into one managed cross-harness workstream; omit the harness to resume the newest usable local session, or name Claude Code, Codex, OpenCode, Pi, Crush, Kimi Code, Command Code, Kiro CLI v2/v3, OMP, Grok Build CLI, or Antigravity CLI explicitly; exact `--yolo` and `--fresh` flags are wrapper-owned and other native arguments pass through |
 | `show [--json]` | host wrapper or native binary | Choose a client-local checkout and installed managed harness, or return structured discovery data without launching; remote servers never provide checkout paths |
 | `continue [--workspace NAME]` | host wrapper or native binary | From any directory, revalidate and resume the newest client-local managed checkout; accepts `--yolo` and `--fresh` but no harness-native arguments |
+| `resume [--workspace NAME] [--limit N]` | host wrapper or native binary | Interactively choose a recent managed workstream from valid client-local checkouts; Up/Down selects the workstream and Left/Right cycles `auto` plus installed harnesses before launch; accepts `--yolo` and `--fresh` |
 | `workstreams [--workspace NAME] [--project NAME] [--limit N] [--json]` | host wrapper or native binary | List recent workstreams selectable from the current checkout, including current selection and linked harnesses, without exposing paths or native session ids |
 | `rename-workstream (--from NAME \| --workstream-id ID) --to NAME [--workspace NAME] [--project NAME] [--json]` | host wrapper or native binary | Retitle one workstream selectable from the current checkout; metadata only, so the stable id, the ledger, the listing order, and the current selection are unaffected |
 | `workstream-search [query]` | managed child or thin HTTP client | Search the complete visible managed-workstream ledger; the managed child receives its workstream id automatically |
@@ -1821,6 +1823,9 @@ docker run --rm akitaonrails/ai-memory:latest --help     # full subcommand tree
 | `commit -m "…"` | `docker exec` | Stage + commit the wiki tree |
 | `reset --confirm` | `docker exec` | Wipe data (refuses while siblings alive) |
 | `generate-auth-token` | `docker run --rm` | Print a random hex bearer token |
+| `user add-human` / `list` / `reset-password` / `disable` / `enable` / `patch` | `docker exec` or native binary | Human identities and temporary passwords; never issues an API key |
+| `user add` / `expire` / `revive` / `rotate-token` | `docker exec` or native binary | Deprecated 1.x compatibility-token lifecycle backed by `legacy-user-token` |
+| `api-key add` / `list` / `rotate` / `revoke` | `docker exec` or native binary | Native `aim_` machine credentials |
 | `auth login openai-oauth` | same data volume as the server | Store a ChatGPT/Codex OAuth refresh token for the optional `openai-oauth` LLM provider |
 | `auth login copilot` | same data volume as the server | Store a GitHub token for the optional `copilot` LLM provider |
 | `auth login oidc-device` | same developer data dir as native hooks and thin-client CLI commands | Store a per-developer OIDC device token for native hook authentication and HTTP CLI fallback auth |
@@ -2027,6 +2032,67 @@ either way. To keep durable file logs (and durable hook spooling) inside a
 sandbox, map the data dir read-write, e.g. `ai-jail --rw-map
 ~/.local/share/ai-memory …`.
 
+## Human password bootstrap and recovery
+
+Human console login is username/password, not a Bearer pasted into the
+browser. Machine APIs keep using `Authorization: Bearer` (`AI_MEMORY_AUTH_TOKEN`
+or a native `aim_` key). Before human auth activates, deprecated GET-only
+browser compatibility may exchange the root bearer through HTTP Basic for an
+HttpOnly `ai_memory_auth` cookie; activation disables that path immediately.
+The active classes stay isolated: a password only issues a session; a session
+never authenticates `/mcp`/hooks/workstreams; recovery never issues a session;
+an API key never logs into `/auth/login`.
+
+### First-time root (greenfield)
+
+Set a one-shot password, then start `serve`. The engine creates the configured
+`root_username` (default `root`) with `must_change_password=true` and marks
+bootstrap complete. Later restarts ignore the value even if it stays in the
+environment — unset it so the plaintext is not kept in process env.
+
+```bash
+# At least 12 characters. Must not equal the root bearer, actor-proxy bearer,
+# or recovery token, and must not use an `ams_`/`aim_`/`amk_` prefix.
+export AI_MEMORY_AUTH__INITIAL_ROOT_PASSWORD='choose-a-long-password'
+docker compose up -d   # or: ai-memory serve
+unset AI_MEMORY_AUTH__INITIAL_ROOT_PASSWORD
+```
+
+The first login must change that password (`POST /auth/password` with CSRF).
+If the password collides with an existing native API-credential hash, startup
+fails closed and bootstrap is not marked complete.
+
+### Break-glass recovery
+
+If the last human root is lost, set a high-entropy recovery secret (at least
+32 characters) and `POST /auth/recovery` with a new password. Success returns
+204, expires the legacy `ai_memory_auth` cookie, revokes that user's sessions,
+and does **not** set `ai_memory_session`. Sign in again with the new password.
+
+```bash
+export AI_MEMORY_AUTH__RECOVERY_TOKEN='at-least-32-characters-of-entropy-here'
+# restart serve so the process picks up the new value
+curl -sS -D - -o /dev/null -X POST http://127.0.0.1:49374/auth/recovery \
+  -H 'content-type: application/json' \
+  -d '{"recovery_token":"'"$AI_MEMORY_AUTH__RECOVERY_TOKEN"'","new_password":"brand-new-pass!!","new_password_confirmation":"brand-new-pass!!"}'
+```
+
+Rotate by changing the env var and restarting; the previous token stops
+working immediately. Public failures (wrong token, recovery unset, password
+policy) share one 401 body. The recovery token is not a Bearer, cookie, or
+login password.
+
+When human mode is on (bootstrap completed, any password hash, or
+initial/recovery secrets configured), `serve` refuses to start unless a
+recoverable root exists (`role=root` with a password and not disabled) or
+recovery is configured. Explicit machine-only remote deploys with
+`AI_MEMORY_AUTH_TOKEN` and no human secrets remain valid. Loopback with
+neither Bearer nor human auth stays anonymous.
+
+CIDRs in `AI_MEMORY_AUTH__TRUSTED_PROXY_CIDRS` may supply `X-Forwarded-For`
+for login rate limits; untrusted peers' XFF is ignored. Behind HTTPS, set
+`AI_MEMORY_AUTH__SECURE_COOKIE=true` as noted above.
+
 ## Operating without auth
 
 For local-only / single-machine deploys you can skip the bearer
@@ -2102,7 +2168,7 @@ warns that relabeling system directories such as `/home` can make the host
 inoperable. Docker documents `label=disable` in the
 [`docker run` security options](https://docs.docker.com/reference/cli/docker/container/run/#security-opt).
 
-`ai-memory run`, `ai-memory show`, `ai-memory continue`,
+`ai-memory run`, `ai-memory show`, `ai-memory continue`, `ai-memory resume`,
 `ai-memory workstreams`, and `ai-memory rename-workstream` are the exceptions:
 the current wrapper intercepts them and starts a cached checksum-verified native
 client on the host, where local checkouts, harness executables, and session

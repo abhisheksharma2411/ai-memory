@@ -8,6 +8,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- Added `ai-memory resume`, an interactive picker for recent managed
+  workstreams from the current checkout and validated client-local links. It
+  launches the selected named workstream with the established automatic harness
+  selection while the server continues to receive only repository/worktree
+  fingerprints, extending the checkout-local discovery introduced by
+  `workstreams`. Left/Right cycles `auto` and the supported harnesses found in
+  `PATH`, so the selected workstream can be continued directly in another agent.
+  (#499)
+
 - `ai-memory handoffs --expire-all --confirm` and `POST /admin/handoffs/expire`
   clear a stale open-handoff backlog for one scope. The listing added in
   v1.35.0 made a backlog visible and gave `memory_handoff_cancel` the ids it
@@ -104,6 +113,68 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
   `status` only advises compaction once the backlog is worth the stall (≥20% of
   the file *and* ≥64 MiB); the raw numbers are always reported.
+
+### Changed
+
+- **The `[auto_scope]` default changed from `single` to `per_actor`.** The
+  "currently active project" pointer is now keyed by the caller's identity and
+  session, so two harnesses in one project — or two operators on one server —
+  no longer overwrite each other's notion of the current project. Unscoped MCP
+  calls resolve through that pointer, and so do unscoped **writes**, so under
+  the old default a `memory_write_page` from one session could land in whatever
+  project another session had most recently published.
+
+  **Upgrade impact is narrow, and there is an escape hatch.** A single harness
+  with hooks, a static MCP client sending only a bearer, a client forwarding no
+  identity at all, and an MCP-only install with no lifecycle hooks all resolve
+  to the same project they did before — the last case because nothing is ever
+  keyed there, so the shared slot still applies. The one deliberate change: a
+  client forwarding a session id that matches no published hook activity no
+  longer inherits the shared slot, because that is precisely what routed a
+  request into whichever project published last. It now resolves to the
+  server's configured default.
+
+  Set `mode = "single"` under `[auto_scope]`, or
+  `AI_MEMORY_AUTO_SCOPE__MODE=single`, for the old behaviour exactly. The
+  effective mode is logged at startup. `docs/auto-scope.md` carries a
+  per-setup upgrade table.
+
+- Multi-session and multi-user access to one project is now a documented
+  cross-cutting invariant (`AGENTS.md` #16) with integration-level guards:
+  `crates/ai-memory-store/tests/multi_session.rs` plus pointer tests in
+  `ai-memory-core::active_project`. They pin the properties a team depends on —
+  pages shared while handoffs stay owned, a concurrent write superseding rather
+  than destroying, an identical rewrite staying idempotent, and a second accept
+  being unable to steal a claimed handoff. Unit tests could not cover this:
+  they exercise one session at a time, which is the shape that cannot see a
+  collaboration or concurrency defect.
+
+  `crates/ai-memory-consolidate/tests/multi_machine.rs` additionally pins the
+  same-project-two-machines case: identity derives from the checkout's name,
+  never its absolute path, so a copy at a different path on another machine
+  is the same project and reads what the first wrote.
+
+  Writer capacity is now measured rather than assumed:
+  `crates/ai-memory-store/tests/writer_throughput.rs` reports ~700 writes/second
+  at saturation (~32 concurrent writers, flat to 128), with single-writer
+  latency dominated by `fsync` rather than CPU. A companion test asserts that a
+  burst larger than the 1024-deep queue applies backpressure and loses nothing.
+  `docs/deploy.md` carries the table and the capacity reading.
+
+  `docs/users.md` and `docs/deploy.md` gain the team-facing guidance they were
+  missing entirely, including that two servers must never share one data
+  directory.
+
+- `/admin/*` and `/api/v1/*` accept a human web session or a machine Bearer.
+  Custom SPA HTML at `/web` is public static; the builtin wiki browser stays
+  authenticated. Human auth is additive during 1.x: until a human password or
+  completed bootstrap exists, deprecated GET-only HTTP Basic and
+  `ai_memory_auth` cookie authentication continue to work. The transition to
+  human auth disables both legacy browser credentials immediately. (#533)
+- Preserved `ai-memory user add|expire|revive|rotate-token` and their admin
+  endpoints as deprecated 1.x compatibility paths backed by the reserved
+  `legacy-user-token` API credential. New automation should use
+  `api-key add|rotate|revoke`. (#533)
 
 ### Fixed
 - A failed or skipped embed now leaves a durable record. `page_embeddings`
@@ -216,8 +287,71 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   enable. The workspace-client half of #492 landed in #496; this is the MCP
   transport, which is a second, independent copy of reqwest ([#497]).
 
+- `ai-memory mcp-bridge` no longer risks a panic when building its HTTP
+  transport. #497 moved the bridge onto reqwest's `rustls-no-provider`, which
+  **panics** inside `ClientBuilder` when no rustls crypto provider is
+  installed — not an error a caller can handle, a crash. The install ran in
+  `run` only, leaving `StreamableHttpClientTransport::from_config` reachable
+  without one.
+
+  Moved into `upstream_config`, which every transport in that module is built
+  from. Caught by `stdio_bridge_forwards_tools_and_session_header_in_both_http_modes`
+  failing in isolation on `main`; it had passed in CI because the provider is
+  process-global and another test happened to install it first.
+
+- `install-hooks` now probes for and stages the hook bundle under the data dir
+  actually in use, instead of the platform default (#554). With
+  `AI_MEMORY_DATA_DIR` (or `--data-dir`) set, the process logged one data dir
+  while `--apply` reported staging into another, quietly populating a directory
+  the operator was not using — and the probe could never find a bundle a
+  previous run, or docker `setup-agent`, had staged into the configured one.
+
+  Byte-identical for a default install: `default_data_dir()` *is*
+  `data_local_dir()/ai-memory`, so `<data_dir>/hooks/<agent>` resolves to the
+  same path the old `<data_local>/ai-memory/hooks/<agent>` produced. A test
+  pins that so the compatibility claim cannot rot.
+
+  Reported by @alvadorn alongside #546 and split out at their suggestion.
+
+- The server bearer is no longer written onto hook command lines (#552).
+  `install-hooks --apply` stored it in the agent's config as
+  `--auth-token <token>` for native hooks and as an `AI_MEMORY_AUTH_TOKEN=`
+  shell prefix for the script hooks, so it sat in `/proc/<pid>/cmdline` —
+  readable by any local user — for the lifetime of every hook, and of every
+  `curl` those hooks ran, on every tool call.
+
+  It now lives in two `0600` files inside the `0700` data dir:
+  `auth-token` for the native `ai-memory hook` path, and `auth-header` for the
+  shell hooks, which pass it to `curl -H @<file>`. The second file is the point
+  rather than duplication — building the header inline would put the credential
+  straight back on a command line.
+
+  Backward compatible: an explicit `--auth-token`, or `AI_MEMORY_AUTH_TOKEN` in
+  the environment, still wins, so configs written before this keep working.
+  Re-run `install-hooks --apply` to move an existing install onto the stored
+  form. Only `--apply` persists; printing a snippet writes no credential.
+
+- Atomic wiki writes now absorb transient Windows sharing violations (#567).
+  On Windows the tmp-then-rename persist can fail with
+  `ERROR_SHARING_VIOLATION` when an antivirus or indexer briefly holds the
+  just-created tempfile — endemic on CI runners, and the cause of a
+  `per_session_isolates_concurrent_writes` failure on the nightly Windows run.
+  Both persist sites retry up to five times with linear backoff (at most
+  150 ms) before propagating; `ACCESS_DENIED` and every other error still
+  propagate immediately, and nothing is classified transient off Windows, so
+  Unix behaviour is byte-for-byte unchanged. The retry mechanics are tested on
+  every platform by injecting the failure rather than hoping to reproduce a
+  scanner's timing.
+
 ### Docs
 
+- Reworked the README around the September 2026 research pass: a humanized
+  "Why ai-memory" differentiator section and "How it works" flow up top, a
+  compact support matrix, and a shorter quick start. Detail sections moved
+  verbatim into linked docs: `docs/support-matrix.md` (full per-agent matrix),
+  `docs/use-cases.md`, `docs/llm-providers.md`, and `docs/security.md`.
+  Added `docs/research-2026-landscape.md` and follow-up pointers in the four
+  May 2026 research documents.
 - `docs/windows.md` gains **Scenario E**, a persistent-server story for native
   Windows. Scenarios C and D both ended at `ai-memory serve` in a foreground
   terminal, while Linux got `Restart=on-failure` from the packaged systemd
@@ -262,6 +396,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   project, or worktree reads as absent rather than renamable. The Docker
   wrapper routes the command through its native host client, since repository
   identity is a host resource.
+- Human password login, web sessions, and native `aim_` API credentials, so the
+  console can use short-lived human sessions instead of a Bearer pasted into
+  the browser. `POST /auth/login` issues an `HttpOnly` `ai_memory_session`
+  cookie plus CSRF; `/mcp`, hooks, and workstreams stay Bearer-only. Greenfield
+  bootstrap consumes `AI_MEMORY_AUTH__INITIAL_ROOT_PASSWORD` once; break-glass
+  recovery uses `AI_MEMORY_AUTH__RECOVERY_TOKEN` and never opens a session.
+  `ai-memory user add-human|list|reset-password|disable|enable|patch` manages
+  people, while `ai-memory api-key add|list|rotate|revoke` manages machine
+  secrets. Existing 32-byte `users.token_hash` values copy losslessly into
+  `api_credentials`. The mirror triggers remain load-bearing for the deprecated
+  1.x `user add|expire|revive|rotate-token` shims and may be removed only when
+  those shims are removed in 2.0. (#533)
 - `llm_reasoning_effort` / `AI_MEMORY_LLM_REASONING_EFFORT` is a typed
   enum (`none`, `minimal`, `low`, `medium`, `high`, `xhigh`, `max`,
   `ultra`, `persistent`); unknown values fail at config load. Unset keeps

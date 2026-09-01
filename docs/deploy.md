@@ -105,7 +105,7 @@ CLI sends an `Authorization: Bearer <token>` header on every call; ai-memory's
 middleware validates with a constant-time comparison.
 
 **Encrypted transport.** Plain HTTP on the LAN means anyone with a
-packet capture can read the bearer token (and per-user tokens once
+packet capture can read the bearer token (and native `aim_` keys once
 multi-user mode is on) in transit. Add a TLS-terminating reverse
 proxy in front of ai-memory — Caddy with Let's Encrypt, Caddy with
 its internal CA, Cloudflare Tunnel, nginx, or external cert files —
@@ -209,6 +209,72 @@ scp "$SERVER:$DEPLOY_DIR/data/snapshot-$(date +%F).tar.gz" ./backups/
 
 The `ai-memory backup` command uses SQLite's online backup API so
 writes during the snapshot are coherent.
+
+## Sharing one server between people or harnesses
+
+A deployed server is the supported way to share a project — between teammates,
+or between several harnesses you run yourself. Two things are worth knowing
+before you hand out the URL.
+
+**One server per data directory.** Point two `ai-memory serve` processes at the
+same `data/` (a synced folder, an NFS mount, two containers on one volume) and
+they will each run their own writer and their own git handle on the wiki. SQLite
+survives it; the wiki and the in-process state do not. Run one server and let
+everyone connect to it — which is also what makes the shared-knowledge model
+work.
+
+**Check the isolation mode.** Unscoped MCP calls resolve "current project"
+through a pointer that, since v1.39, is keyed per caller. The startup line says
+which mode is live:
+
+```
+active-project isolation mode mode=PerActor …
+```
+
+`PerActor` is the default and the one you want on a shared server. `Single` is
+a single process-wide slot — fine for one harness, but concurrent sessions then
+share it, and unscoped **writes** resolve through it too. See
+[auto-scope.md](auto-scope.md) and [users.md](users.md#running-for-a-team).
+
+### How much load one server absorbs
+
+Every write goes through a single writer actor — the right design for SQLite,
+and the obvious question it raises is when that becomes the ceiling. Measured
+rather than estimated, with
+`cargo test -p ai-memory-store --test writer_throughput -- --ignored --nocapture`:
+
+| concurrent writers | throughput | mean latency |
+|---|---|---|
+| 1 | 42/s | 23.9 ms |
+| 8 | 295/s | 3.4 ms |
+| 32 | 698/s | 1.43 ms |
+| 128 | 700/s | 1.43 ms |
+
+Read it in two parts.
+
+**The ceiling is ~700 writes/second**, reached around 32 concurrent writers and
+flat from there — 128 writers produce the same throughput at the same latency.
+Past saturation the server applies backpressure instead of degrading: the queue
+is bounded at 1024 with an awaiting send, so a burst larger than the queue slows
+its producers down and still lands every write. Nothing is dropped, and nothing
+grows without limit.
+
+**Single-writer latency is dominated by `fsync`, not CPU.** One observation per
+commit costs about one disk sync; concurrency lets SQLite coalesce WAL commits,
+which is why throughput rises 17× while per-write latency *falls*.
+
+For capacity planning: an actively working agent emits on the order of one
+lifecycle write per tool call. Even at a pessimistic one tool call per second
+per agent, ~700/s is several hundred concurrently active agents — far beyond a
+team, and beyond most shared installs. The writer is not the thing that will
+break first.
+
+Two caveats before you lean on the numbers. They were taken on a fast local
+disk; because the cost is `fsync`, a network filesystem or a slow volume will
+be materially lower, which is another reason to keep the data dir on local
+storage. And they measure the store, not the HTTP front door — an install that
+saturates this is far more likely to be limited by the agent side than by
+SQLite.
 
 ## Reclaiming disk space
 
