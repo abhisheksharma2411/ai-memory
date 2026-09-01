@@ -159,6 +159,14 @@ impl LocalEmbedder {
         .map_err(|e| LlmError::UnexpectedShape(format!("parsing model config: {e}")))?;
         let mut tokenizer = Tokenizer::from_file(dir.join("tokenizer.json"))
             .map_err(|e| LlmError::UnexpectedShape(format!("loading tokenizer: {e}")))?;
+        // The shipped tokenizer.json enables fixed-length padding (128).
+        // Left on, a single unbatched input carries a tail of [PAD]
+        // tokens — and feeding those through with an all-ones attention
+        // mask makes the model attend to padding, which flattens every
+        // similarity toward ~0.8 (caught by the reference-comparison
+        // test below). No batching here, so: no padding, and the real
+        // attention mask is passed to the forward pass regardless.
+        tokenizer.with_padding(None);
         tokenizer
             .with_truncation(Some(tokenizers::TruncationParams {
                 max_length: MAX_TOKENS,
@@ -191,23 +199,36 @@ impl LocalEmbedder {
         if ids.is_empty() {
             return Err(LlmError::UnexpectedShape("empty tokenization".into()));
         }
+        let mask_vals = encoding.get_attention_mask();
         let input_ids = Tensor::new(ids, &inner.device)
             .and_then(|t| t.unsqueeze(0))
             .map_err(|e| LlmError::UnexpectedShape(e.to_string()))?;
         let token_type_ids = input_ids
             .zeros_like()
             .map_err(|e| LlmError::UnexpectedShape(e.to_string()))?;
+        let attention_mask = Tensor::new(mask_vals, &inner.device)
+            .and_then(|t| t.unsqueeze(0))
+            .map_err(|e| LlmError::UnexpectedShape(e.to_string()))?;
         let hidden = inner
             .model
-            .forward(&input_ids, &token_type_ids, None)
+            .forward(&input_ids, &token_type_ids, Some(&attention_mask))
             .map_err(|e| LlmError::UnexpectedShape(format!("forward pass: {e}")))?;
-        // Mean pooling over the token axis (no padding in a single
-        // unbatched input, so a plain mean is the masked mean), then L2
+        // Masked mean pooling over the token axis (identical to a plain
+        // mean when nothing is padded, correct either way), then L2
         // normalise — the sentence-transformers contract, and the unit
         // vector the Embedder trait promises.
-        let pooled = hidden
-            .mean(1)
+        let mask_f = attention_mask
+            .to_dtype(hidden.dtype())
+            .and_then(|m| m.unsqueeze(2))
+            .map_err(|e| LlmError::UnexpectedShape(e.to_string()))?;
+        let masked = hidden
+            .broadcast_mul(&mask_f)
+            .map_err(|e| LlmError::UnexpectedShape(e.to_string()))?;
+        let token_count = mask_vals.iter().map(|&m| m as f32).sum::<f32>().max(1.0);
+        let pooled = masked
+            .sum(1)
             .and_then(|t| t.squeeze(0))
+            .and_then(|t| t / token_count as f64)
             .map_err(|e| LlmError::UnexpectedShape(e.to_string()))?;
         let vec: Vec<f32> = pooled
             .to_vec1()
@@ -287,6 +308,28 @@ mod tests {
         };
         assert!(err.contains("model.safetensors"), "{err}");
         assert!(err.contains("manually"), "{err}");
+    }
+
+    /// Calibration guard: absolute similarity ranges for a known pair.
+    /// The padding bug this catches (fixed-length padding in the shipped
+    /// tokenizer.json + an all-ones attention mask) flattened every
+    /// similarity toward ~0.85; correct masked-mean pooling puts this
+    /// pair near 0.28. A pipeline change that shifts calibration out of
+    /// range is a retrieval-quality regression even if orderings hold.
+    #[tokio::test]
+    #[ignore = "needs the fetched all-MiniLM-L6-v2 model files"]
+    async fn similarity_calibration_matches_the_reference_range() {
+        let root = std::env::var("AI_MEMORY_TEST_MODELS_DIR")
+            .expect("set AI_MEMORY_TEST_MODELS_DIR to a dir containing all-MiniLM-L6-v2");
+        let embedder = LocalEmbedder::load(Path::new(&root)).unwrap();
+        let cat = embedder.embed("The cat sits outside").await.unwrap();
+        let dog = embedder.embed("The dog plays in the garden").await.unwrap();
+        let dot: f32 = cat.iter().zip(&dog).map(|(x, y)| x * y).sum();
+        assert!(
+            (0.15..=0.45).contains(&dot),
+            "cat/dog similarity {dot:.3} outside the calibrated range \
+             (0.15..0.45); pooling or masking has drifted"
+        );
     }
 
     /// Full inference against the real fetched model: `#[ignore]`d like
