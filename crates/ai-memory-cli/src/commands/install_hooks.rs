@@ -34,6 +34,7 @@ use crate::commands::render_shared::{
     hook_script_for_claude_code, hook_script_for_current_platform, kimi_code_hook_commands,
     local_hook_policy_v1_supported, ts_capture_policy_v1, ts_string_literal,
 };
+use crate::commands::uninstall::hook_command_is_ours;
 use crate::config::{Config, DEFAULT_SERVER_URL};
 
 const CLAUDE_PROMPT_EVENT: &str = "UserPromptSubmit";
@@ -1314,10 +1315,7 @@ fn is_ai_memory_hook_entry(entry: &serde_json::Value) -> bool {
         let lower = command.to_ascii_lowercase();
         let args = value.get("args").and_then(|a| a.as_array());
         let Some(args) = args else {
-            // Legacy shell/string form: broad matching is intentional because
-            // old installs may identify us by the binary/script path or by the
-            // inlined AI_MEMORY_* env vars.
-            return lower.contains("ai-memory") || lower.contains("ai_memory");
+            return hook_command_is_ours(command);
         };
         let tokens: Vec<&str> = args.iter().filter_map(|v| v.as_str()).collect();
         // Exec form: require both an ai-memory-ish executable and our hook argv
@@ -2327,17 +2325,14 @@ fn upsert_kimi_code_hooks(
     Ok(())
 }
 
-/// True if a `[[hooks]]` table belongs to ai-memory — i.e. its command
-/// references our staged script path or the inlined `AI_MEMORY_*` env
-/// vars. Broad matching is intentional (mirrors the shell-form branch
-/// of `is_ai_memory_hook_entry`): old installs may identify us by the
-/// script path or by the env prefix alone.
+/// True if a `[[hooks]]` table belongs to ai-memory. Keep the ownership
+/// signature shared with JSON hook overlays and uninstall so string commands
+/// from other tools are not removed during re-apply.
 fn is_ai_memory_toml_hook_entry(entry: &toml_edit::Table) -> bool {
     let Some(command) = entry.get("command").and_then(|c| c.as_str()) else {
         return false;
     };
-    let lower = command.to_ascii_lowercase();
-    lower.contains("ai-memory") || lower.contains("ai_memory")
+    hook_command_is_ours(command)
 }
 
 /// Merge ai-memory's camelCase hook entries into every existing Kiro CLI
@@ -5117,8 +5112,8 @@ mod tests {
     fn baked_prompt_capture_reads_only_owned_claude_hooks() {
         let enabled = serde_json::json!({
             "hooks": {
-                "SessionStart": [{ "hooks": [{ "command": "ai-memory hook --event session-start" }] }],
-                "UserPromptSubmit": [{ "hooks": [{ "command": "ai-memory hook --event user-prompt" }] }]
+                "SessionStart": [{ "hooks": [{ "command": "ai-memory hook --event session-start --agent claude-code --server-url http://h" }] }],
+                "UserPromptSubmit": [{ "hooks": [{ "command": "ai-memory hook --event user-prompt --agent claude-code --server-url http://h" }] }]
             }
         });
         assert_eq!(
@@ -5128,7 +5123,7 @@ mod tests {
 
         let disabled = serde_json::json!({
             "hooks": {
-                "SessionStart": [{ "hooks": [{ "command": "ai-memory hook --event session-start" }] }],
+                "SessionStart": [{ "hooks": [{ "command": "ai-memory hook --event session-start --agent claude-code --server-url http://h" }] }],
                 "UserPromptSubmit": [{ "hooks": [{ "command": "third-party prompt guard" }] }]
             }
         });
@@ -5185,11 +5180,11 @@ mod tests {
             "SessionStart".into(),
             serde_json::json!([
                 { "hooks": [ { "type": "command", "command": "node context-mode-cache-heal.mjs" } ] },
-                { "matcher": "", "hooks": [ { "type": "command", "command": "/old/ai-memory.exe hook --event session-start" } ] }
+                { "matcher": "", "hooks": [ { "type": "command", "command": "/old/ai-memory.exe hook --event session-start --agent claude-code --server-url http://old" } ] }
             ]),
         );
         let ours = serde_json::json!([
-            { "matcher": "", "hooks": [ { "type": "command", "command": "/new/.cargo/bin/ai-memory.exe hook --event session-start" } ] }
+            { "matcher": "", "hooks": [ { "type": "command", "command": "/new/.cargo/bin/ai-memory.exe hook --event session-start --agent claude-code --server-url http://new" } ] }
         ]);
         overlay_event_hooks(&mut hooks, "SessionStart", &ours);
 
@@ -5303,7 +5298,7 @@ mod tests {
     fn overlay_event_hooks_inserts_when_event_absent() {
         let mut hooks = serde_json::Map::new();
         let ours = serde_json::json!([
-            { "matcher": "", "hooks": [ { "type": "command", "command": "ai-memory.exe hook --event stop" } ] }
+            { "matcher": "", "hooks": [ { "type": "command", "command": "ai-memory.exe hook --event stop --agent claude-code --server-url http://h" } ] }
         ]);
         overlay_event_hooks(&mut hooks, "Stop", &ours);
         assert_eq!(hooks["Stop"].as_array().unwrap().len(), 1);
@@ -5314,7 +5309,7 @@ mod tests {
         // Re-applying must not accumulate duplicate ai-memory entries.
         let mut hooks = serde_json::Map::new();
         let ours = serde_json::json!([
-            { "matcher": "", "hooks": [ { "type": "command", "command": "ai-memory.exe hook --event pre-tool-use" } ] }
+            { "matcher": "", "hooks": [ { "type": "command", "command": "ai-memory.exe hook --event pre-tool-use --agent claude-code --server-url http://h" } ] }
         ]);
         overlay_event_hooks(&mut hooks, "PreToolUse", &ours);
         overlay_event_hooks(&mut hooks, "PreToolUse", &ours);
@@ -5329,7 +5324,7 @@ mod tests {
     fn is_ai_memory_hook_entry_detects_nested_flat_and_skips_third_party() {
         // Nested (Claude Code / Codex / Gemini)
         assert!(is_ai_memory_hook_entry(&serde_json::json!(
-            { "matcher": "", "hooks": [ { "type": "command", "command": "ai-memory.exe hook" } ] }
+            { "matcher": "", "hooks": [ { "type": "command", "command": "ai-memory.exe hook --event session-start --agent claude-code --server-url http://h" } ] }
         )));
         // Flat (Cursor) + shell form
         assert!(is_ai_memory_hook_entry(&serde_json::json!(
@@ -5349,6 +5344,55 @@ mod tests {
         assert!(!is_ai_memory_hook_entry(&serde_json::json!(
             { "hooks": [ { "type": "command", "command": "C:\\bin\\ai-memory-helper.exe", "args": ["--check", "project"] } ] }
         )));
+        // A third-party string command may use the same executable name, but
+        // without either ai-memory hook signature it must not be replaced.
+        assert!(!is_ai_memory_hook_entry(&serde_json::json!(
+            { "hooks": [ { "type": "command", "command": "/opt/alphaone/bin/ai-memory boot --quiet --limit 10 --budget-tokens 4096" } ] }
+        )));
+        // Legacy script commands can use any path, so the exact env marker is
+        // the ownership signal rather than the script basename.
+        assert!(is_ai_memory_hook_entry(&serde_json::json!(
+            { "hooks": [ { "type": "command", "command": "AI_MEMORY_HOOK_URL=http://h /custom/session-start.sh" } ] }
+        )));
+    }
+
+    #[test]
+    fn overlay_event_hooks_preserves_third_party_string_command_and_replaces_legacy() {
+        let third_party =
+            "/opt/alphaone/bin/ai-memory boot --quiet --limit 10 --budget-tokens 4096";
+        let legacy = "AI_MEMORY_HOOK_URL=http://old /custom/session-start.sh";
+        let mut hooks = serde_json::Map::new();
+        hooks.insert(
+            "SessionStart".into(),
+            serde_json::json!([
+                { "matcher": "", "hooks": [ { "type": "command", "command": third_party } ] },
+                { "matcher": "", "hooks": [ { "type": "command", "command": legacy } ] }
+            ]),
+        );
+        let ours = serde_json::json!([
+            { "matcher": "", "hooks": [ { "type": "command", "command": "AI_MEMORY_HOOK_URL=http://new /fresh/session-start.sh" } ] }
+        ]);
+
+        overlay_event_hooks(&mut hooks, "SessionStart", &ours);
+
+        let commands: Vec<&str> = hooks["SessionStart"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|entry| {
+                entry
+                    .pointer("/hooks/0/command")
+                    .and_then(serde_json::Value::as_str)
+            })
+            .collect();
+        assert_eq!(
+            commands,
+            [
+                third_party,
+                "AI_MEMORY_HOOK_URL=http://new /fresh/session-start.sh"
+            ]
+        );
+        assert!(!commands.contains(&legacy), "legacy entry must be replaced");
     }
 
     fn stub_scripts(dir: &Path, names: &[&str]) {
@@ -8156,6 +8200,10 @@ command = "echo third-party"
 
 [[hooks]]
 event = "SessionStart"
+command = "/opt/alphaone/bin/ai-memory boot --quiet --limit 10 --budget-tokens 4096"
+
+[[hooks]]
+event = "SessionStart"
 command = "AI_MEMORY_HOOK_URL=http://old:1 /old/ai-memory/hooks/kimi-code/session-start.sh"
 "#,
         )
@@ -8197,15 +8245,12 @@ command = "AI_MEMORY_HOOK_URL=http://old:1 /old/ai-memory/hooks/kimi-code/sessio
         );
 
         let entries = kimi_code_hooks_in(&config_path);
-        // Third-party entry + our 9: the stale ai-memory entry must be
+        // Two third-party entries + our 9: the stale ai-memory entry must be
         // replaced, not duplicated.
-        assert_eq!(entries.len(), 1 + KIMI_CODE_EVENTS.len());
+        assert_eq!(entries.len(), 2 + KIMI_CODE_EVENTS.len());
         let ours: Vec<&(String, String)> = entries
             .iter()
-            .filter(|(_, command)| {
-                let lower = command.to_ascii_lowercase();
-                lower.contains("ai-memory") || lower.contains("ai_memory")
-            })
+            .filter(|(_, command)| hook_command_is_ours(command))
             .collect();
         assert_eq!(ours.len(), KIMI_CODE_EVENTS.len(), "no duplicated entries");
         assert!(
@@ -8213,6 +8258,13 @@ command = "AI_MEMORY_HOOK_URL=http://old:1 /old/ai-memory/hooks/kimi-code/sessio
                 .iter()
                 .any(|(_, command)| command == "echo third-party"),
             "third-party hook survives: {entries:?}"
+        );
+        assert!(
+            entries.iter().any(|(_, command)| {
+                command
+                    == "/opt/alphaone/bin/ai-memory boot --quiet --limit 10 --budget-tokens 4096"
+            }),
+            "third-party string hook survives: {entries:?}"
         );
         assert!(
             !entries.iter().any(|(_, command)| command.contains("/old/")),
@@ -8399,7 +8451,7 @@ command = "AI_MEMORY_HOOK_URL=http://old:1 /old/ai-memory/hooks/kimi-code/sessio
                 "hooks": {
                     "UserPromptSubmit": [
                         { "hooks": [{ "command": "third-party prompt guard" }] },
-                        { "hooks": [{ "command": "/old/ai-memory hook --event user-prompt" }] }
+                        { "hooks": [{ "command": "/old/ai-memory hook --event user-prompt --agent claude-code --server-url http://old" }] }
                     ]
                 }
             })
@@ -8825,9 +8877,11 @@ command = "AI_MEMORY_HOOK_URL=http://old:1 /old/ai-memory/hooks/kimi-code/sessio
         let tmp = TempDir::new().unwrap();
         let repo_root = tmp.path().join("a.json");
         let basename = tmp.path().join("b.json");
+        // Script-form hooks always include the URL marker; the project strategy
+        // is an additional setting, not the ownership signature.
         fs::write(
             &repo_root,
-            r#"{"name":"a","hooks":{"agentSpawn":[{"command":"AI_MEMORY_PROJECT_STRATEGY=repo-root /old/hooks/kiro-cli/session-start.sh"}]}}"#,
+            r#"{"name":"a","hooks":{"agentSpawn":[{"command":"AI_MEMORY_HOOK_URL=http://old:1 AI_MEMORY_PROJECT_STRATEGY=repo-root /old/hooks/kiro-cli/session-start.sh"}]}}"#,
         )
         .unwrap();
         fs::write(&basename, r#"{"name":"b"}"#).unwrap();

@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+- Preserved third-party string-form lifecycle hooks whose commands merely
+  contain `ai-memory` or `ai_memory` when `install-hooks --apply` refreshes
+  ai-memory's own entries. Legacy ai-memory script and native hook commands
+  remain recognized by their specific hook signatures.
+
 ## [1.39.0] - 2026-09-01
 
 ### Added
