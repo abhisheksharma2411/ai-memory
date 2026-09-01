@@ -7,6 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- `llm_reasoning_effort` / `AI_MEMORY_LLM_REASONING_EFFORT` is a typed
+  enum (`none`, `minimal`, `low`, `medium`, `high`, `xhigh`, `max`,
+  `ultra`, `persistent`); unknown values fail at config load. Unset keeps
+  the model default. Each chat provider maps the value to its native
+  field: OpenAI `reasoning_effort`, OpenRouter `reasoning.effort`,
+  xAI Grok `reasoning_effort`, Anthropic `output_config.effort` (plus
+  adaptive/disabled thinking on models that accept it), and Codex
+  Responses `reasoning.effort`. Gemini and Copilot ignore the key.
+  Host-unsupported values are clamped (`ultra`/`persistent` → `max` on
+  OpenAI/OpenRouter/Codex; Anthropic `xhigh`/`max` per model; `none`
+  does not send `thinking: disabled` on always-on Claude models).
+
 ## [1.39.0] - 2026-09-01
 
 ### Added
@@ -410,17 +423,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `api_credentials`. The mirror triggers remain load-bearing for the deprecated
   1.x `user add|expire|revive|rotate-token` shims and may be removed only when
   those shims are removed in 2.0. (#533)
-- `llm_reasoning_effort` / `AI_MEMORY_LLM_REASONING_EFFORT` is a typed
-  enum (`none`, `minimal`, `low`, `medium`, `high`, `xhigh`, `max`,
-  `ultra`, `persistent`); unknown values fail at config load. Unset keeps
-  the model default. Each chat provider maps the value to its native
-  field: OpenAI `reasoning_effort`, OpenRouter `reasoning.effort`,
-  xAI Grok `reasoning_effort`, Anthropic `output_config.effort` (plus
-  adaptive/disabled thinking on models that accept it), and Codex
-  Responses `reasoning.effort`. Gemini and Copilot ignore the key.
-  Host-unsupported values are clamped (`ultra`/`persistent` → `max` on
-  OpenAI/OpenRouter/Codex; Anthropic `xhigh`/`max` per model; `none`
-  does not send `thinking: disabled` on always-on Claude models).
 
 ## [1.38.0] - 2026-08-30
 
