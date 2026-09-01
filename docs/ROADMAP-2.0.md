@@ -134,7 +134,7 @@ worth having. Builds on item 3's schema work.
 - Migration: additive columns; backfill `valid_from` from the page
   version's `created_at` - a one-shot data migration inside refinery.
 
-## Item 5 - Local embeddings (ONNX, all-MiniLM class)
+## Item 5 - Local embeddings (all-MiniLM class; shipped via candle, not ONNX)
 
 *Why:* zero-config hybrid retrieval with no provider; `models/` has been
 reserved for this since M9.5. Competitors ship it by default.
@@ -151,7 +151,10 @@ reserved for this since M9.5. Competitors ship it by default.
   configured provider either way.
 - Watch: `ort`/onnxruntime licensing + build weight on all release
   targets (incl. Windows); a `local-embeddings` cargo feature if the
-  dependency is heavy.
+  dependency is heavy. **As built: this watch item decided the
+  implementation — candle (pure Rust) instead of ort, no native
+  runtime, feature `local-embeddings` (default on). Same model, same
+  use case; see `docs/local-embeddings.md`.**
 
 ## Item 6 - Cross-session abstraction ("Experience" stage)
 

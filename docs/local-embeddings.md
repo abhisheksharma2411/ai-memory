@@ -11,6 +11,47 @@ comparable memory servers ship by default.
 embedding_provider = "local"     # model/dim default correctly
 ```
 
+## Why: semantic recall without data egress
+
+Search is hybrid: FTS5 (lexical), entities, graph, and — when an
+embedder is configured — vectors. The vector stream is what lets
+*"how do we deploy"* find the page that says *"release procedure"*:
+paraphrase recall, no shared keywords required. Before this provider,
+enabling it cost one of two things:
+
+- **an API key** (OpenAI / Voyage / Google): per-call spend, and every
+  page body and every search query leaves your machine. For a system
+  whose job is recording everything you do, that is not a small ask;
+- **a self-hosted engine** (Ollama / LM Studio via `openai-compat`):
+  keyless, but another server to run, warm, and keep on the same
+  network as ai-memory.
+
+`local` removes both. Use it when any of these describe you:
+
+- you run the zero-LLM path and want better recall without handing a
+  provider your memory;
+- the install is offline or air-gapped (drop the model files in
+  manually — see below);
+- a homelab/team server where "one binary, one volume" is the whole
+  operational story and adding an Ollama sidecar just for embeddings
+  is not worth it;
+- you want reproducible retrieval: same model files (checksum-pinned),
+  same vectors, forever — no provider-side model deprecations.
+
+Stick with a hosted or self-hosted provider when you already run one
+happily, want a larger/multilingual model, or want embedding compute
+off the memory server's CPU.
+
+### Why not ONNX?
+
+ONNX is a model format plus a native runtime (`onnxruntime`) — one
+*mechanism* for local inference, and the one the comparable servers
+use. We ship the same model through **candle** (pure Rust) instead:
+identical capability, but no native C++ library to build, license, and
+debug across every release target (Windows, macOS, the sandboxed nix
+build). If a future model genuinely requires an ONNX-only runtime, the
+`Embedder` trait is where it would slot in.
+
 ## The model files
 
 The binary does not bundle the model (~87 MB). On the first start with
