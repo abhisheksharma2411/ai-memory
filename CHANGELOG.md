@@ -7,6 +7,52 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+- `install-hooks` now writes the capture-mode opt-in atomically. It was
+  written in place, and every reader maps an unrecognised value onto
+  `denylist` — the less private mode — so a crash, a full disk or a killed
+  `ai-memory upgrade` mid-write left a truncated file that silently reverted
+  an `--capture-mode allowlist` opt-in to capture-by-default, which is exactly
+  what `persist_capture_mode` documents it must never do. The fallback itself
+  is correct and stays; the torn write that triggered it is gone. Now routed
+  through the same `write_atomic` (tmp + fsync + rename) the rest of the CLI
+  already uses, per the project's atomic-writes invariant.
+- `status` no longer overstates missing embeddings: empty-body pages —
+  which no embedder can ever cover and the backfill skips by rule — are
+  excluded from the "latest pages missing" figure and reported on their
+  own line (observed live as a permanently stuck 427).
+- Natural-language searches no longer surface stopword trash: bare
+  queries drop English stopwords before the FTS5 OR-join, so a page
+  containing five "the"s cannot outrank the page whose content matches,
+  and pages matching only stopwords no longer appear at all. Quoted
+  phrases and explicit-operator queries are untouched, and an
+  all-stopword query still searches its literal terms. Guarded by a
+  CI-runnable search-quality suite asserting ranking usefulness, not
+  just machinery.
+- `memory_query` no longer fails with `fts5: syntax error` when the query is
+  natural language containing parentheses, apostrophe-quoted phrases, or a
+  stray `OR`/`AND` (e.g. *"my visit to the Museum of Modern Art (MoMA) and
+  the 'Ancient Civilizations' exhibit"*). Prepared FTS5 queries are now
+  validated against the engine's own parser and degrade to an always-valid
+  quoted bag of words when the preserved operator form does not parse;
+  deliberate well-formed operator queries are preserved as before. Found by
+  the new LongMemEval retrieval harness on its first full run.
+
+- `ai-memory serve` now takes an exclusive lock on `<data-dir>/.serve.lock`
+  before opening the store, so a second server pointed at the same data
+  directory refuses at startup and names the holding process instead of
+  silently contending the single-writer actor, the wiki git handle, and the
+  active-project pointer. The OS releases the lock when the process exits,
+  so a crashed server never leaves the operator locked out; `--force` starts
+  unguarded for an operator who knows the previous server is gone, and a
+  filesystem that cannot lock at all downgrades the guard to a warning
+  instead of refusing to start. (#563)
+
+- Preserved third-party string-form lifecycle hooks whose commands merely
+  contain `ai-memory` or `ai_memory` when `install-hooks --apply` refreshes
+  ai-memory's own entries. Legacy ai-memory script and native hook commands
+  remain recognized by their specific hook signatures.
+||||||| a613bf6d
 ### Added
 - `status` tells more of the truth (2.0 status audit): the wiki-format
   line (OKF migration state and the pre-migration backup archive while
@@ -97,47 +143,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   is deleted. A data dir migrated by a newer binary is refused by older
   2.0+ binaries instead of silently mixing formats. See
   `docs/okf.md` and `docs/MIGRATION-2.0.md`.
-
-### Fixed
-- `install-hooks` now writes the capture-mode opt-in atomically. It was
-  written in place, and every reader maps an unrecognised value onto
-  `denylist` — the less private mode — so a crash, a full disk or a killed
-  `ai-memory upgrade` mid-write left a truncated file that silently reverted
-  an `--capture-mode allowlist` opt-in to capture-by-default, which is exactly
-  what `persist_capture_mode` documents it must never do. The fallback itself
-  is correct and stays; the torn write that triggered it is gone. Now routed
-  through the same `write_atomic` (tmp + fsync + rename) the rest of the CLI
-  already uses, per the project's atomic-writes invariant.
-- `status` no longer overstates missing embeddings: empty-body pages —
-  which no embedder can ever cover and the backfill skips by rule — are
-  excluded from the "latest pages missing" figure and reported on their
-  own line (observed live as a permanently stuck 427).
-- Natural-language searches no longer surface stopword trash: bare
-  queries drop English stopwords before the FTS5 OR-join, so a page
-  containing five "the"s cannot outrank the page whose content matches,
-  and pages matching only stopwords no longer appear at all. Quoted
-  phrases and explicit-operator queries are untouched, and an
-  all-stopword query still searches its literal terms. Guarded by a
-  CI-runnable search-quality suite asserting ranking usefulness, not
-  just machinery.
-- `memory_query` no longer fails with `fts5: syntax error` when the query is
-  natural language containing parentheses, apostrophe-quoted phrases, or a
-  stray `OR`/`AND` (e.g. *"my visit to the Museum of Modern Art (MoMA) and
-  the 'Ancient Civilizations' exhibit"*). Prepared FTS5 queries are now
-  validated against the engine's own parser and degrade to an always-valid
-  quoted bag of words when the preserved operator form does not parse;
-  deliberate well-formed operator queries are preserved as before. Found by
-  the new LongMemEval retrieval harness on its first full run.
-
-- `ai-memory serve` now takes an exclusive lock on `<data-dir>/.serve.lock`
-  before opening the store, so a second server pointed at the same data
-  directory refuses at startup and names the holding process instead of
-  silently contending the single-writer actor, the wiki git handle, and the
-  active-project pointer. The OS releases the lock when the process exits,
-  so a crashed server never leaves the operator locked out; `--force` starts
-  unguarded for an operator who knows the previous server is gone, and a
-  filesystem that cannot lock at all downgrades the guard to a warning
-  instead of refusing to start. (#563)
 
 ## [1.39.0] - 2026-09-01
 
