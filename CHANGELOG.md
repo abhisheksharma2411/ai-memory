@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [2.0.0] - 2026-09-02
+
 ### Added
 - Added a per-user launchd agent for macOS at
   `packaging/launchd/com.github.akitaonrails.ai-memory.plist`, the counterpart
@@ -4708,7 +4710,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Consolidator used server startup default project instead of the
   session's actual project.
 
-[Unreleased]: https://github.com/akitaonrails/ai-memory/compare/v1.39.0...HEAD
+[Unreleased]: https://github.com/akitaonrails/ai-memory/compare/v2.0.0...HEAD
+[2.0.0]: https://github.com/akitaonrails/ai-memory/releases/tag/v2.0.0
 [1.39.0]: https://github.com/akitaonrails/ai-memory/releases/tag/v1.39.0
 [1.38.0]: https://github.com/akitaonrails/ai-memory/releases/tag/v1.38.0
 [1.37.0]: https://github.com/akitaonrails/ai-memory/releases/tag/v1.37.0
