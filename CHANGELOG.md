@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [2.0.1] - 2026-09-02
+
 ### Fixed
 - The human-readable wiki no longer drowns knowledge in machinery
   (UX audit after the 2.0 deploy). Three changes:
@@ -4727,7 +4729,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Consolidator used server startup default project instead of the
   session's actual project.
 
-[Unreleased]: https://github.com/akitaonrails/ai-memory/compare/v2.0.0...HEAD
+[Unreleased]: https://github.com/akitaonrails/ai-memory/compare/v2.0.1...HEAD
+[2.0.1]: https://github.com/akitaonrails/ai-memory/releases/tag/v2.0.1
 [2.0.0]: https://github.com/akitaonrails/ai-memory/releases/tag/v2.0.0
 [1.39.0]: https://github.com/akitaonrails/ai-memory/releases/tag/v1.39.0
 [1.38.0]: https://github.com/akitaonrails/ai-memory/releases/tag/v1.38.0
