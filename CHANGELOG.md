@@ -73,6 +73,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   out with `embedding_provider = "none"`; configured providers are
   never overridden. Measured on LongMemEval-S: overall hit@5 rises
   from 0.617 (FTS-only) to 0.779 with local embeddings.
+- An unscoped `memory_write_page` / `memory_handoff_begin` from a caller whose
+  active-project pointer does not resolve is now refused instead of written to
+  the server's default project. The page such a write produced was real,
+  attributed and searchable, and in a project nobody goes looking in. The error
+  names both remedies — pass explicit `workspace`/`project`, or install the
+  lifecycle hooks so the pointer is populated. Reads are unchanged: a read
+  answering from the default is a wrong answer the caller can see, a write is a
+  misfile they cannot. Callers with no identity coordinate at all
+  (anonymous/legacy) keep resolving through the shared slot, and an install with
+  no pointer information anywhere still resolves to the configured default
+  ([#564]).
 - The wiki's on-disk format is now natively the Open Knowledge Format
   (OKF) v0.2: every page write fills the spec's `type`, `generated`,
   `sources` and `stale_after` keys (ai-memory's own fields ride along as
