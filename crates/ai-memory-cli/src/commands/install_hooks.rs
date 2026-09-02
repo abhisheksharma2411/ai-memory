@@ -6746,7 +6746,6 @@ model = "gpt-5"
     /// scripts themselves source it with `. "$(dirname "$0")/_lib.sh"`
     /// and a missing helper would surface as a runtime "command not
     /// found" much further from the cause.
-    #[test]
     /// #581: inside the docker wrapper the server data dir is a volume
     /// the host cannot execute from; staging must fall back to the
     /// home-based path the wrapper bind-mounts and reads. Natively, the
