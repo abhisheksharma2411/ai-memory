@@ -196,7 +196,15 @@ pub async fn run_auto_improve_scheduler_tick(
             {
                 Ok((newer, _)) if newer >= experience.min_new_sessions => {
                     match run_scheduled_experience(&ctx, experience).await {
-                        Ok(run) => {
+                        Ok(None) => {
+                            tracing::debug!(
+                                workspace = %scope.workspace_name,
+                                project = %scope.project_name,
+                                "experience pass skipped (too few session pages); \
+                                 cadence anchor kept"
+                            );
+                        }
+                        Ok(Some(run)) => {
                             outcome.experience_runs += 1;
                             outcome.skipped += run.skipped.len();
                             if let Err(e) = writer
@@ -354,7 +362,7 @@ async fn run_scheduled_auto_improve(
 async fn run_scheduled_experience(
     ctx: &ScheduledAutoImproveContext<'_>,
     experience: &crate::ExperienceConfig,
-) -> Result<ScheduledAutoImproveOutcome> {
+) -> Result<Option<ScheduledAutoImproveOutcome>> {
     let cfg = ctx.settings.review.clone();
     let report = crate::run_experience_review(
         ctx.reader,
@@ -365,7 +373,16 @@ async fn run_scheduled_experience(
         experience,
     )
     .await?;
-    stage_and_apply(ctx, None, &report, "experience-scheduler").await
+    // A preflight skip (enough ENDED sessions but too few summary
+    // pages — consolidation lag, purges) must not stage an empty run or
+    // burn the cadence window (post-audit finding): report it as
+    // not-run so the anchor stays put and the next tick retries.
+    if report.provider == "none" {
+        return Ok(None);
+    }
+    stage_and_apply(ctx, None, &report, "experience-scheduler")
+        .await
+        .map(Some)
 }
 
 /// Stage a report's proposals and (unless approval is required) apply
@@ -843,6 +860,32 @@ mod tests {
                 .await
                 .unwrap();
         assert_eq!(outcome2.experience_runs, 0, "{outcome2:?}");
+
+        // Post-audit regression: approving the proposal must land an
+        // OKF-conformant FILE (type + generated), like every other write
+        // path — the approve emit used to skip disk conformance, which
+        // blocked export-okf and phantom-superseded on the next reindex
+        // after a binary upgrade.
+        wiki.approve_auto_improve_proposal(
+            ws,
+            project,
+            pending[0].id,
+            ActorContext::anonymous(),
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        let approved = std::fs::read_to_string(
+            tmp.path()
+                .join("wiki")
+                .join(ws.to_string())
+                .join(project.to_string())
+                .join("procedures/cross-session-release.md"),
+        )
+        .unwrap();
+        assert!(approved.contains("type: Procedure"), "{approved}");
+        assert!(approved.contains("generated:"), "{approved}");
     }
 
     /// Below the cadence floor nothing runs at all — no LLM call, no

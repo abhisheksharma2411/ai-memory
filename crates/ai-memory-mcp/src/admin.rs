@@ -889,6 +889,13 @@ async fn build_okf_bundle_file(
             let path = entry.path();
             let ft = entry.file_type()?;
             if ft.is_dir() {
+                // `_pending/` is the auto-improve staging area — proposal
+                // sidecars, not concept files; a strict OKF reader has no
+                // business seeing them (post-audit finding: an unresolved
+                // pending proposal blocked every export).
+                if entry.file_name() == "_pending" {
+                    continue;
+                }
                 if dir == bundle_dir {
                     families.push(entry.file_name().to_string_lossy().into_owned());
                 }
@@ -8066,6 +8073,69 @@ mod tests {
         let fm = ai_memory_wiki::parse(&page_body).unwrap().frontmatter;
         assert!(ai_memory_core::okf::is_conformant(&fm));
         assert_eq!(fm["type"], "Gotcha");
+    }
+
+    /// Post-audit regression: the things a REAL deployment's tree holds
+    /// beside concept pages — typed scope manifests and _pending
+    /// proposal sidecars — must not block the export. Sidecars are
+    /// excluded; manifests ship typed.
+    #[tokio::test]
+    async fn export_okf_tolerates_manifests_and_skips_pending() {
+        let (tmp, router) = read_page_test_router();
+        post_write_page(&router, "default", "scratch", "notes/a.md", "fine").await;
+        let ws_dir = std::fs::read_dir(tmp.path().join("wiki"))
+            .unwrap()
+            .flatten()
+            .map(|e| e.path())
+            .find(|p| p.is_dir() && p.file_name().is_none_or(|n| n != ".git"))
+            .unwrap();
+        let proj_dir = std::fs::read_dir(&ws_dir)
+            .unwrap()
+            .flatten()
+            .map(|e| e.path())
+            .find(|p| p.is_dir())
+            .unwrap();
+        // Typed manifest (what the fixed backfill writes) + a pending
+        // sidecar with no frontmatter (what staging writes).
+        std::fs::write(
+            proj_dir.join("_meta.md"),
+            "---\nproject: scratch\ntype: Scope Manifest\n---\n",
+        )
+        .unwrap();
+        std::fs::create_dir_all(proj_dir.join("_pending/auto-improve")).unwrap();
+        std::fs::write(
+            proj_dir.join("_pending/auto-improve/proposal.md"),
+            "# A staged proposal\n\nno frontmatter at all",
+        )
+        .unwrap();
+
+        let resp = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/admin/export-okf?workspace=default&project=scratch")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let dec = flate2::read::GzDecoder::new(std::io::Cursor::new(bytes.to_vec()));
+        let mut ar = tar::Archive::new(dec);
+        let names: Vec<String> = ar
+            .entries()
+            .unwrap()
+            .map(|e| e.unwrap().path().unwrap().display().to_string())
+            .collect();
+        assert!(names.iter().any(|n| n == "_meta.md"), "{names:?}");
+        assert!(
+            !names.iter().any(|n| n.starts_with("_pending")),
+            "pending sidecars must not ship: {names:?}"
+        );
     }
 
     /// A bundle with a non-conformant page must fail the export rather
