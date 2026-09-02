@@ -511,8 +511,11 @@ that touch the relevant area.
 8. **`{provider, model, dim}` denormalised next to every embedding.**
    Warn and ignore stale vectors on mismatch until re-embedding completes.
    (agentmemory #469.)
-9. **Live-process check before destructive ops.** `ai-memory reset`,
-   `backup`, `restore` all consult `sysinfo`. (basic-memory #765.)
+9. **Live-process check before direct-disk lifecycle ops.** `ai-memory reset`,
+   `restore`, `reindex`, and `uninstall --purge-data` consult `sysinfo`; the
+   uninstall guard is conditional on `--purge-data`. `backup` is a thin HTTP
+   client instead: the server snapshots SQLite with its online backup API while
+   the writer remains live. (basic-memory #765.)
 10. **Atomic file writes** (tmp + rename + fsync). Watcher ignores
     own writes by filename prefix.
 11. **Absolute canonical data dir** default; logged loudly on

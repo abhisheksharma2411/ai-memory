@@ -277,8 +277,11 @@ prior-art bug (see `docs/ARCHITECTURE.md` and `docs/issues-*.md`):
    wrapper libraries.
 8. **`{provider, model, dim}` denormalized next to every embedding**;
    stale vectors are warned about and ignored on config mismatch.
-9. **Live-process check before destructive ops** (`reset`, `backup`,
-   `restore` consult `sysinfo`).
+9. **Live-process check before direct-disk lifecycle ops.** `reset`, `restore`,
+   `reindex`, and `uninstall --purge-data` consult `sysinfo`; the uninstall
+   guard is conditional on `--purge-data`. `backup` stays online: its thin HTTP
+   client asks the server to snapshot SQLite with the online backup API while
+   the writer remains live.
 10. **Atomic file writes** (tmp + rename + fsync); the watcher ignores
     its own writes by filename prefix.
 11. **Absolute canonical data dir**, logged loudly at startup.
