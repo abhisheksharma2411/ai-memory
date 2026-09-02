@@ -93,14 +93,14 @@ fn destination_dir(
     // Canonicalize both sides before comparing: `<data_dir>/.` or a
     // symlinked spelling must not defeat the root guard (or the walk's
     // self-exclusion, which compares against the path returned here).
+    // The dest is created first so it ALWAYS canonicalizes — an
+    // uncanonical spelling of a not-yet-existing dest defeated the
+    // self-exclusion on the very first backup.
+    std::fs::create_dir_all(&dest)?;
     let canonical_data = data_dir
         .canonicalize()
         .unwrap_or_else(|_| data_dir.to_path_buf());
-    let canonical_dest = if dest.exists() {
-        dest.canonicalize().unwrap_or_else(|_| dest.clone())
-    } else {
-        dest.clone()
-    };
+    let canonical_dest = dest.canonicalize().unwrap_or_else(|_| dest.clone());
     if canonical_dest == canonical_data {
         return Err(WikiError::Io(std::io::Error::other(
             "the backup destination must not be the data dir root itself; \
@@ -127,8 +127,15 @@ fn create_pre_migration_backup_inner(
     dest_override: Option<&Path>,
     in_container: bool,
 ) -> WikiResult<BackupReceipt> {
+    // One spelling for every comparison below: `destination_dir` returns a
+    // canonical path, so the walk must produce canonical paths too or the
+    // self-exclusion guards (`path == dest_dir`, `path == archive_path`)
+    // silently miss under a symlinked data-dir spelling (macOS /var ->
+    // /private/var; observed tarring the half-written archive itself).
+    let data_dir = &data_dir
+        .canonicalize()
+        .unwrap_or_else(|_| data_dir.to_path_buf());
     let dest_dir = destination_dir(dest_override, data_dir, in_container)?;
-    std::fs::create_dir_all(&dest_dir)?;
     let stamp = jiff::Timestamp::now().strftime("%Y%m%d-%H%M%S").to_string();
     let archive_path = dest_dir.join(format!("ai-memory-backup-{label}-{stamp}.tar.gz"));
 
@@ -230,7 +237,13 @@ mod tests {
         let data = data_dir_with_content();
         let dest = TempDir::new().unwrap();
         let receipt = create_pre_migration_backup(data.path(), "test", Some(dest.path())).unwrap();
-        assert!(receipt.archive_path.starts_with(dest.path()));
+        // TempDir spellings differ from canonical on macOS (/var vs
+        // /private/var); the backup works in canonical space.
+        assert!(
+            receipt
+                .archive_path
+                .starts_with(dest.path().canonicalize().unwrap())
+        );
         assert_eq!(receipt.entries, 2);
         assert!(receipt.size_bytes > 0);
         assert!(receipt.archive_present());
@@ -262,7 +275,7 @@ mod tests {
         assert!(
             receipt
                 .archive_path
-                .starts_with(data.path().join("backups"))
+                .starts_with(data.path().canonicalize().unwrap().join("backups"))
         );
         // The two data files, not the archive or receipt.
         assert_eq!(receipt.entries, 2);
@@ -282,6 +295,27 @@ mod tests {
         // it (a real file) but never the prior archive in backups/.
         let second = create_pre_migration_backup(data.path(), "test", Some(&dest)).unwrap();
         assert_eq!(second.entries, 3, "data files + first receipt");
+    }
+
+    /// Reproduces the macOS matrix failure on any Unix: hand the backup a
+    /// symlinked spelling of the data dir (as macOS's /var -> /private/var
+    /// does implicitly) and prove the self-exclusion still holds — a second
+    /// run must not descend into backups/ or tar the first archive.
+    #[cfg(unix)]
+    #[test]
+    fn self_exclusion_survives_a_symlinked_data_dir_spelling() {
+        let real = data_dir_with_content();
+        let outer = TempDir::new().unwrap();
+        let alias = outer.path().join("alias");
+        std::os::unix::fs::symlink(real.path(), &alias).unwrap();
+        let dest = alias.join("backups");
+        let first = create_pre_migration_backup(&alias, "test", Some(&dest)).unwrap();
+        assert_eq!(first.entries, 2);
+        let second = create_pre_migration_backup(&alias, "test", Some(&dest)).unwrap();
+        assert_eq!(
+            second.entries, 3,
+            "data files + first receipt, never the archive"
+        );
     }
 
     #[test]

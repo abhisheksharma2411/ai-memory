@@ -1,7 +1,6 @@
 //! `ai-memory serve` — MCP server with optional filesystem watcher.
 
 use std::future::Future;
-use std::io::Write as _;
 use std::net::SocketAddr;
 use std::path::Path;
 use std::sync::Arc;
@@ -80,6 +79,13 @@ struct ServeLock {
     _file: std::fs::File,
 }
 
+/// Unlocked sidecar naming the lock holder (`pid=<n>`). Separate from the
+/// lock file because Windows' exclusive lock blocks reads of the locked
+/// file from other handles; informational only, rewritten by each holder.
+fn holder_info_path(data_dir: &Path) -> std::path::PathBuf {
+    data_dir.join(".serve.lock.holder")
+}
+
 /// Take the single-instance serve lock for `data_dir`.
 ///
 /// A contended lock refuses startup naming the holder, unless `force` is set:
@@ -91,7 +97,7 @@ fn acquire_serve_lock(data_dir: &Path, force: bool) -> Result<Option<ServeLock>>
     std::fs::create_dir_all(data_dir)
         .with_context(|| format!("creating data directory {}", data_dir.display()))?;
     let path = data_dir.join(SERVE_LOCK_FILE);
-    let mut file = std::fs::OpenOptions::new()
+    let file = std::fs::OpenOptions::new()
         .create(true)
         .truncate(false)
         .read(true)
@@ -101,16 +107,20 @@ fn acquire_serve_lock(data_dir: &Path, force: bool) -> Result<Option<ServeLock>>
     use fs2::FileExt as _;
     match file.try_lock_exclusive() {
         Ok(()) => {
-            // Informational only: the flock is the guard, and this line names
-            // the holder in a later refusal message. Best-effort.
-            let _ = file
-                .set_len(0)
-                .and_then(|()| file.write_all(format!("pid={}\n", std::process::id()).as_bytes()));
+            // Informational only: the flock is the guard, and this names the
+            // holder in a later refusal message. Best-effort, and written to
+            // an UNLOCKED sidecar — on Windows the exclusive lock blocks
+            // other handles from reading the locked file itself, which made
+            // every refusal report "holder unknown".
+            let _ = std::fs::write(
+                holder_info_path(data_dir),
+                format!("pid={}\n", std::process::id()),
+            );
             tracing::info!(lock = %path.display(), "single-instance serve lock held");
             Ok(Some(ServeLock { _file: file }))
         }
         Err(err) if crate::commands::hook_spool::is_drain_lock_busy_error(&err) => {
-            let holder = std::fs::read_to_string(&path)
+            let holder = std::fs::read_to_string(holder_info_path(data_dir))
                 .map(|text| text.trim().to_string())
                 .unwrap_or_default();
             if force {
