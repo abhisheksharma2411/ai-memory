@@ -608,8 +608,11 @@ mod tests {
     /// The homepage shows the pre-migration backup notice while the
     /// archive exists, and drops it once the archive is deleted
     /// (docs/okf.md).
+    /// 2.0.1: the always-on backup banner is gone — the migration
+    /// dialog is the single carrier of the archive path and restore
+    /// pointer (and `ai-memory status` keeps the durable reminder).
     #[tokio::test]
-    async fn homepage_backup_notice_tracks_the_archive() {
+    async fn homepage_has_no_backup_banner_and_dialog_carries_the_archive() {
         let (tmp, router) = based_web_router("", "/web");
 
         async fn body_of(router: &axum::Router) -> String {
@@ -625,14 +628,13 @@ mod tests {
             String::from_utf8(bytes.to_vec()).unwrap()
         }
 
-        // No receipt → no notice.
-        assert!(
-            !body_of(&router)
-                .await
-                .contains("pre-migration backup of your memory")
-        );
+        // No receipt: neither banner nor dialog.
+        let body = body_of(&router).await;
+        assert!(!body.contains("pre-migration backup of your memory"));
+        assert!(!body.contains("okf-dialog-overlay"));
 
-        // Receipt + archive present → notice with the path.
+        // Receipt + archive present: still no banner — the dialog holds
+        // the archive path and the restore pointer instead.
         let archive = tmp.path().join("fake-archive.tar.gz");
         std::fs::write(&archive, b"gz").unwrap();
         let receipt = ai_memory_wiki::backup::BackupReceipt {
@@ -649,20 +651,12 @@ mod tests {
         .unwrap();
         let body = body_of(&router).await;
         assert!(
-            body.contains("pre-migration backup of your memory"),
-            "notice missing"
+            !body.contains("pre-migration backup of your memory"),
+            "the redundant banner must never render"
         );
+        assert!(body.contains("okf-dialog-overlay"), "dialog missing");
         assert!(body.contains("fake-archive.tar.gz"), "archive path missing");
         assert!(body.contains("MIGRATION-2.0.md"), "restore pointer missing");
-
-        // Archive deleted → notice gone, receipt or not (the explainer
-        // dialog may still render; only the banner must clear).
-        std::fs::remove_file(&archive).unwrap();
-        assert!(
-            !body_of(&router)
-                .await
-                .contains("pre-migration backup of your memory")
-        );
     }
 
     /// The one-time 2.0 explainer dialog renders whenever a migration

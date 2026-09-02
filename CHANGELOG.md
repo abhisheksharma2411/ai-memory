@@ -7,6 +7,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+- The human-readable wiki no longer drowns knowledge in machinery
+  (UX audit after the 2.0 deploy). Three changes:
+  the lint pass now supersedes a single `_lint/report.md` per project
+  instead of minting a dated page every day (a long-lived store had
+  accumulated 2,000+ lint pages — indexed, searched, and embedded;
+  each pass now also prunes the legacy dated pile, and a clean pass
+  removes the report entirely, so existing stores self-heal without a
+  migration); the web project view splits machinery (lint reports,
+  session captures, monthly logs, bundle indexes, `_meta`) into a
+  collapsed System sidebar section and keeps Recent Activity to
+  knowledge pages only — `_rules` stay with knowledge; and the
+  homepage's LLM-optimised-memory explainer is now dismissible
+  (persisted per browser) while the redundant always-on backup banner
+  is gone — the migration dialog and `ai-memory status` carry that
+  information.
+
 ## [2.0.0] - 2026-09-02
 
 ### Added

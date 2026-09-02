@@ -180,3 +180,137 @@ async fn a_contradiction_to_a_deleted_page_reports_the_stale_declaration() {
         .expect("unresolved contradicts still lints");
     assert!(finding.message.contains("does not resolve"));
 }
+
+// ── 2.0.1: lint reports are one superseding page, not a daily pile ──
+
+/// A page old enough (and cold enough) to trigger the rule-based
+/// `stale` finding, so a non-dry run has something to report.
+fn stale_page_req(ws: WorkspaceId, proj: ProjectId) -> WritePageRequest {
+    let mut r = req(
+        ws,
+        proj,
+        "sessions/ancient.md",
+        "long-forgotten episodic capture",
+        serde_json::json!({}),
+    );
+    r.tier = Tier::Episodic;
+    r
+}
+
+async fn backdate_page(tmp: &TempDir, path: &str, days: i64) {
+    let db = rusqlite::Connection::open(tmp.path().join("db").join("memory.sqlite")).unwrap();
+    let cutoff = jiff::Timestamp::now().as_microsecond() - days * 86_400 * 1_000_000;
+    db.execute(
+        "UPDATE pages SET updated_at = ?1, created_at = ?1 WHERE path = ?2",
+        rusqlite::params![cutoff, path],
+    )
+    .unwrap();
+}
+
+#[tokio::test]
+async fn lint_supersedes_one_report_and_prunes_the_legacy_daily_pile() {
+    let tmp = TempDir::new().unwrap();
+    let store = Store::open(tmp.path()).unwrap();
+    let (ws, proj) = scope(&store).await;
+    let wiki = Wiki::new(tmp.path(), store.writer.clone()).unwrap();
+
+    // The pre-2.0.1 accumulation: dated daily reports.
+    for date in ["2026-07-01", "2026-07-02", "2026-08-15"] {
+        wiki.write_page(req(
+            ws,
+            proj,
+            &format!("_lint/{date}.md"),
+            "1 finding(s).",
+            serde_json::json!({"kind": "lint-report"}),
+        ))
+        .await
+        .unwrap();
+    }
+    // Something for the current pass to find.
+    wiki.write_page(stale_page_req(ws, proj)).await.unwrap();
+    backdate_page(&tmp, "sessions/ancient.md", 90).await;
+
+    let opts = LintOptions {
+        dry_run: false,
+        use_llm: false,
+        decay_lambda: 0.02,
+    };
+    let report = run_lint(&store.reader, &wiki, None, ws, proj, opts)
+        .await
+        .unwrap();
+    assert!(!report.findings.is_empty(), "the stale page must be found");
+
+    let db = rusqlite::Connection::open(tmp.path().join("db").join("memory.sqlite")).unwrap();
+    let lint_paths: Vec<String> = db
+        .prepare("SELECT path FROM pages WHERE is_latest = 1 AND path LIKE '\\_lint/%' ESCAPE '\\' ORDER BY path")
+        .unwrap()
+        .query_map([], |r| r.get(0))
+        .unwrap()
+        .collect::<Result<_, _>>()
+        .unwrap();
+    assert_eq!(
+        lint_paths,
+        vec!["_lint/report.md".to_string()],
+        "one superseding report; every legacy dated page pruned"
+    );
+
+    // A second run with findings still present supersedes in place —
+    // still exactly one latest lint page.
+    run_lint(&store.reader, &wiki, None, ws, proj, opts)
+        .await
+        .unwrap();
+    let latest_count: i64 = db
+        .query_row(
+            "SELECT COUNT(*) FROM pages WHERE is_latest = 1 AND path LIKE '\\_lint/%' ESCAPE '\\'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(latest_count, 1, "reruns supersede, never accumulate");
+}
+
+#[tokio::test]
+async fn a_clean_pass_removes_the_stale_report() {
+    let tmp = TempDir::new().unwrap();
+    let store = Store::open(tmp.path()).unwrap();
+    let (ws, proj) = scope(&store).await;
+    let wiki = Wiki::new(tmp.path(), store.writer.clone()).unwrap();
+
+    // Findings exist -> a report is written.
+    wiki.write_page(stale_page_req(ws, proj)).await.unwrap();
+    backdate_page(&tmp, "sessions/ancient.md", 90).await;
+    let opts = LintOptions {
+        dry_run: false,
+        use_llm: false,
+        decay_lambda: 0.02,
+    };
+    run_lint(&store.reader, &wiki, None, ws, proj, opts)
+        .await
+        .unwrap();
+
+    // The offending page goes away; the next clean pass must take the
+    // now-false report with it.
+    wiki.delete_page(
+        ws,
+        proj,
+        &PagePath::new("sessions/ancient.md").unwrap(),
+        None,
+        None,
+    )
+    .await
+    .unwrap();
+    let report = run_lint(&store.reader, &wiki, None, ws, proj, opts)
+        .await
+        .unwrap();
+    assert!(report.findings.is_empty(), "nothing left to find");
+
+    let db = rusqlite::Connection::open(tmp.path().join("db").join("memory.sqlite")).unwrap();
+    let latest_count: i64 = db
+        .query_row(
+            "SELECT COUNT(*) FROM pages WHERE is_latest = 1 AND path LIKE '\\_lint/%' ESCAPE '\\'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(latest_count, 0, "a clean project carries no lint page");
+}

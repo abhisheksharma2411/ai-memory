@@ -1692,7 +1692,7 @@ pub struct ForgetSweepArgs {
 /// Arguments for `lint`.
 #[derive(Debug, Args)]
 pub struct LintArgs {
-    /// Compute findings but don't write `wiki/_lint/<date>.md`.
+    /// Compute findings but don't write `wiki/_lint/report.md`.
     #[arg(long)]
     pub dry_run: bool,
     /// Run only rule-based checks; skip the LLM contradiction pass.

@@ -2962,3 +2962,122 @@ async fn api_v1_etag_differs_between_anonymous_and_attributed_writes() {
          (would otherwise let stale caches hide attribution flips)"
     );
 }
+
+// ── 2.0.1: knowledge pages stay in front, machinery collapses ──
+
+#[tokio::test]
+async fn project_view_separates_machinery_from_knowledge() {
+    let (_tmp, store, wiki) = setup().await;
+    let ws = store
+        .writer
+        .get_or_create_workspace("default")
+        .await
+        .unwrap();
+    let proj = store
+        .writer
+        .get_or_create_project(ws, "scratch", None)
+        .await
+        .unwrap();
+    for (path, title) in [
+        ("concepts/retrieval.md", "Retrieval Concept"),
+        ("_rules/deploy-policy.md", "Deploy Policy Rule"),
+        ("_lint/report.md", "Lint report 2026-09-02"),
+        ("sessions/abc123.md", "Session abc123"),
+        ("log-2026-09.md", "log-2026-09"),
+        ("index.md", "Bundle index"),
+        ("_meta.md", "meta"),
+    ] {
+        store
+            .writer
+            .upsert_page(new_page(ws, proj, path, title, "body text"))
+            .await
+            .unwrap();
+    }
+
+    let app = router(store.reader.clone(), wiki.clone());
+    let req = Request::builder()
+        .uri("/w/default/scratch")
+        .body(Body::empty())
+        .unwrap();
+    let resp = app.oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let text = std::str::from_utf8(&body).unwrap();
+
+    // Recent Activity lists knowledge only. The list is the segment
+    // after its heading; machinery must not appear there.
+    let recent = &text[text.find("Recent Activity").expect("recent heading")..];
+    assert!(recent.contains("Retrieval Concept"));
+    assert!(
+        recent.contains("Deploy Policy Rule"),
+        "_rules are standing human-authored knowledge, not machinery"
+    );
+    for machinery in [
+        "Lint report 2026-09-02",
+        "Session abc123",
+        "log-2026-09",
+        "Bundle index",
+    ] {
+        assert!(
+            !recent.contains(machinery),
+            "machinery page {machinery:?} leaked into Recent Activity"
+        );
+    }
+
+    // The sidebar still reaches everything: machinery sits in the
+    // collapsed System section.
+    let sidebar = &text[..text.find("Recent Activity").unwrap()];
+    let system = &sidebar[sidebar.find("System").expect("system section")..];
+    assert!(system.contains("Lint report 2026-09-02"));
+    assert!(system.contains("Session abc123"));
+    assert!(system.contains("log-2026-09"));
+    // Knowledge renders BEFORE the System section.
+    let knowledge = &sidebar[..sidebar.find("System").unwrap()];
+    assert!(knowledge.contains("Retrieval Concept"));
+    assert!(knowledge.contains("Deploy Policy Rule"));
+    assert!(!knowledge.contains("Session abc123"));
+}
+
+#[tokio::test]
+async fn homepage_llm_notice_is_dismissible_and_backup_banner_is_gone() {
+    let (_tmp, store, wiki) = setup().await;
+    let ws = store
+        .writer
+        .get_or_create_workspace("default")
+        .await
+        .unwrap();
+    let proj = store
+        .writer
+        .get_or_create_project(ws, "scratch", None)
+        .await
+        .unwrap();
+    store
+        .writer
+        .upsert_page(new_page(ws, proj, "foo.md", "Foo Page", "Hello"))
+        .await
+        .unwrap();
+
+    let app = router(store.reader.clone(), wiki.clone());
+    let req = Request::builder().uri("/").body(Body::empty()).unwrap();
+    let resp = app.oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let text = std::str::from_utf8(&body).unwrap();
+
+    // The explainer ships hidden with a persistent dismissal control;
+    // client script reveals it unless previously dismissed.
+    assert!(text.contains(r#"id="llm-notice""#));
+    assert!(text.contains(r#"id="llm-notice-close""#));
+    assert!(text.contains("ai-memory-llm-notice-dismissed"));
+
+    // The old always-on backup banner is gone (the migration dialog
+    // carries that information; `status` keeps the durable reminder).
+    assert!(
+        !text.contains("pre-migration backup of your memory is still on disk"),
+        "redundant backup banner must not render"
+    );
+}
