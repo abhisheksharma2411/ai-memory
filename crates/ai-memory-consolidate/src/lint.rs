@@ -210,6 +210,32 @@ pub async fn run_lint(
         });
     }
 
+    // Declared contradictions (typed `contradicts` edges, 2.0 item 3):
+    // an author or the consolidator explicitly said two pages disagree —
+    // the highest-signal zero-LLM contradiction finding possible.
+    for edge in reader.contradiction_edges(workspace_id, project_id).await? {
+        let message = if edge.resolved {
+            format!(
+                "Page {} declares it contradicts {} — reconcile them or \
+                 supersede the outdated one",
+                edge.from_path, edge.to_path,
+            )
+        } else {
+            format!(
+                "Page {} declares it contradicts {}, which does not resolve \
+                 to a page (deleted or renamed) — the declaration is stale",
+                edge.from_path, edge.to_path,
+            )
+        };
+        findings.push(LintFinding {
+            kind: "contradiction".into(),
+            severity: "warning".into(),
+            message,
+            pages: vec![edge.from_path, edge.to_path],
+            detail: None,
+        });
+    }
+
     // Explicit `stale` / `wrong` feedback (memory_feedback). An agent or
     // user asserting a page is outdated or incorrect is the highest-signal
     // finding the zero-LLM path can produce — it came from a human/agent

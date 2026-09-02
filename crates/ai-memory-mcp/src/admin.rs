@@ -578,6 +578,7 @@ pub fn admin_router_with_sweep_tuning(
     let state = Arc::new(state);
     let operational = Router::new()
         .route("/admin/backup", post(handle_backup))
+        .route("/admin/export-okf", post(handle_export_okf))
         .route("/admin/bootstrap", post(handle_bootstrap))
         .route("/admin/auto-improve", post(handle_auto_improve))
         .route(
@@ -817,6 +818,142 @@ async fn build_backup_tarball_file(state: &AdminState) -> anyhow::Result<tokio::
 }
 
 // ---------------------------------------------------------------------
+// export-okf
+// ---------------------------------------------------------------------
+
+/// Query for `POST /admin/export-okf`: the one project bundle to export.
+#[derive(Deserialize)]
+struct ExportOkfQuery {
+    workspace: String,
+    project: String,
+}
+
+/// `POST /admin/export-okf?workspace=…&project=…` — stream the project
+/// directory as an OKF v0.2 bundle tarball (docs/okf.md). The wiki files
+/// ARE the bundle (native conformance), so this is a validated copy with
+/// a freshly generated `index.md` (full listing + `okf_version`). Any
+/// non-conformant page file fails the export rather than shipping a
+/// bundle a strict reader would reject.
+async fn handle_export_okf(
+    State(state): State<Arc<AdminState>>,
+    Query(q): Query<ExportOkfQuery>,
+) -> Response {
+    let ids = match lookup_ws_proj_no_create(&state, q.workspace.trim(), q.project.trim()).await {
+        Ok(ids) => ids,
+        Err((status, body)) => return (status, body).into_response(),
+    };
+    match build_okf_bundle_file(&state, ids.0, ids.1).await {
+        Ok(file) => Response::builder()
+            .status(StatusCode::OK)
+            .header(header::CONTENT_TYPE, "application/gzip")
+            .header(
+                header::CONTENT_DISPOSITION,
+                "attachment; filename=\"okf-bundle.tar.gz\"",
+            )
+            .body(Body::from_stream(ReaderStream::new(file)))
+            .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response()),
+        Err(e) => {
+            warn!(error = %e, "okf export failed");
+            let body = serde_json::to_vec(&serde_json::json!({ "error": e.to_string() }))
+                .unwrap_or_default();
+            Response::builder()
+                .status(StatusCode::UNPROCESSABLE_ENTITY)
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(body))
+                .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response())
+        }
+    }
+}
+
+async fn build_okf_bundle_file(
+    state: &AdminState,
+    ws: ai_memory_core::WorkspaceId,
+    proj: ai_memory_core::ProjectId,
+) -> anyhow::Result<tokio::fs::File> {
+    let bundle_dir = state
+        .data_dir
+        .join("wiki")
+        .join(ws.to_string())
+        .join(proj.to_string());
+    if !bundle_dir.is_dir() {
+        anyhow::bail!("project has no wiki directory yet");
+    }
+
+    // Validate + collect: every non-reserved .md must be conformant.
+    let mut files: Vec<std::path::PathBuf> = Vec::new();
+    let mut families: Vec<String> = Vec::new();
+    let mut stack = vec![bundle_dir.clone()];
+    while let Some(dir) = stack.pop() {
+        for entry in std::fs::read_dir(&dir)? {
+            let entry = entry?;
+            let path = entry.path();
+            let ft = entry.file_type()?;
+            if ft.is_dir() {
+                // `_pending/` is the auto-improve staging area — proposal
+                // sidecars, not concept files; a strict OKF reader has no
+                // business seeing them (post-audit finding: an unresolved
+                // pending proposal blocked every export).
+                if entry.file_name() == "_pending" {
+                    continue;
+                }
+                if dir == bundle_dir {
+                    families.push(entry.file_name().to_string_lossy().into_owned());
+                }
+                stack.push(path);
+            } else if ft.is_file() && path.extension().is_some_and(|e| e == "md") {
+                let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
+                if name == "index.md" || name == "log.md" {
+                    continue; // regenerated / not adopted
+                }
+                let raw = std::fs::read_to_string(&path)?;
+                let fm = ai_memory_wiki::parse(&raw)
+                    .map(|m| m.frontmatter)
+                    .unwrap_or_default();
+                if !ai_memory_core::okf::is_conformant(&fm) {
+                    anyhow::bail!(
+                        "page {} is not OKF-conformant; run the server once to migrate \
+                         before exporting",
+                        path.strip_prefix(&bundle_dir).unwrap_or(&path).display()
+                    );
+                }
+                files.push(path);
+            }
+        }
+    }
+
+    let mut tar_file = tempfile::tempfile()?;
+    {
+        let encoder = GzEncoder::new(&mut tar_file, Compression::default());
+        let mut tar = tar::Builder::new(encoder);
+        tar.mode(tar::HeaderMode::Deterministic);
+        tar.follow_symlinks(false);
+        // Fresh bundle-root index.md: okf_version + full listing.
+        families.sort();
+        let listing: String = families
+            .iter()
+            .map(|f| format!("- [{f}/]({f}/)\n"))
+            .collect();
+        let index = format!(
+            "---\nokf_version: \"0.2\"\n---\n\n# Bundle index\n\nConcept files live in these directories:\n\n{listing}"
+        );
+        let mut header = tar::Header::new_gnu();
+        header.set_size(index.len() as u64);
+        header.set_mode(0o644);
+        header.set_cksum();
+        tar.append_data(&mut header, "index.md", index.as_bytes())?;
+        for path in files {
+            let rel = path.strip_prefix(&bundle_dir).unwrap_or(&path);
+            tar.append_path_with_name(&path, rel)?;
+        }
+        let encoder = tar.into_inner()?;
+        encoder.finish()?;
+    }
+    tar_file.sync_data()?;
+    tar_file.rewind()?;
+    Ok(tokio::fs::File::from_std(tar_file))
+}
+
+// ---------------------------------------------------------------------
 // status
 // ---------------------------------------------------------------------
 
@@ -953,6 +1090,24 @@ pub struct StatusReport {
     /// Hook-ingestion counters for this server process. Counts and one
     /// timestamp only — never captured content (#428).
     pub ingest: ai_memory_core::IngestMetricsSnapshot,
+    /// Instantaneous write-queue depth `(queued, capacity)` — the
+    /// wedged-writer signal (2.0 item 7).
+    pub write_queue: (usize, usize),
+    /// Wiki-format state: whether the OKF migration has run, and the
+    /// pre-migration backup archive if its receipt still exists.
+    pub wiki_format: WikiFormatStatus,
+}
+
+/// Wiki-format section of [`StatusReport`].
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
+pub struct WikiFormatStatus {
+    /// True once the OKF v0.2 wiki migration has been applied.
+    pub okf_migrated: bool,
+    /// Pre-migration backup archive path, when the receipt exists AND
+    /// the archive file is still on disk.
+    pub backup_archive: Option<String>,
+    /// Size of that archive in bytes.
+    pub backup_archive_bytes: Option<u64>,
 }
 
 /// `GET /admin/projects` — the authoritative list of `(workspace, project)`
@@ -980,6 +1135,14 @@ async fn handle_status(State(state): State<Arc<AdminState>>) -> impl IntoRespons
                 // Three pragma reads; a failure here must not take down the
                 // whole status response, which is also the health probe.
                 let storage = state.reader.storage_status().await.unwrap_or_default();
+                let okf_migrated = state
+                    .reader
+                    .wiki_migration_names()
+                    .await
+                    .map(|names| names.iter().any(|n| n.contains("okf")))
+                    .unwrap_or(false);
+                let backup = ai_memory_wiki::backup::BackupReceipt::load(&state.data_dir)
+                    .filter(ai_memory_wiki::backup::BackupReceipt::archive_present);
                 let report = StatusReport {
                     version: env!("CARGO_PKG_VERSION").to_string(),
                     data_dir: state.data_dir.display().to_string(),
@@ -990,6 +1153,14 @@ async fn handle_status(State(state): State<Arc<AdminState>>) -> impl IntoRespons
                     storage,
                     providers: state.provider_health.snapshot(),
                     ingest: state.ingest_metrics.snapshot(),
+                    write_queue: state.writer.queue_depth(),
+                    wiki_format: WikiFormatStatus {
+                        okf_migrated,
+                        backup_archive: backup
+                            .as_ref()
+                            .map(|r| r.archive_path.display().to_string()),
+                        backup_archive_bytes: backup.as_ref().map(|r| r.size_bytes),
+                    },
                 };
                 (
                     StatusCode::OK,
@@ -7062,6 +7233,12 @@ mod tests {
         let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(json["providers"]["llm"]["status"], "disabled");
         assert_eq!(json["providers"]["embedding"]["status"], "disabled");
+        // 2.0 item 7: the report carries the wedged-writer gauge and the
+        // wiki-format state — a fresh store is natively conformant (no
+        // migration ran) with no backup archive.
+        assert!(json["write_queue"].is_array(), "{json}");
+        assert_eq!(json["wiki_format"]["okf_migrated"], false);
+        assert!(json["wiki_format"]["backup_archive"].is_null());
     }
 
     /// The MCP-only complement: per-client tool-call counters served
@@ -7839,6 +8016,165 @@ mod tests {
             trusted_proxy_identity: false,
         });
         (tmp, router)
+    }
+
+    /// The exported tarball is a valid OKF v0.2 bundle: fresh index.md
+    /// with okf_version, every concept file conformant (docs/okf.md).
+    #[tokio::test]
+    async fn export_okf_streams_a_conformant_bundle() {
+        let (_tmp, router) = read_page_test_router();
+        post_write_page(
+            &router,
+            "default",
+            "scratch",
+            "gotchas/build.md",
+            "watch out",
+        )
+        .await;
+
+        let resp = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/admin/export-okf?workspace=default&project=scratch")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+
+        let dec = flate2::read::GzDecoder::new(std::io::Cursor::new(bytes.to_vec()));
+        let mut ar = tar::Archive::new(dec);
+        let mut names = Vec::new();
+        let mut index_body = String::new();
+        let mut page_body = String::new();
+        for entry in ar.entries().unwrap() {
+            let mut entry = entry.unwrap();
+            let name = entry.path().unwrap().display().to_string();
+            use std::io::Read as _;
+            let mut content = String::new();
+            entry.read_to_string(&mut content).unwrap();
+            if name == "index.md" {
+                index_body = content.clone();
+            }
+            if name == "gotchas/build.md" {
+                page_body = content.clone();
+            }
+            names.push(name);
+        }
+        assert!(names.contains(&"index.md".to_string()), "{names:?}");
+        assert!(names.contains(&"gotchas/build.md".to_string()), "{names:?}");
+        assert!(index_body.contains("okf_version: \"0.2\""));
+        let fm = ai_memory_wiki::parse(&page_body).unwrap().frontmatter;
+        assert!(ai_memory_core::okf::is_conformant(&fm));
+        assert_eq!(fm["type"], "Gotcha");
+    }
+
+    /// Post-audit regression: the things a REAL deployment's tree holds
+    /// beside concept pages — typed scope manifests and _pending
+    /// proposal sidecars — must not block the export. Sidecars are
+    /// excluded; manifests ship typed.
+    #[tokio::test]
+    async fn export_okf_tolerates_manifests_and_skips_pending() {
+        let (tmp, router) = read_page_test_router();
+        post_write_page(&router, "default", "scratch", "notes/a.md", "fine").await;
+        let ws_dir = std::fs::read_dir(tmp.path().join("wiki"))
+            .unwrap()
+            .flatten()
+            .map(|e| e.path())
+            .find(|p| p.is_dir() && p.file_name().is_none_or(|n| n != ".git"))
+            .unwrap();
+        let proj_dir = std::fs::read_dir(&ws_dir)
+            .unwrap()
+            .flatten()
+            .map(|e| e.path())
+            .find(|p| p.is_dir())
+            .unwrap();
+        // Typed manifest (what the fixed backfill writes) + a pending
+        // sidecar with no frontmatter (what staging writes).
+        std::fs::write(
+            proj_dir.join("_meta.md"),
+            "---\nproject: scratch\ntype: Scope Manifest\n---\n",
+        )
+        .unwrap();
+        std::fs::create_dir_all(proj_dir.join("_pending/auto-improve")).unwrap();
+        std::fs::write(
+            proj_dir.join("_pending/auto-improve/proposal.md"),
+            "# A staged proposal\n\nno frontmatter at all",
+        )
+        .unwrap();
+
+        let resp = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/admin/export-okf?workspace=default&project=scratch")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let dec = flate2::read::GzDecoder::new(std::io::Cursor::new(bytes.to_vec()));
+        let mut ar = tar::Archive::new(dec);
+        let names: Vec<String> = ar
+            .entries()
+            .unwrap()
+            .map(|e| e.unwrap().path().unwrap().display().to_string())
+            .collect();
+        assert!(names.iter().any(|n| n == "_meta.md"), "{names:?}");
+        assert!(
+            !names.iter().any(|n| n.starts_with("_pending")),
+            "pending sidecars must not ship: {names:?}"
+        );
+    }
+
+    /// A bundle with a non-conformant page must fail the export rather
+    /// than ship something a strict reader rejects.
+    #[tokio::test]
+    async fn export_okf_refuses_a_nonconformant_page() {
+        let (tmp, router) = read_page_test_router();
+        post_write_page(&router, "default", "scratch", "notes/a.md", "fine").await;
+        // Fabricate a pre-migration file next to it. The wiki root also
+        // holds `.git`; read_dir order is arbitrary, so select the
+        // UUID-named scope dirs explicitly.
+        let uuid_dir = |parent: &std::path::Path| {
+            std::fs::read_dir(parent)
+                .unwrap()
+                .flatten()
+                .map(|e| e.path())
+                .find(|p| p.is_dir() && p.file_name().is_none_or(|n| n != ".git"))
+                .expect("scope dir")
+        };
+        let ws_dir = uuid_dir(&tmp.path().join("wiki"));
+        let proj_dir = uuid_dir(&ws_dir);
+        std::fs::write(
+            proj_dir.join("notes/legacy.md"),
+            "---\ntitle: Legacy\n---\nno type here",
+        )
+        .unwrap();
+
+        let resp = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/admin/export-okf?workspace=default&project=scratch")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::UNPROCESSABLE_ENTITY);
     }
 
     fn admin_state_for_store(tmp: &TempDir, store: &Store, wiki: Wiki) -> AdminState {
@@ -10355,6 +10691,11 @@ mod tests {
     fn admin_route_samples() -> Vec<(&'static str, &'static str, serde_json::Value)> {
         vec![
             ("POST", "/admin/backup", serde_json::Value::Null),
+            (
+                "POST",
+                "/admin/export-okf?workspace=default&project=scratch",
+                serde_json::Value::Null,
+            ),
             (
                 "POST",
                 "/admin/bootstrap",

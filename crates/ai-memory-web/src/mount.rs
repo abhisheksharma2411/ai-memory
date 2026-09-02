@@ -605,6 +605,124 @@ mod tests {
         (tmp, router)
     }
 
+    /// The homepage shows the pre-migration backup notice while the
+    /// archive exists, and drops it once the archive is deleted
+    /// (docs/okf.md).
+    #[tokio::test]
+    async fn homepage_backup_notice_tracks_the_archive() {
+        let (tmp, router) = based_web_router("", "/web");
+
+        async fn body_of(router: &axum::Router) -> String {
+            let resp = router
+                .clone()
+                .oneshot(Request::builder().uri("/web").body(Body::empty()).unwrap())
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), StatusCode::OK);
+            let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            String::from_utf8(bytes.to_vec()).unwrap()
+        }
+
+        // No receipt → no notice.
+        assert!(
+            !body_of(&router)
+                .await
+                .contains("pre-migration backup of your memory")
+        );
+
+        // Receipt + archive present → notice with the path.
+        let archive = tmp.path().join("fake-archive.tar.gz");
+        std::fs::write(&archive, b"gz").unwrap();
+        let receipt = ai_memory_wiki::backup::BackupReceipt {
+            archive_path: archive.clone(),
+            size_bytes: 2,
+            entries: 1,
+            created_at: "2026-09-01T00:00:00Z".into(),
+            label: "okf-v0.2".into(),
+        };
+        std::fs::write(
+            tmp.path().join(ai_memory_wiki::backup::BACKUP_RECEIPT_FILE),
+            serde_json::to_vec(&receipt).unwrap(),
+        )
+        .unwrap();
+        let body = body_of(&router).await;
+        assert!(
+            body.contains("pre-migration backup of your memory"),
+            "notice missing"
+        );
+        assert!(body.contains("fake-archive.tar.gz"), "archive path missing");
+        assert!(body.contains("MIGRATION-2.0.md"), "restore pointer missing");
+
+        // Archive deleted → notice gone, receipt or not (the explainer
+        // dialog may still render; only the banner must clear).
+        std::fs::remove_file(&archive).unwrap();
+        assert!(
+            !body_of(&router)
+                .await
+                .contains("pre-migration backup of your memory")
+        );
+    }
+
+    /// The one-time 2.0 explainer dialog renders whenever a migration
+    /// receipt exists — with recovery steps while the archive is
+    /// present, with the git-checkpoint fallback after it was deleted —
+    /// keyed for per-browser "do not show me again" dismissal.
+    #[tokio::test]
+    async fn homepage_migration_dialog_adapts_to_the_archive() {
+        let (tmp, router) = based_web_router("", "/web");
+
+        async fn body_of(router: &axum::Router) -> String {
+            let resp = router
+                .clone()
+                .oneshot(Request::builder().uri("/web").body(Body::empty()).unwrap())
+                .await
+                .unwrap();
+            let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            String::from_utf8(bytes.to_vec()).unwrap()
+        }
+
+        // No receipt → no dialog at all.
+        assert!(!body_of(&router).await.contains("okf-dialog-overlay"));
+
+        let archive = tmp.path().join("fake-archive.tar.gz");
+        std::fs::write(&archive, b"gz").unwrap();
+        let receipt = ai_memory_wiki::backup::BackupReceipt {
+            archive_path: archive.clone(),
+            size_bytes: 2,
+            entries: 1,
+            created_at: "2026-09-01T00:00:00Z".into(),
+            label: "okf-v0.2".into(),
+        };
+        std::fs::write(
+            tmp.path().join(ai_memory_wiki::backup::BACKUP_RECEIPT_FILE),
+            serde_json::to_vec(&receipt).unwrap(),
+        )
+        .unwrap();
+
+        // Archive present → dialog with restore steps + dismissal key.
+        let body = body_of(&router).await;
+        assert!(body.contains("okf-dialog-overlay"));
+        assert!(body.contains("upgraded to the 2.0 format"));
+        assert!(body.contains("Do not show me again"));
+        assert!(
+            body.contains("ai-memory-okf-dialog-2026-09-01T00:00:00Z"),
+            "dismissal key must be migration-stamped"
+        );
+        assert!(body.contains("Unpack the archive"));
+
+        // Archive deleted → dialog still explains, recovery falls back
+        // to the git checkpoint; the inline banner is gone.
+        std::fs::remove_file(&archive).unwrap();
+        let body = body_of(&router).await;
+        assert!(body.contains("okf-dialog-overlay"));
+        assert!(body.contains("pre-okf-migration checkpoint"));
+        assert!(!body.contains("pre-migration backup of your memory"));
+    }
+
     #[tokio::test]
     async fn base_path_nests_all_surfaces_and_root_404s() {
         let (_tmp, router) = based_web_router("/wiki", "/web");

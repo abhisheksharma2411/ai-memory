@@ -723,9 +723,9 @@ fn strip_legacy_orphan_tail(tail: &str) -> &str {
 /// True when a hook command string was written by ai-memory. Legacy script
 /// commands carry the unconditional `AI_MEMORY_HOOK_URL=` env prefix; native
 /// commands invoke the `ai-memory hook --event ... --server-url ...` subcommand.
-/// Keep both signatures narrow so uninstall does not remove unrelated hooks that
-/// happen to use the same event names or script basenames.
-fn hook_command_is_ours(command: &str) -> bool {
+/// Keep both signatures narrow so hook overlays and uninstall do not remove
+/// unrelated hooks that happen to use the same event names or script basenames.
+pub(crate) fn hook_command_is_ours(command: &str) -> bool {
     if command.contains("AI_MEMORY_HOOK_URL=") {
         return true;
     }

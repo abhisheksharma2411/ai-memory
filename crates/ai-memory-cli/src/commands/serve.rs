@@ -1,6 +1,7 @@
 //! `ai-memory serve` — MCP server with optional filesystem watcher.
 
 use std::future::Future;
+use std::io::Write as _;
 use std::net::SocketAddr;
 use std::path::Path;
 use std::sync::Arc;
@@ -66,6 +67,80 @@ const SESSION_CONSOLIDATION_POLL_INTERVAL: Duration = Duration::from_secs(15);
 /// A claimed job may be recovered after this long without completion. Provider
 /// requests are expected to finish well inside this lease.
 const SESSION_CONSOLIDATION_LEASE: Duration = Duration::from_secs(10 * 60);
+
+/// Lock file guarding a data dir against a second `ai-memory serve` (#563).
+const SERVE_LOCK_FILE: &str = ".serve.lock";
+
+/// The single-instance guard for `ai-memory serve`: an exclusive `flock` on
+/// `<data-dir>/.serve.lock` held for the process lifetime. The OS releases it
+/// when the process exits, so a crashed server never locks the operator out of
+/// their own data.
+#[derive(Debug)]
+struct ServeLock {
+    _file: std::fs::File,
+}
+
+/// Take the single-instance serve lock for `data_dir`.
+///
+/// A contended lock refuses startup naming the holder, unless `force` is set:
+/// the operator who knows the previous server is gone (a hung holder, or a
+/// mount with unreliable locking) must not be stranded. A filesystem that
+/// cannot lock at all only downgrades the guard to a warning — refusing to
+/// start there would be worse than the unguarded risk.
+fn acquire_serve_lock(data_dir: &Path, force: bool) -> Result<Option<ServeLock>> {
+    std::fs::create_dir_all(data_dir)
+        .with_context(|| format!("creating data directory {}", data_dir.display()))?;
+    let path = data_dir.join(SERVE_LOCK_FILE);
+    let mut file = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .open(&path)
+        .with_context(|| format!("opening serve lock {}", path.display()))?;
+    use fs2::FileExt as _;
+    match file.try_lock_exclusive() {
+        Ok(()) => {
+            // Informational only: the flock is the guard, and this line names
+            // the holder in a later refusal message. Best-effort.
+            let _ = file
+                .set_len(0)
+                .and_then(|()| file.write_all(format!("pid={}\n", std::process::id()).as_bytes()));
+            tracing::info!(lock = %path.display(), "single-instance serve lock held");
+            Ok(Some(ServeLock { _file: file }))
+        }
+        Err(err) if crate::commands::hook_spool::is_drain_lock_busy_error(&err) => {
+            let holder = std::fs::read_to_string(&path)
+                .map(|text| text.trim().to_string())
+                .unwrap_or_default();
+            if force {
+                tracing::warn!(
+                    lock = %path.display(),
+                    holder = %holder,
+                    "another process holds the serve lock; continuing unguarded per --force"
+                );
+                return Ok(None);
+            }
+            anyhow::bail!(
+                "another ai-memory serve process appears to be using {} ({}); two servers on one data directory corrupt wiki and index state — stop the other process, or pass --force if you are certain it is gone",
+                data_dir.display(),
+                if holder.is_empty() {
+                    "holder unknown".to_owned()
+                } else {
+                    holder
+                },
+            )
+        }
+        Err(err) => {
+            tracing::warn!(
+                lock = %path.display(),
+                error = %err,
+                "cannot lock the data directory; running without the single-instance guard"
+            );
+            Ok(None)
+        }
+    }
+}
 
 fn validate_api_credential_pepper(api_credentials_exist: bool, auth: &AuthSettings) -> Result<()> {
     let pepper_present = auth
@@ -628,6 +703,11 @@ pub async fn run(config: &Config, args: ServeArgs) -> Result<()> {
     // Validation runs before binding so a misconfigured origin is caught early.
     let cors_origins = merge_cors_origins(&config.cors_allow_origins, &args.cors_allow_origin);
     validate_cors_origins(&cors_origins)?;
+
+    // Guard the data dir before anything opens it: a second serve process
+    // means a second writer actor, a second git handle on the wiki, and a
+    // second active-project pointer (#563). Held until `run` returns.
+    let _serve_lock = acquire_serve_lock(&config.data_dir, args.force)?;
 
     let store = Store::open(&config.data_dir)
         .with_context(|| format!("opening store at {}", config.data_dir.display()))?;
@@ -1384,6 +1464,36 @@ async fn start_maintenance_scheduler(
         }));
     }
 
+    // One-shot startup backfill (2.0): with an embedder present, pages
+    // written before it existed - a fresh upgrade onto the default local
+    // embedder, or a provider switch - get their vectors without any
+    // maintenance config. Skips already-embedded pages, so a settled
+    // store logs one cheap no-op pass. Runs in the background; startup
+    // is never blocked on it.
+    if let Some(embedder) = embedder.clone() {
+        let reader = reader.clone();
+        let writer = writer.clone();
+        let wiki = wiki.clone();
+        tasks.push(tokio::spawn(async move {
+            let started = std::time::Instant::now();
+            match run_scheduled_embedding_backfill_tick(&reader, &writer, &wiki, &embedder).await {
+                Ok(outcome) if outcome.embedded > 0 || outcome.failed > 0 || outcome.errors > 0 => {
+                    info!(
+                        scopes = outcome.scopes,
+                        embedded = outcome.embedded,
+                        skipped = outcome.skipped,
+                        failed = outcome.failed,
+                        errors = outcome.errors,
+                        elapsed_ms = started.elapsed().as_millis(),
+                        "startup embedding backfill completed"
+                    );
+                }
+                Ok(_) => {}
+                Err(e) => tracing::warn!(error = %e, "startup embedding backfill failed"),
+            }
+        }));
+    }
+
     if maintenance_enabled && embedding_backfill_interval_secs > 0 {
         if let Some(embedder) = embedder {
             let reader = reader.clone();
@@ -1429,6 +1539,13 @@ async fn start_maintenance_scheduler(
             require_approval: auto_improve.require_approval,
             min_session_age_secs: scheduler.min_session_age_secs,
             max_sessions_per_tick: scheduler.max_sessions_per_tick,
+            experience: (scheduler.experience_every_sessions > 0).then(|| {
+                ai_memory_consolidate::ExperienceConfig {
+                    sessions: scheduler.experience_sessions.max(1),
+                    min_new_sessions: scheduler.experience_every_sessions,
+                    ..ai_memory_consolidate::ExperienceConfig::default()
+                }
+            }),
         };
         match ai_memory_consolidate::initialize_auto_improve_scheduler_scopes(&reader, &writer)
             .await
@@ -1704,7 +1821,61 @@ async fn configure_embedder(
     let provider_name = cfg.provider.name().to_string();
     let model = cfg.model.clone();
     let dim = cfg.dim;
-    let embedder = build_embedder(cfg).context("building embedder from config")?;
+    let defaulted = cfg.defaulted;
+    // Local embeddings: fetch the model once, checksum-pinned, before
+    // the loader runs (docs/local-embeddings.md). Offline installs drop
+    // the files into models/ by hand and never hit the network.
+    if cfg.provider == ai_memory_llm::EmbedderChoice::Local
+        && let Some(models_dir) = cfg.models_dir.as_deref()
+        && !ai_memory_llm::model_present(models_dir)
+    {
+        if defaulted {
+            // Best-effort default (docs/local-embeddings.md): never
+            // block startup on an ~87 MB download. Fetch in the
+            // background; THIS boot runs without an embedder (the
+            // pre-2.0 behaviour), the next start finds the files and
+            // enables hybrid search. Offline hosts just log the warn.
+            let models_dir = models_dir.to_path_buf();
+            tokio::spawn(async move {
+                tracing::info!(
+                    dir = %models_dir.display(),
+                    "fetching the default local embedding model in the \
+                     background (~87 MB, one time); hybrid search enables \
+                     on the next start"
+                );
+                if let Err(e) = ai_memory_llm::fetch_model(&models_dir).await {
+                    tracing::warn!(
+                        error = %e,
+                        "default local embedding model fetch failed; running \
+                         without an embedder. Set embedding_provider = \"none\" \
+                         to opt out, or install offline per \
+                         docs/local-embeddings.md"
+                    );
+                }
+            });
+            return Ok((wiki, None));
+        }
+        tracing::info!(
+            dir = %models_dir.display(),
+            "local embedding model not present; fetching (~87 MB, one time)"
+        );
+        ai_memory_llm::fetch_model(models_dir).await.context(
+            "fetching the local embedding model (set up offline per \
+             docs/local-embeddings.md if this host has no network)",
+        )?;
+    }
+    let embedder = match build_embedder(cfg) {
+        Ok(e) => e,
+        Err(e) if defaulted => {
+            tracing::warn!(
+                error = %e,
+                "default local embeddings unavailable (model load failed); \
+                 continuing without an embedder"
+            );
+            return Ok((wiki, None));
+        }
+        Err(e) => return Err(e).context("building embedder from config"),
+    };
     let mismatch = store
         .reader
         .embedding_meta_for_mismatch(
@@ -1986,6 +2157,44 @@ mod tests {
             );
             tokio::task::yield_now().await;
         }
+    }
+
+    #[test]
+    fn second_server_on_the_same_data_dir_is_refused_and_names_the_holder() {
+        let dir = TempDir::new().unwrap();
+        let first = acquire_serve_lock(dir.path(), false).unwrap();
+        assert!(first.is_some());
+        let err = acquire_serve_lock(dir.path(), false)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("--force"),
+            "refusal must name the override: {err}"
+        );
+        assert!(
+            err.contains(&format!("pid={}", std::process::id())),
+            "refusal must name the holding process: {err}"
+        );
+    }
+
+    #[test]
+    fn force_starts_unguarded_while_the_holder_keeps_the_lock() {
+        let dir = TempDir::new().unwrap();
+        let _first = acquire_serve_lock(dir.path(), false).unwrap();
+        assert!(acquire_serve_lock(dir.path(), true).unwrap().is_none());
+        // --force bypasses the refusal, not the holder: a plain attempt still sees it.
+        assert!(acquire_serve_lock(dir.path(), false).is_err());
+    }
+
+    #[test]
+    fn a_released_serve_lock_does_not_lock_out_the_next_server() {
+        let dir = TempDir::new().unwrap();
+        {
+            let _first = acquire_serve_lock(dir.path(), false).unwrap();
+            // Dropping the holder is what process exit does to the flock: the
+            // leftover .serve.lock file must not outlive the lock it named.
+        }
+        assert!(acquire_serve_lock(dir.path(), false).unwrap().is_some());
     }
 
     #[test]
