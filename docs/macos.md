@@ -165,6 +165,114 @@ symlink caution above (#546) does not apply here.
 The published Docker image includes both `linux/amd64` and `linux/arm64`, so
 Apple Silicon pulls the native arm64 image without `--platform linux/amd64`.
 
+## Run as a Login Service (launchd)
+
+Every scenario above leaves the server in the foreground: close that terminal
+and capture stops. The macOS counterpart of a systemd user unit is a
+**LaunchAgent** — a plist in `~/Library/LaunchAgents/` that the per-user
+launchd domain starts at login and restarts on failure. The repo ships one at
+`packaging/launchd/com.github.akitaonrails.ai-memory.plist`, and the macOS
+release tarballs include it.
+
+launchd expands nothing. A plist has no home specifier and no
+`EnvironmentFile`, so every path in it is a literal and the template carries
+two placeholders you substitute at install time. Run this from the extracted
+tarball (Scenario A) or the repo root (Scenario B):
+
+```bash
+# launchd creates the log files but not their parent directory, and a missing
+# one is a silent redirect failure.
+mkdir -p ~/Library/Logs/ai-memory
+
+# Wherever you keep the binary: ~/Applications/ai-memory/ai-memory for a
+# release tarball, ./target/release/ai-memory for a source build.
+AI_MEMORY_BIN=~/Applications/ai-memory/ai-memory
+
+sed -e "s|__AI_MEMORY_BIN__|$AI_MEMORY_BIN|" \
+    -e "s|__HOME__|$HOME|" \
+    packaging/launchd/com.github.akitaonrails.ai-memory.plist \
+    > ~/Library/LaunchAgents/com.github.akitaonrails.ai-memory.plist
+
+launchctl bootstrap gui/$(id -u) \
+    ~/Library/LaunchAgents/com.github.akitaonrails.ai-memory.plist
+```
+
+The agent runs `ai-memory serve --transport http --enable-web` and passes
+neither `--data-dir` nor `--config`: on macOS the binary already defaults to
+`~/Library/Application Support/ai-memory` with the config file inside it, so
+naming them would only add two more paths to substitute. `bind` comes from that
+config, defaulting to `127.0.0.1:49374`. Re-render and reload the plist if you
+move the binary.
+
+Verify it came up:
+
+```bash
+launchctl print gui/$(id -u)/com.github.akitaonrails.ai-memory | grep state
+curl -s -o /dev/null -w '%{http_code}\n' http://127.0.0.1:49374/mcp   # 405
+tail -f ~/Library/Logs/ai-memory/stderr.log
+```
+
+### Coming from systemd
+
+| systemd `--user` | launchd (per-user domain) |
+|---|---|
+| `systemctl --user enable --now ai-memory` | `launchctl bootstrap gui/$(id -u) <plist>` |
+| `systemctl --user disable --now ai-memory` | `launchctl bootout gui/$(id -u)/<label>` |
+| `systemctl --user status ai-memory` | `launchctl print gui/$(id -u)/<label>` |
+| `systemctl --user restart ai-memory` | `launchctl kickstart -k gui/$(id -u)/<label>` |
+| `journalctl --user -u ai-memory -f` | `tail -f ~/Library/Logs/ai-memory/stderr.log` |
+| `loginctl enable-linger $USER` | no equivalent — a LaunchAgent stops at logout |
+| `EnvironmentFile=` | no equivalent — see the token note below |
+
+`<label>` is `com.github.akitaonrails.ai-memory`. After editing the plist,
+`bootout` then `bootstrap` again; `kickstart -k` only restarts the process and
+does not re-read the definition.
+
+### If you configure a bearer token
+
+`AI_MEMORY_AUTH_TOKEN` is read from the process environment only — it is not a
+`config.toml` key, and launchd has no `EnvironmentFile`. A single-user loopback
+setup needs no token at all. If you do set one, add it to your rendered plist
+and tighten the file, because `~/Library/LaunchAgents` is not private:
+
+```xml
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>AI_MEMORY_AUTH_TOKEN</key>
+    <string>…</string>
+  </dict>
+```
+
+```bash
+chmod 600 ~/Library/LaunchAgents/com.github.akitaonrails.ai-memory.plist
+```
+
+### Removing the agent
+
+```bash
+launchctl bootout gui/$(id -u)/com.github.akitaonrails.ai-memory
+rm ~/Library/LaunchAgents/com.github.akitaonrails.ai-memory.plist
+```
+
+Nothing rotates the two log files; they grow without bound. Add a
+`newsyslog.d` entry or truncate them periodically if that matters to you.
+
+> **Validated on** macOS 26.6.2 (build 25G83, Apple Silicon) with ai-memory
+> v1.38.0 installed per Scenario A, and separately with v1.21.0 to confirm the
+> agent does not depend on a recently added flag. Confirmed: `launchctl
+> bootstrap`; the job `running` with `last exit code = (never exited)` rather
+> than crash-looping; the launchd child (`PPID 1`) owning `127.0.0.1:49374`, so
+> the reply came from the agent rather than a foreground server left over on the
+> same port; `~/Library/Application Support/ai-memory` resolved and logged as
+> the data dir with no `--data-dir` passed; `405` from `GET /mcp` on the bound
+> port; `KeepAlive` — the served process was `SIGKILL`ed and a replacement was
+> answering about a second later, with `runs` incrementing; and a clean
+> `launchctl bootout`. Start-at-login was configured but not independently
+> exercised, since that needs a logout. `ThrottleInterval` is left at its 10s
+> default, so a crash within 10s of startup is respawned after that delay rather
+> than immediately. Corrections from anyone on a different macOS version are
+> welcome.
+
 ## Hook Platform on macOS
 
 `AI_MEMORY_HOOK_PLATFORM` selects how hook commands are rendered. On macOS the

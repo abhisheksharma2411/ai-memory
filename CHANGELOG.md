@@ -245,6 +245,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [1.39.0] - 2026-09-01
 
 ### Added
+- Added a per-user launchd agent for macOS at
+  `packaging/launchd/com.github.akitaonrails.ai-memory.plist`, the counterpart
+  of the systemd user unit, shipped in both macOS release tarballs and
+  documented in [`docs/macos.md`](docs/macos.md). Until now macOS had no
+  documented way to keep the server running once the terminal that started it
+  closed, which silently stopped hook delivery. (#569)
+
+  launchd expands nothing, so the template carries explicit
+  `__AI_MEMORY_BIN__` / `__HOME__` placeholders rather than a home specifier,
+  and passes neither `--data-dir` nor `--config` — both already resolve to the
+  macOS platform defaults. `ProcessType` is pinned to `Interactive` because
+  leaving it unset makes launchd throttle the job's CPU and I/O bandwidth,
+  which the hook ingress budget cannot absorb. A bearer token, if one is
+  configured at all, goes in the rendered plist's `EnvironmentVariables`:
+  launchd has no `EnvironmentFile` equivalent.
+
 - Added `ai-memory resume`, an interactive picker for recent managed
   workstreams from the current checkout and validated client-local links. It
   launches the selected named workstream with the established automatic harness
