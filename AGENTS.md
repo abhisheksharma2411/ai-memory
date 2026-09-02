@@ -411,8 +411,19 @@ Additional boundary rules:
   regression tests asserting every tool appears in both prompt surfaces.
   The tool count is currently 18 (see `docs/ARCHITECTURE.md`).
 - **Semantic versioning:** patch = fixes; minor = additive (new CLI
-  subcommands, MCP tools, config keys); major = breaking (on-disk format
-  without migration, removed subcommands, breaking MCP schema changes).
+  subcommands, MCP tools, config keys, a new agent harness or LLM
+  provider); major = breaking (on-disk format without migration, removed
+  subcommands, breaking MCP schema changes, big rewrites).
+- **Release cadence and ordering.** Batch tickets by semver impact and
+  ship fixes as a patch release promptly — never let a bug fix wait on
+  unreleased feature work. The `[Unreleased]` section signals the bump:
+  only `### Fixed` → patch; any `### Added` → minor; anything breaking →
+  major. Releases cut from `main` (trunk-based). If `main` already holds
+  unreleased feature work and a fix must ship, cut `release/X.Y` from
+  the last tag, cherry-pick the fix (it lands on `main` first, always),
+  tag from the branch, then let the branch go dormant — no standing
+  develop/gitflow branches. Bucket incoming work at triage with the
+  `breaking-change` label and version milestones.
 - Keep `CLAUDE.md` as a pointer to this file.
 
 ## Documentation map
