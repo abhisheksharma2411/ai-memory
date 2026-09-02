@@ -4043,7 +4043,34 @@ fn manual_agent_project_strategy_instruction(project_strategy: Option<&str>) -> 
 /// Errors propagate when source is missing, the staging dir
 /// can't be created, or any file copy fails.
 fn stage_hook_scripts(source_dir: &Path, agent_label: &str, data_dir: &Path) -> Result<PathBuf> {
-    stage_hook_scripts_in(source_dir, agent_label, data_dir)
+    stage_hook_scripts_in(
+        source_dir,
+        agent_label,
+        &hook_staging_root(data_dir, ai_memory_wiki::backup::running_in_container()),
+    )
+}
+
+/// Where hook scripts are staged — which is also the path written into
+/// the agent's settings, so it must be reachable by the process that
+/// EXECUTES the hooks: the host-side agent CLI.
+///
+/// - **Native installs**: the resolved data dir (`--data-dir` /
+///   `AI_MEMORY_DATA_DIR` / platform default), per #554.
+/// - **Inside a container** (the docker wrapper): the server data dir is
+///   a volume (`/data`) the host cannot execute from — staging there
+///   wrote container-only paths into the host's settings and every hook
+///   failed silently (#581). The wrapper binds `$HOME:$HOME` and reads
+///   staged hooks from `~/.local/share/ai-memory/hooks` (its
+///   `HOOKS_STAGE_DIR` contract), so the home-based default is the
+///   host-reachable location there.
+pub(crate) fn hook_staging_root(data_dir: &Path, in_container: bool) -> PathBuf {
+    if in_container {
+        dirs::data_local_dir()
+            .map(|d| d.join("ai-memory"))
+            .unwrap_or_else(|| data_dir.to_path_buf())
+    } else {
+        data_dir.to_path_buf()
+    }
 }
 
 fn stage_hook_scripts_in(source_dir: &Path, agent_label: &str, data_dir: &Path) -> Result<PathBuf> {
@@ -6719,6 +6746,32 @@ model = "gpt-5"
     /// scripts themselves source it with `. "$(dirname "$0")/_lib.sh"`
     /// and a missing helper would surface as a runtime "command not
     /// found" much further from the cause.
+    #[test]
+    /// #581: inside the docker wrapper the server data dir is a volume
+    /// the host cannot execute from; staging must fall back to the
+    /// home-based path the wrapper bind-mounts and reads. Natively, the
+    /// resolved data dir keeps winning (#554/#573).
+    #[test]
+    fn staging_root_leaves_the_container_volume_for_home() {
+        let data = Path::new("/data");
+        assert_eq!(
+            hook_staging_root(data, false),
+            PathBuf::from("/data"),
+            "native installs stage under the resolved data dir"
+        );
+        let in_container = hook_staging_root(data, true);
+        assert_ne!(
+            in_container,
+            PathBuf::from("/data"),
+            "container staging must not target the volume"
+        );
+        assert_eq!(
+            in_container,
+            dirs::data_local_dir().unwrap().join("ai-memory"),
+            "container staging targets the wrapper's bind-mounted home contract"
+        );
+    }
+
     #[test]
     fn stage_hook_scripts_copies_shared_lib_sh() {
         // Distinct agent_label per test: `stage_hook_scripts` writes

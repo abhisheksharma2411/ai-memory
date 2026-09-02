@@ -77,6 +77,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ||||||| a613bf6d
 ### Fixed
+- Docker-wrapper installs stage hook scripts back to the host-reachable
+  `~/.local/share/ai-memory/hooks` instead of the container's `/data`
+  volume (#581): the #554 change made staging follow the resolved data
+  dir, which inside the wrapper is a volume the host cannot execute
+  from — settings pointed at container-only paths and every hook failed
+  silently. Container runs now redirect staging to the wrapper's
+  bind-mounted home contract; native installs keep following
+  `--data-dir`/`AI_MEMORY_DATA_DIR` exactly as before.
 - Merging a project no longer reports a spurious content conflict when
   the only difference is `generated.at`: the merge comparison now uses
   the same modulo-timestamp projection as the store's idempotency rule.
