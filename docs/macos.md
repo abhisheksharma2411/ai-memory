@@ -72,14 +72,14 @@ Optionally, once hooks are wired, put the binary on `PATH` so later commands
 sudo ln -sf ~/Applications/ai-memory/ai-memory /usr/local/bin/ai-memory
 ```
 
-Do this *after* `install-hooks`, not before: on macOS `install-hooks`
-auto-discovers the sibling `hooks/` directory by walking up from the running
-binary's own path, and that walk does not currently resolve through a
-symlink (tracked in [#546](https://github.com/akitaonrails/ai-memory/issues/546)).
-Running `install-hooks` through the `/usr/local/bin` symlink instead of the
-extracted `./ai-memory` sends discovery to the wrong parent directories. On a
-machine with no prior ai-memory install (verified with a clean `$HOME`) this
-fails outright:
+As of v1.39.0, running `install-hooks` through the symlink works: hook
+discovery canonicalises the running binary's path before walking up to
+the sibling `hooks/` directory
+([#546](https://github.com/akitaonrails/ai-memory/issues/546), fixed in
+v1.39.0). **On v1.38.x or older**, the walk did not resolve through a
+symlink — running `install-hooks` via `/usr/local/bin/ai-memory` sent
+discovery to the wrong parent directories, failing outright on a clean
+machine:
 
 ```
 Error: could not locate hooks directory. Tried: ["/…/hooks/claude-code",
@@ -87,11 +87,10 @@ Error: could not locate hooks directory. Tried: ["/…/hooks/claude-code",
 "…/Library/Application Support/ai-memory/hooks/claude-code"]
 ```
 
-On a machine that already has a hooks cache under
-`~/Library/Application Support/ai-memory` from an earlier run, discovery can
-instead silently fall back to *that* — reporting success while wiring
-whatever hook version happens to be cached there, possibly not the one you
-just extracted. `ai-memory serve`/`status`/etc. are unaffected either way.
+— or, worse, silently wiring a stale hooks cache from
+`~/Library/Application Support/ai-memory` on a machine with an earlier
+install. If you are on an older release, run `install-hooks` via the
+extracted `./ai-memory` path (or upgrade).
 
 Notes:
 
@@ -100,9 +99,8 @@ Notes:
   `AI_MEMORY_AUTH_TOKEN` for the server, pass the same token with `--auth-token`
   or export it for CLI commands.
 - Keep the extracted `ai-memory` at a stable path; the hook commands (and the
-  symlink, if you made one) reference it. Re-run `install-hooks` — via the
-  extracted path, per the caution above — and re-point the symlink if you move
-  it.
+  symlink, if you made one) reference it. Re-run `install-hooks` and re-point
+  the symlink if you move it.
 
 ## Scenario B: Source Build
 
