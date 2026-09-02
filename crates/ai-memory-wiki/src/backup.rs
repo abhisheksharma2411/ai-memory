@@ -90,13 +90,24 @@ fn destination_dir(
             ))
         })?
     };
-    if dest == data_dir {
+    // Canonicalize both sides before comparing: `<data_dir>/.` or a
+    // symlinked spelling must not defeat the root guard (or the walk's
+    // self-exclusion, which compares against the path returned here).
+    let canonical_data = data_dir
+        .canonicalize()
+        .unwrap_or_else(|_| data_dir.to_path_buf());
+    let canonical_dest = if dest.exists() {
+        dest.canonicalize().unwrap_or_else(|_| dest.clone())
+    } else {
+        dest.clone()
+    };
+    if canonical_dest == canonical_data {
         return Err(WikiError::Io(std::io::Error::other(
             "the backup destination must not be the data dir root itself; \
              use a subdirectory (e.g. <data_dir>/backups) or a path outside it",
         )));
     }
-    Ok(dest)
+    Ok(canonical_dest)
 }
 
 /// Compress `data_dir` into a timestamped tar.gz in the destination dir,

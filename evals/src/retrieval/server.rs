@@ -87,7 +87,10 @@ impl EvalServer {
         .env_remove("LLM_API_KEY");
         match embeddings {
             EvalEmbeddings::None => {
-                cmd.env_remove("AI_MEMORY_EMBEDDING_PROVIDER");
+                // Explicit: with 2.0's default-on local embeddings, an
+                // UNSET provider would start a background model download
+                // per spawned server. The baseline must be hermetic.
+                cmd.env("AI_MEMORY_EMBEDDING_PROVIDER", "none");
             }
             EvalEmbeddings::Local => {
                 cmd.env("AI_MEMORY_EMBEDDING_PROVIDER", "local");

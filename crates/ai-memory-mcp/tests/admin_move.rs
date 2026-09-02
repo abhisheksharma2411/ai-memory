@@ -1812,7 +1812,19 @@ async fn copy_purge_rerun_is_idempotent() {
         json!({ "from_workspace": "src", "project": "proj", "to_workspace": "dst", "confirm": true }),
     )
     .await;
-    assert_eq!(r2.status(), StatusCode::OK);
+    // Flaky under heavy parallel load / on Windows (observed in the 2.0
+    // full-matrix run); keep the body in the failure so the next
+    // occurrence is diagnosable instead of a bare status assert.
+    let r2_status = r2.status();
+    if r2_status != StatusCode::OK {
+        let body = axum::body::to_bytes(r2.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        panic!(
+            "second move-project failed: {r2_status} {}",
+            String::from_utf8_lossy(&body)
+        );
+    }
 
     // Destination still holds exactly one of each path — no duplicates.
     let mut paths: Vec<String> = store

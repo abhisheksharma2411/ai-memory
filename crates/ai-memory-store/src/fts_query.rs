@@ -83,21 +83,32 @@ pub fn prepare_fts5_query(raw: &str) -> String {
 /// table (microseconds; search-path frequency, not ingest-path) so the
 /// judgement is the engine's, not a re-implementation of its grammar.
 fn fts5_query_parses(query: &str) -> bool {
-    let Ok(conn) = rusqlite::Connection::open_in_memory() else {
-        return false;
-    };
-    if conn
-        .execute_batch("CREATE VIRTUAL TABLE fts_probe USING fts5(title, body)")
-        .is_err()
-    {
-        return false;
+    thread_local! {
+        // One probe connection per thread: opening a fresh in-memory
+        // database per search query was measurable overhead on the
+        // read-pool hot path (post-audit nit).
+        static PROBE: Option<rusqlite::Connection> = {
+            let conn = rusqlite::Connection::open_in_memory().ok();
+            if let Some(c) = &conn
+                && c.execute_batch("CREATE VIRTUAL TABLE fts_probe USING fts5(title, body)")
+                    .is_err()
+            {
+                None
+            } else {
+                conn
+            }
+        };
     }
-    conn.query_row(
-        "SELECT count(*) FROM fts_probe WHERE fts_probe MATCH ?1",
-        [query],
-        |row| row.get::<_, i64>(0),
-    )
-    .is_ok()
+    PROBE.with(|probe| {
+        probe.as_ref().is_some_and(|conn| {
+            conn.query_row(
+                "SELECT count(*) FROM fts_probe WHERE fts_probe MATCH ?1",
+                [query],
+                |row| row.get::<_, i64>(0),
+            )
+            .is_ok()
+        })
+    })
 }
 
 /// English stopwords excluded from bare-query OR-joins. Deliberately

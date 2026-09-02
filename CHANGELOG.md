@@ -17,6 +17,103 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   is correct and stays; the torn write that triggered it is gone. Now routed
   through the same `write_atomic` (tmp + fsync + rename) the rest of the CLI
   already uses, per the project's atomic-writes invariant.
+||||||| parent of f14775e5 (fix: post-audit findings across the 2.0 range)
+- The 2.0 pre-release audit findings (post-merge adversarial review of
+  the whole range): `export-okf` no longer fails on real deployments —
+  scope manifests are OKF-typed at their writer (ending a startup
+  tug-of-war that reverted the migration's typing on the same boot and
+  self-healing manifests reverted by pre-fix binaries), approved
+  auto-improve pages land conformant like every other write (also
+  preventing phantom supersedes on the first reindex after a binary
+  upgrade), and `_pending/` proposal sidecars are excluded from the
+  export walk. Pages retired WITHOUT a successor (decay tombstones,
+  purge-regenerate, workspace merges) now close their entity-link
+  validity windows so `as_of` cannot resurrect retired knowledge, with
+  a V58 backfill for previously retired rows. The experience pass no
+  longer burns its cadence window or stages an empty run when a scope
+  has too few session pages. Backup destination guards canonicalize
+  paths; `as_of` parse errors return invalid-params; the FTS5 probe
+  connection is cached per thread.
+- `status` no longer overstates missing embeddings: empty-body pages —
+  which no embedder can ever cover and the backfill skips by rule — are
+  excluded from the "latest pages missing" figure and reported on their
+  own line (observed live as a permanently stuck 427).
+- Natural-language searches no longer surface stopword trash: bare
+  queries drop English stopwords before the FTS5 OR-join, so a page
+  containing five "the"s cannot outrank the page whose content matches,
+  and pages matching only stopwords no longer appear at all. Quoted
+  phrases and explicit-operator queries are untouched, and an
+  all-stopword query still searches its literal terms. Guarded by a
+  CI-runnable search-quality suite asserting ranking usefulness, not
+  just machinery.
+- `memory_query` no longer fails with `fts5: syntax error` when the query is
+  natural language containing parentheses, apostrophe-quoted phrases, or a
+  stray `OR`/`AND` (e.g. *"my visit to the Museum of Modern Art (MoMA) and
+  the 'Ancient Civilizations' exhibit"*). Prepared FTS5 queries are now
+  validated against the engine's own parser and degrade to an always-valid
+  quoted bag of words when the preserved operator form does not parse;
+  deliberate well-formed operator queries are preserved as before. Found by
+  the new LongMemEval retrieval harness on its first full run.
+
+- `ai-memory serve` now takes an exclusive lock on `<data-dir>/.serve.lock`
+  before opening the store, so a second server pointed at the same data
+  directory refuses at startup and names the holding process instead of
+  silently contending the single-writer actor, the wiki git handle, and the
+  active-project pointer. The OS releases the lock when the process exits,
+  so a crashed server never leaves the operator locked out; `--force` starts
+  unguarded for an operator who knows the previous server is gone, and a
+  filesystem that cannot lock at all downgrades the guard to a warning
+  instead of refusing to start. (#563)
+
+- `install-hooks` now writes the capture-mode opt-in atomically. It was
+  written in place, and every reader maps an unrecognised value onto
+  `denylist` — the less private mode — so a crash, a full disk or a killed
+  `ai-memory upgrade` mid-write left a truncated file that silently reverted
+  an `--capture-mode allowlist` opt-in to capture-by-default, which is exactly
+  what `persist_capture_mode` documents it must never do. The fallback itself
+  is correct and stays; the torn write that triggered it is gone. Now routed
+  through the same `write_atomic` (tmp + fsync + rename) the rest of the CLI
+  already uses, per the project's atomic-writes invariant.
+- `status` no longer overstates missing embeddings: empty-body pages —
+  which no embedder can ever cover and the backfill skips by rule — are
+  excluded from the "latest pages missing" figure and reported on their
+  own line (observed live as a permanently stuck 427).
+- Natural-language searches no longer surface stopword trash: bare
+  queries drop English stopwords before the FTS5 OR-join, so a page
+  containing five "the"s cannot outrank the page whose content matches,
+  and pages matching only stopwords no longer appear at all. Quoted
+  phrases and explicit-operator queries are untouched, and an
+  all-stopword query still searches its literal terms. Guarded by a
+  CI-runnable search-quality suite asserting ranking usefulness, not
+  just machinery.
+- `memory_query` no longer fails with `fts5: syntax error` when the query is
+  natural language containing parentheses, apostrophe-quoted phrases, or a
+  stray `OR`/`AND` (e.g. *"my visit to the Museum of Modern Art (MoMA) and
+  the 'Ancient Civilizations' exhibit"*). Prepared FTS5 queries are now
+  validated against the engine's own parser and degrade to an always-valid
+  quoted bag of words when the preserved operator form does not parse;
+  deliberate well-formed operator queries are preserved as before. Found by
+  the new LongMemEval retrieval harness on its first full run.
+
+- `ai-memory serve` now takes an exclusive lock on `<data-dir>/.serve.lock`
+  before opening the store, so a second server pointed at the same data
+  directory refuses at startup and names the holding process instead of
+  silently contending the single-writer actor, the wiki git handle, and the
+  active-project pointer. The OS releases the lock when the process exits,
+  so a crashed server never leaves the operator locked out; `--force` starts
+  unguarded for an operator who knows the previous server is gone, and a
+  filesystem that cannot lock at all downgrades the guard to a warning
+  instead of refusing to start. (#563)
+
+- `install-hooks` now writes the capture-mode opt-in atomically. It was
+  written in place, and every reader maps an unrecognised value onto
+  `denylist` — the less private mode — so a crash, a full disk or a killed
+  `ai-memory upgrade` mid-write left a truncated file that silently reverted
+  an `--capture-mode allowlist` opt-in to capture-by-default, which is exactly
+  what `persist_capture_mode` documents it must never do. The fallback itself
+  is correct and stays; the torn write that triggered it is gone. Now routed
+  through the same `write_atomic` (tmp + fsync + rename) the rest of the CLI
+  already uses, per the project's atomic-writes invariant.
 - `status` no longer overstates missing embeddings: empty-body pages —
   which no embedder can ever cover and the backfill skips by rule — are
   excluded from the "latest pages missing" figure and reported on their
@@ -144,6 +241,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   2.0+ binaries instead of silently mixing formats. See
   `docs/okf.md` and `docs/MIGRATION-2.0.md`.
 
+||||||| 7907fd4d
 ## [1.39.0] - 2026-09-01
 
 ### Added

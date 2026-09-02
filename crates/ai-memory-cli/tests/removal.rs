@@ -35,6 +35,7 @@ fn command_with_home(home: &Path) -> Command {
         .env("LOCALAPPDATA", local_app_data)
         .env("AI_MEMORY_HOME", home)
         .env("AI_MEMORY_DATA_DIR", home.join(".ai-memory-data"))
+        .env("AI_MEMORY_EMBEDDING_PROVIDER", "none")
         .env_remove("AI_MEMORY_SERVER_URL")
         .env_remove("AI_MEMORY_AUTH_TOKEN")
         // A host-level KIMI_CODE_HOME would pull uninstall's kimi-code

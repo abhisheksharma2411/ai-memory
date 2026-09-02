@@ -1990,6 +1990,14 @@ pub fn soft_delete_for_decay_if_latest(
         ],
     )?;
     if affected != 0 {
+        // Retirement is supersession for the entity timeline too: an
+        // open window on a tombstoned page made `as_of` resurrect
+        // retired knowledge forever (post-audit finding).
+        tx.execute(
+            "UPDATE entity_page_links SET superseded_at = ?1 \
+             WHERE page_id = ?2 AND superseded_at IS NULL",
+            params![now, expected_latest_id.as_bytes()],
+        )?;
         audit(
             &tx,
             "soft_delete_for_decay",
@@ -2992,6 +3000,12 @@ pub fn reorg_sessions(
     }
     // Graveyard only this workspace's latest pages; sibling workspaces may
     // have already-consolidated pages that must remain current.
+    tx.execute(
+        "UPDATE entity_page_links SET superseded_at = ?2 \
+         WHERE superseded_at IS NULL AND page_id IN ( \
+             SELECT id FROM pages WHERE workspace_id = ?1 AND is_latest = 1)",
+        params![workspace_id.as_bytes(), Timestamp::now().as_microsecond()],
+    )?;
     let pages_graveyarded: usize = tx.execute(
         "UPDATE pages SET is_latest = 0 WHERE workspace_id = ?1 AND is_latest = 1",
         params![workspace_id.as_bytes()],
@@ -4211,6 +4225,22 @@ pub fn move_session(
                 )? as u64;
             }
             PagesMode::Regenerate => {
+                // Close the retiring page's entity windows first (the
+                // predicate needs is_latest = 1, flipped just below).
+                tx.execute(
+                    &format!(
+                        "UPDATE entity_page_links SET superseded_at = ?4 \
+                         WHERE superseded_at IS NULL AND page_id IN ( \
+                             SELECT id FROM pages \
+                             WHERE {page_scope_sql} AND path = ?3 AND is_latest = 1)"
+                    ),
+                    params![
+                        page_scope_params.0,
+                        page_scope_params.1,
+                        page_path.as_str(),
+                        Timestamp::now().as_microsecond(),
+                    ],
+                )?;
                 summary.pages_regenerated = tx.execute(
                     &format!(
                         "UPDATE pages SET is_latest = 0 \
