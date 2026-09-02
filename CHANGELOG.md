@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+- The Windows PowerShell wrapper (`ai-memory.ps1`) no longer crashes with
+  `git.exe : fatal: not a git repository … NativeCommandError` when run
+  outside a git repository — which broke `ai-memory status` and every
+  non-repo invocation (#591). The wrapper's script-global
+  `$ErrorActionPreference = 'Stop'` turned the repo-root probe's
+  *redirected* native stderr into a terminating error under Windows
+  PowerShell 5.1; the probe now runs under a localized
+  `SilentlyContinue`, gates on `$LASTEXITCODE`, and restores the
+  preference, falling back to the working directory as before. The
+  unredirected Docker invocations were never affected.
+
 ## [2.0.1] - 2026-09-02
 
 ### Fixed
