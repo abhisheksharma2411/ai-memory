@@ -45,6 +45,13 @@ impl OpenCodeProvider {
         self.inner = self.inner.with_timeout_secs(secs);
         self
     }
+
+    /// Forward reasoning effort to the OpenAI-compatible Zen/Go client.
+    #[must_use]
+    pub fn with_reasoning_effort(mut self, effort: Option<crate::ReasoningEffort>) -> Self {
+        self.inner = self.inner.with_reasoning_effort(effort);
+        self
+    }
 }
 
 #[async_trait]

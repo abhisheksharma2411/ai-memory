@@ -10,7 +10,7 @@ use std::path::{Path, PathBuf};
 
 use ai_memory_llm::{
     AuthRequirement, EmbedderChoice, EmbedderConfig, LlmError, LlmResult, OPENCODE_DEFAULT_MODEL,
-    ProviderAuth, ProviderChoice, ProviderConfig,
+    ProviderAuth, ProviderChoice, ProviderConfig, ReasoningEffort,
 };
 use anyhow::{Context, Result};
 use figment::{
@@ -170,6 +170,14 @@ pub struct Config {
     /// ceiling (observed with free aggregator tiers). Set with
     /// `AI_MEMORY_LLM_TIMEOUT_SECS`.
     pub llm_timeout_secs: u64,
+    /// Optional reasoning / thinking effort. Omitted when unset so the
+    /// model default applies. Env: `AI_MEMORY_LLM_REASONING_EFFORT`.
+    /// Values: `none`, `minimal`, `low`, `medium`, `high`, `xhigh`,
+    /// `max`, `ultra`, `persistent`. Each provider maps this to its
+    /// native request field (OpenAI `reasoning_effort`, OpenRouter
+    /// `reasoning`, xAI Grok `reasoning_effort`, Anthropic
+    /// `output_config.effort`, Codex `reasoning.effort`).
+    pub llm_reasoning_effort: Option<ReasoningEffort>,
     /// Opt-in: run LLM consolidation on SessionEnd (in addition to the
     /// always-written heuristic session page), when an LLM provider is
     /// configured. Off by default. Provider work is durably queued after the
@@ -625,6 +633,7 @@ impl Default for Config {
             llm_base_url: None,
             llm_compat_strict: true,
             llm_timeout_secs: ai_memory_llm::DEFAULT_REQUEST_TIMEOUT_SECS,
+            llm_reasoning_effort: None,
             consolidate_on_session_end: false,
             capture_assistant: false,
             strip_root_combinators: false,
@@ -1023,7 +1032,6 @@ impl Config {
                 config.llm_timeout_secs
             );
         }
-
         validate_auth_secrets(&config.auth)?;
 
         Ok(config)
@@ -1092,6 +1100,7 @@ impl Config {
                 .or_else(|| self.runtime_env.llm_base_url.clone()),
             compat_strict: self.llm_compat_strict,
             request_timeout_secs: self.llm_timeout_secs,
+            reasoning_effort: self.llm_reasoning_effort,
         }))
     }
 
@@ -1602,6 +1611,7 @@ mod tests {
         clear_hook_auth_token(&dd).expect("clearing twice must not error");
     }
     use super::*;
+    use rstest::rstest;
     use secrecy::{ExposeSecret, SecretString};
     use tempfile::TempDir;
 
@@ -1876,6 +1886,35 @@ mod tests {
         assert!(
             error.to_string().contains("llm_timeout_secs"),
             "unexpected error: {error:#}"
+        );
+    }
+
+    fn load_reasoning_effort(raw: &str) -> anyhow::Result<Config> {
+        let tmp = TempDir::new().unwrap();
+        let config_path = tmp.path().join("config.toml");
+        std::fs::write(&config_path, format!("llm_reasoning_effort = \"{raw}\"\n")).unwrap();
+        Config::load(Some(&config_path), Some(tmp.path().to_path_buf()))
+    }
+
+    #[rstest]
+    #[case::none("none", ReasoningEffort::None)]
+    #[case::low("low", ReasoningEffort::Low)]
+    #[case::high("high", ReasoningEffort::High)]
+    fn load_accepts_reasoning_effort(#[case] raw: &str, #[case] expected: ReasoningEffort) {
+        let cfg = load_reasoning_effort(raw).unwrap();
+        assert_eq!(cfg.llm_reasoning_effort, Some(expected));
+    }
+
+    #[rstest]
+    #[case::unknown("ludicrous")]
+    #[case::uppercase("HIGH")]
+    fn load_rejects_invalid_reasoning_effort(#[case] raw: &str) {
+        let error =
+            load_reasoning_effort(raw).expect_err("invalid reasoning effort must fail closed");
+        let rendered = format!("{error:#}");
+        assert!(
+            rendered.contains("llm_reasoning_effort") && rendered.contains("unknown variant"),
+            "unexpected error: {rendered}"
         );
     }
 
@@ -2416,6 +2455,26 @@ mod tests {
             provider.auth.require_openai_oauth_token_file().unwrap(),
             tmp.path().join("auth.json")
         );
+        assert_eq!(provider.reasoning_effort, None);
+    }
+
+    #[rstest]
+    #[case::unset(None)]
+    #[case::low(Some(ReasoningEffort::Low))]
+    #[case::none_wire(Some(ReasoningEffort::None))]
+    fn openai_oauth_provider_config_forwards_reasoning_effort(
+        #[case] effort: Option<ReasoningEffort>,
+    ) {
+        let tmp = TempDir::new().unwrap();
+        let cfg = Config {
+            data_dir: tmp.path().to_path_buf(),
+            llm_provider: Some("openai-oauth".into()),
+            llm_reasoning_effort: effort,
+            ..Config::default()
+        };
+
+        let provider = cfg.llm_provider_config().unwrap().unwrap();
+        assert_eq!(provider.reasoning_effort, effort);
     }
 
     #[test]

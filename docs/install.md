@@ -1485,7 +1485,7 @@ If you set only the provider, ai-memory picks a sensible default:
 | `AI_MEMORY_LLM_PROVIDER=anthropic` | `claude-haiku-4-5` | **Recommended default.** Best balance of speed, restraint, and classification quality. Not a reasoning model. Consistently classifies durable project rules as `kind: rule`. |
 | `AI_MEMORY_LLM_PROVIDER=anthropic-oauth` | `claude-sonnet-4-6` | Anthropic via Claude subscription. Run `claude setup-token` once; set `ANTHROPIC_OAUTH_TOKEN` (or `CLAUDE_CODE_OAUTH_TOKEN`). No `ANTHROPIC_API_KEY` needed. Same `/v1/messages` endpoint, Bearer token auth. |
 | `AI_MEMORY_LLM_PROVIDER=openai` | `gpt-5.4-mini` | Cheaper + faster alternative. Same parse reliability; mild over-classification on thin sessions. |
-| `AI_MEMORY_LLM_PROVIDER=openai-oauth` | `gpt-5.5` | ChatGPT/Codex backend. Run `ai-memory auth login openai-oauth` once; ai-memory stores the refresh token in `<data_dir>/auth.json` and refreshes access tokens automatically. |
+| `AI_MEMORY_LLM_PROVIDER=openai-oauth` | `gpt-5.5` | ChatGPT/Codex backend. Run `ai-memory auth login openai-oauth` once; ai-memory stores the refresh token in `<data_dir>/auth.json` and refreshes access tokens automatically. Optional `AI_MEMORY_LLM_REASONING_EFFORT` (`none`/`minimal`/`low`/`medium`/`high`/`xhigh`/`max`/`ultra`/`persistent`) is mapped to each provider's native reasoning field; omit it to keep the model default. |
 | `AI_MEMORY_LLM_PROVIDER=copilot` | `gpt-5.5` | GitHub Copilot Chat backend. ai-memory stores a GitHub user token in `<data_dir>/auth.json`, exchanges it for a short-lived Copilot API token, and refreshes before expiry. |
 | `AI_MEMORY_LLM_PROVIDER=gemini` | `gemini-3.5-flash` | Google's hosted option with a generous free tier. ai-memory disables Gemini 3.5 Flash's default dynamic thinking so hidden thought tokens do not truncate strict JSON. Set `GEMINI_API_KEY` (or `GOOGLE_API_KEY`). |
 | `AI_MEMORY_LLM_PROVIDER=opencode` | `claude-sonnet-4-6` | [OpenCode Zen/Go](https://opencode.ai) cloud API — OpenAI-compatible endpoint at `opencode.ai/zen/go/v1`. Set `OPENCODE_API_KEY` (key from `opencode.ai/auth`). Alias: `opencode-zen`. |
@@ -1627,8 +1627,10 @@ Use `ai-memory auth status` to check whether a token is present and
 > summarisation tasks, not hard reasoning — a mini-class model is plenty and
 > is much easier on subscription rate limits. Set e.g.
 > `AI_MEMORY_LLM_MODEL=gpt-5-mini` (the `gpt-5.5` default works but is
-> overkill for this workload). Reserve the high-effort reasoning models for
-> your coding agent.
+> overkill for this workload). If you stay on a reasoning model, set
+> `AI_MEMORY_LLM_REASONING_EFFORT=none` or `low` so hidden thought tokens
+> do not eat the JSON budget. Reserve high-effort reasoning for your
+> coding agent.
 
 ### GitHub Copilot
 
@@ -1685,6 +1687,17 @@ required. For OpenRouter (Kimi, DeepSeek, etc.):
 -e AI_MEMORY_LLM_MODEL=moonshotai/kimi-k2.6
 -e LLM_API_KEY=sk-or-v1-...
 ```
+
+`AI_MEMORY_LLM_REASONING_EFFORT` is honoured on this path: OpenRouter hosts
+send `reasoning: { effort, exclude: true }`; `https://api.x.ai` (Grok)
+sends Chat Completions `reasoning_effort` (clamped to `low`/`medium`/`high`/
+`xhigh`, because Grok cannot disable reasoning); other compat endpoints send
+OpenAI-style `reasoning_effort`. Anthropic and Anthropic-OAuth map the same
+key to `output_config.effort` and adaptive/disabled thinking on models that
+accept those fields (Haiku 4.5 omits them so the default model does not 400;
+Fable 5 / Mythos 5 / Mythos Preview omit `thinking: disabled` because those
+models reject it). `ultra` and `persistent` clamp to `max` on OpenAI-style
+hosts. Gemini and Copilot ignore the key.
 
 [Atlas Cloud](https://www.atlascloud.ai/models/qwen/qwen3.5-flash) uses the
 same provider; no Atlas-specific ai-memory provider is needed. Pass its API key

@@ -7,6 +7,75 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- `status` tells more of the truth (2.0 status audit): the wiki-format
+  line (OKF migration state and the pre-migration backup archive while
+  it exists), stored embedding triples by provider/model/dim, typed-edge
+  counts by relation, and a write-queue depth gauge that surfaces a
+  backpressured (wedged) writer — shown only when non-zero.
+- An opt-in cross-session "experience" pass
+  (`[auto_improve.scheduler] experience_every_sessions`): every N newly
+  completed sessions, the last few session summaries are reviewed side
+  by side and knowledge visible only ACROSS trajectories — repeated
+  workflows, re-stated preferences, architecture facts every session
+  re-discovers, contradictions with stored decisions — is proposed
+  through the identical schema-constrained, validated, eval-gated,
+  pending-writes staging path as per-session auto-improve. Evidence
+  must span at least two sessions; off by default and LLM-hosted, so
+  the zero-LLM path is untouched. See `docs/experience.md`.
+- `AI_MEMORY_EMBEDDING_PROVIDER=local` — in-process sentence embeddings
+  (pure-Rust candle BERT, `all-MiniLM-L6-v2`, 384-dim) with no API key
+  and no external server. The ~87 MB model is fetched once into
+  `<data_dir>/models/` with source-pinned sha256s (offline installs drop
+  the files in manually); vectors coexist with any provider's via the
+  stored `(provider, model, dim)` triple, and switching is a config
+  change. Feature-gated (`local-embeddings`, default on). The eval
+  harness gained `--embeddings local` and publishes the hybrid
+  LongMemEval row next to the zero-LLM baseline. See
+  `docs/local-embeddings.md`.
+- The entity index carries ingestion-time validity windows
+  (bi-temporal-lite): entity links open at their page version's creation
+  and close when the version is superseded, backfilled for existing
+  stores by an additive migration. `memory_query` gains an `as_of`
+  ISO-8601 argument that turns the call into an entity-timeline lookup —
+  "what did we know about X then" — returning the page versions valid at
+  that instant, including ones superseded since. Ingestion time only,
+  documented honestly as such. See `docs/temporal.md`.
+- Pages can declare typed relation edges in `relations:` frontmatter —
+  a closed `causes` / `fixes` / `contradicts` vocabulary riding the
+  existing `links.link_type` column (no schema migration). Declared
+  `contradicts` edges surface as zero-LLM `contradiction` lint findings
+  (including stale declarations whose target no longer resolves), and
+  the session-end consolidation prompt may emit relations under the
+  same schema-constrained vocabulary. See `docs/typed-edges.md`.
+- `ai-memory export-okf --project <p> -o <bundle.tar.gz>` and
+  `POST /admin/export-okf` — stream one project's wiki as a validated
+  OKF v0.2 bundle with a freshly generated index; a non-conformant page
+  fails the export. Importing needs no command: unpack a bundle's
+  concept files into a project's wiki directory and the watcher (or
+  `reindex`) ingests them.
+- Added a LongMemEval retrieval benchmark to the evaluation harness
+  (`cargo run -p ai-memory-eval -- retrieval`). It drives a real
+  `ai-memory serve` subprocess end to end: haystack chat histories replay
+  through `POST /hook/batch` at the production hook cadence, questions run
+  through MCP `memory_query`, and results are scored session-level
+  (`hit@k` / `recall@k` per question category, abstention questions
+  reported separately). The 278 MB dataset is fetched on demand with a
+  pinned sha256; baselines are published under `docs/benchmarks/`. The
+  existing LLM A/B harness moved to the `ab` subcommand.
+- `llm_reasoning_effort` / `AI_MEMORY_LLM_REASONING_EFFORT` is a typed
+  enum (`none`, `minimal`, `low`, `medium`, `high`, `xhigh`, `max`,
+  `ultra`, `persistent`); unknown values fail at config load. Unset keeps
+  the model default. Each chat provider maps the value to its native
+  field: OpenAI `reasoning_effort`, OpenRouter `reasoning.effort`,
+  xAI Grok `reasoning_effort`, Anthropic `output_config.effort` (plus
+  adaptive/disabled thinking on models that accept it), and Codex
+  Responses `reasoning.effort`. Gemini and Copilot ignore the key.
+  Host-unsupported values are clamped (`ultra`/`persistent` → `max` on
+  OpenAI/OpenRouter/Codex; Anthropic `xhigh`/`max` per model; `none`
+  does not send `thinking: disabled` on always-on Claude models).
+
+||||||| a613bf6d
 ### Fixed
 - Merging a project no longer reports a spurious content conflict when
   the only difference is `generated.at`: the merge comparison now uses
@@ -158,62 +227,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   ai-memory's own entries. Legacy ai-memory script and native hook commands
   remain recognized by their specific hook signatures.
 ||||||| a613bf6d
-### Added
-- `status` tells more of the truth (2.0 status audit): the wiki-format
-  line (OKF migration state and the pre-migration backup archive while
-  it exists), stored embedding triples by provider/model/dim, typed-edge
-  counts by relation, and a write-queue depth gauge that surfaces a
-  backpressured (wedged) writer — shown only when non-zero.
-- An opt-in cross-session "experience" pass
-  (`[auto_improve.scheduler] experience_every_sessions`): every N newly
-  completed sessions, the last few session summaries are reviewed side
-  by side and knowledge visible only ACROSS trajectories — repeated
-  workflows, re-stated preferences, architecture facts every session
-  re-discovers, contradictions with stored decisions — is proposed
-  through the identical schema-constrained, validated, eval-gated,
-  pending-writes staging path as per-session auto-improve. Evidence
-  must span at least two sessions; off by default and LLM-hosted, so
-  the zero-LLM path is untouched. See `docs/experience.md`.
-- `AI_MEMORY_EMBEDDING_PROVIDER=local` — in-process sentence embeddings
-  (pure-Rust candle BERT, `all-MiniLM-L6-v2`, 384-dim) with no API key
-  and no external server. The ~87 MB model is fetched once into
-  `<data_dir>/models/` with source-pinned sha256s (offline installs drop
-  the files in manually); vectors coexist with any provider's via the
-  stored `(provider, model, dim)` triple, and switching is a config
-  change. Feature-gated (`local-embeddings`, default on). The eval
-  harness gained `--embeddings local` and publishes the hybrid
-  LongMemEval row next to the zero-LLM baseline. See
-  `docs/local-embeddings.md`.
-- The entity index carries ingestion-time validity windows
-  (bi-temporal-lite): entity links open at their page version's creation
-  and close when the version is superseded, backfilled for existing
-  stores by an additive migration. `memory_query` gains an `as_of`
-  ISO-8601 argument that turns the call into an entity-timeline lookup —
-  "what did we know about X then" — returning the page versions valid at
-  that instant, including ones superseded since. Ingestion time only,
-  documented honestly as such. See `docs/temporal.md`.
-- Pages can declare typed relation edges in `relations:` frontmatter —
-  a closed `causes` / `fixes` / `contradicts` vocabulary riding the
-  existing `links.link_type` column (no schema migration). Declared
-  `contradicts` edges surface as zero-LLM `contradiction` lint findings
-  (including stale declarations whose target no longer resolves), and
-  the session-end consolidation prompt may emit relations under the
-  same schema-constrained vocabulary. See `docs/typed-edges.md`.
-- `ai-memory export-okf --project <p> -o <bundle.tar.gz>` and
-  `POST /admin/export-okf` — stream one project's wiki as a validated
-  OKF v0.2 bundle with a freshly generated index; a non-conformant page
-  fails the export. Importing needs no command: unpack a bundle's
-  concept files into a project's wiki directory and the watcher (or
-  `reindex`) ingests them.
-- Added a LongMemEval retrieval benchmark to the evaluation harness
-  (`cargo run -p ai-memory-eval -- retrieval`). It drives a real
-  `ai-memory serve` subprocess end to end: haystack chat histories replay
-  through `POST /hook/batch` at the production hook cadence, questions run
-  through MCP `memory_query`, and results are scored session-level
-  (`hit@k` / `recall@k` per question category, abstention questions
-  reported separately). The 278 MB dataset is fetched on demand with a
-  pinned sha256; baselines are published under `docs/benchmarks/`. The
-  existing LLM A/B harness moved to the `ab` subcommand.
 ### Changed
 - Hybrid retrieval is on by default: an install with no
   `embedding_provider` configured now gets in-process local embeddings

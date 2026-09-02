@@ -157,6 +157,7 @@ async-trait = "0.1"
 
 # Testing.
 tempfile = "3"
+rstest = "0.26"
 
 [workspace.lints.rust]
 unsafe_code = "forbid"

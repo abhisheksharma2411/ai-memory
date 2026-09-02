@@ -107,6 +107,14 @@ impl OpenAiCompatProvider {
         self.inner = self.inner.with_timeout_secs(secs);
         self
     }
+
+    /// Forward reasoning effort to the inner Chat Completions client.
+    /// OpenRouter and xAI hosts use their native request shapes.
+    #[must_use]
+    pub fn with_reasoning_effort(mut self, effort: Option<crate::ReasoningEffort>) -> Self {
+        self.inner = self.inner.with_reasoning_effort(effort);
+        self
+    }
 }
 
 #[async_trait]

@@ -103,6 +103,12 @@ pub struct ProviderConfig {
     /// Sourced once from `AI_MEMORY_LLM_TIMEOUT_SECS` by `Config::load`;
     /// defaults to [`crate::DEFAULT_REQUEST_TIMEOUT_SECS`].
     pub request_timeout_secs: u64,
+    /// Optional reasoning / thinking effort. Each provider maps this to
+    /// its native request field (OpenAI `reasoning_effort`, OpenRouter
+    /// `reasoning`, xAI Grok `reasoning_effort`, Anthropic
+    /// `output_config.effort`, Codex `reasoning.effort`). `None` omits
+    /// the field so the model default applies. Gemini and Copilot ignore it.
+    pub reasoning_effort: Option<crate::ReasoningEffort>,
 }
 
 /// Embedding providers available to ai-memory.
@@ -261,13 +267,17 @@ pub fn build_provider(config: ProviderConfig) -> LlmResult<Arc<dyn LlmProvider>>
         ProviderChoice::Anthropic => {
             let key = config.auth.require_api_key()?;
             Ok(Arc::new(
-                AnthropicProvider::new(key, config.model)?.with_timeout_secs(timeout),
+                AnthropicProvider::new(key, config.model)?
+                    .with_timeout_secs(timeout)
+                    .with_reasoning_effort(config.reasoning_effort),
             ))
         }
         ProviderChoice::OpenAi => {
             let key = config.auth.require_api_key()?;
             Ok(Arc::new(
-                OpenAiProvider::new(key, config.model)?.with_timeout_secs(timeout),
+                OpenAiProvider::new(key, config.model)?
+                    .with_timeout_secs(timeout)
+                    .with_reasoning_effort(config.reasoning_effort),
             ))
         }
         ProviderChoice::Gemini => {
@@ -285,13 +295,16 @@ pub fn build_provider(config: ProviderConfig) -> LlmResult<Arc<dyn LlmProvider>>
             Ok(Arc::new(
                 OpenAiCompatProvider::new(base, config.auth.optional_api_key(), config.model)?
                     .with_strict(config.compat_strict)
-                    .with_timeout_secs(timeout),
+                    .with_timeout_secs(timeout)
+                    .with_reasoning_effort(config.reasoning_effort),
             ))
         }
         ProviderChoice::OpenAiOAuth => {
             let path = config.auth.require_openai_oauth_token_file()?.to_path_buf();
             Ok(Arc::new(
-                OpenAiOAuthProvider::new(path, config.model)?.with_timeout_secs(timeout),
+                OpenAiOAuthProvider::new(path, config.model)?
+                    .with_timeout_secs(timeout)
+                    .with_reasoning_effort(config.reasoning_effort),
             ))
         }
         ProviderChoice::Copilot => {
@@ -306,12 +319,18 @@ pub fn build_provider(config: ProviderConfig) -> LlmResult<Arc<dyn LlmProvider>>
             if let Some(url) = config.base_url {
                 provider = provider.with_base_url(url);
             }
-            Ok(Arc::new(provider.with_timeout_secs(timeout)))
+            Ok(Arc::new(
+                provider
+                    .with_timeout_secs(timeout)
+                    .with_reasoning_effort(config.reasoning_effort),
+            ))
         }
         ProviderChoice::OpenCode => {
             let key = config.auth.require_api_key()?;
             Ok(Arc::new(
-                OpenCodeProvider::new(key, config.model)?.with_timeout_secs(timeout),
+                OpenCodeProvider::new(key, config.model)?
+                    .with_timeout_secs(timeout)
+                    .with_reasoning_effort(config.reasoning_effort),
             ))
         }
     }
@@ -370,6 +389,7 @@ mod tests {
             base_url: None,
             compat_strict: false,
             request_timeout_secs: crate::DEFAULT_REQUEST_TIMEOUT_SECS,
+            reasoning_effort: None,
         };
 
         let err = match build_provider(cfg) {

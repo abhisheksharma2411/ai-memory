@@ -357,6 +357,10 @@ impl From<ResolvedConfig> for ProviderConfig {
             // same schema-constrained path operators receive.
             compat_strict: true,
             request_timeout_secs: ai_memory_llm::DEFAULT_REQUEST_TIMEOUT_SECS,
+            // The A/B harness compares consolidation quality; reasoning
+            // effort stays at each model's own default unless a future
+            // flag threads it through.
+            reasoning_effort: None,
         }
     }
 }
