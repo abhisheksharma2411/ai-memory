@@ -50,9 +50,10 @@ pub use error::{StoreError, StoreResult};
 pub use maintenance::MaintenanceJob;
 pub use ops::{
     AdmittedSession, CompactSummary, Compaction, DeleteWorkspaceSummary, EmbedOutcome,
-    EmbeddingWrite, HookSessionAdmission, IngestObservationOutcome, LifecycleOnlyEndOutcome,
-    MoveSessionSummary, MoveSummary, ObservationPruneOutcome, OkfMigratedPage, PagesMode,
-    PurgeSessionSummary, PurgeSummary, ReorgSummary, purge_session, record_embed_failure,
+    EmbeddingWrite, EntityBackfillSummary, HookSessionAdmission, IngestObservationOutcome,
+    LifecycleOnlyEndOutcome, MoveSessionSummary, MoveSummary, ObservationPruneOutcome,
+    OkfMigratedPage, PagesMode, PurgeSessionSummary, PurgeSummary, ReorgSummary,
+    backfill_entity_index, purge_session, record_embed_failure,
 };
 pub use reader::{
     ActivityWindow, AgentSessionCount, AuditEvent, AuditLogFilter, AutoImproveCandidateSession,
@@ -131,6 +132,23 @@ impl Store {
         conn.pragma_update(None, "foreign_keys", "OFF")?;
         migrations::run(&mut conn)?;
         conn.pragma_update(None, "foreign_keys", "ON")?;
+
+        // One-shot, idempotent entity-index backfill (docs/temporal.md).
+        // Populates entities/entity_page_links from existing frontmatter
+        // for pages that predate entity extraction, so the entity
+        // retrieval stream and `as_of` timelines work on an upgraded
+        // store without a manual reindex. A store already populated
+        // through the write path finds no candidate pages and returns
+        // immediately. Runs single-threaded here, before the writer actor
+        // spawns, so it completes before the server accepts traffic.
+        let entity_backfill = ops::backfill_entity_index(&mut conn)?;
+        if entity_backfill.links_added > 0 {
+            tracing::info!(
+                pages = entity_backfill.pages_backfilled,
+                links = entity_backfill.links_added,
+                "entity index backfilled from existing frontmatter"
+            );
+        }
 
         let writer = WriterHandle::spawn(conn);
         let reader = ReaderPool::new(&db_path, READER_POOL_SOFT_CAP)?;
@@ -6402,6 +6420,68 @@ mod tests {
             .await
             .unwrap();
         assert!(before.is_empty(), "{before:?}");
+    }
+
+    /// End to end: a page written with only `tags` (no explicit
+    /// `entities`) — the shape of essentially every page on a mature
+    /// store — has no entity index until the one-shot startup backfill
+    /// runs, after which both the entity retrieval stream and `as_of`
+    /// find it. This is the fix that made `as_of` do anything on a real
+    /// deployment (docs/temporal.md).
+    #[tokio::test]
+    async fn startup_backfill_lets_as_of_find_tag_only_pages() {
+        let tmp = TempDir::new().unwrap();
+        let created;
+        let (ws, proj, page_id) = {
+            let store = Store::open(tmp.path()).unwrap();
+            let ws = store
+                .writer
+                .get_or_create_workspace("default")
+                .await
+                .unwrap();
+            let proj = store
+                .writer
+                .get_or_create_project(ws, "temporal", None)
+                .await
+                .unwrap();
+
+            let mut p = sample_page(ws, proj, "concepts/writer.md", "the writer actor");
+            p.frontmatter_json = serde_json::json!({"tags": ["SQLite"]});
+            p.entities = Vec::new();
+            let id = store.writer.upsert_page(p).await.unwrap();
+
+            // Nothing in the entity index yet — the pre-fix state.
+            let none = store
+                .reader
+                .entity_hits_for_project(ws, proj, "sqlite", 10, None)
+                .await
+                .unwrap();
+            assert!(none.is_empty(), "no entities before backfill: {none:?}");
+            created = jiff::Timestamp::now().as_microsecond();
+            (ws, proj, id)
+            // `store` drops here: the writer thread joins and the WAL flushes.
+        };
+
+        // Reopen: `Store::open` runs the one-shot entity backfill.
+        let store = Store::open(tmp.path()).unwrap();
+
+        let now = store
+            .reader
+            .entity_hits_for_project(ws, proj, "sqlite", 10, None)
+            .await
+            .unwrap();
+        assert_eq!(now.len(), 1, "backfill populated the entity index: {now:?}");
+        assert_eq!(now[0].hit.id, page_id);
+
+        // `as_of` an instant after the page was written finds it too — the
+        // window opened at the version's creation.
+        let later = store
+            .reader
+            .entity_hits_for_project_at(ws, proj, "sqlite", 10, None, Some(created + 1))
+            .await
+            .unwrap();
+        assert_eq!(later.len(), 1, "{later:?}");
+        assert_eq!(later[0].hit.id, page_id);
     }
 
     /// Post-audit regression: retirement WITHOUT a successor (a decay

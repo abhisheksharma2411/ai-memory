@@ -1980,30 +1980,48 @@ struct IndexMetadata {
     entities: Vec<String>,
 }
 
-/// Parse the optional frontmatter `entities:` list — salient nouns the
-/// consolidator extracted, indexed by the store as a retrieval stream.
+/// Derive a page's indexed entities — the salient nouns it is *about* —
+/// from its frontmatter, for the entity retrieval stream and the `as_of`
+/// entity-timeline queries (docs/temporal.md).
 ///
-/// Unlike `expires_at`, malformed entries are *dropped* rather than
-/// rejected: entities are a soft ranking signal, and refusing a whole
-/// page write because one hand-edited entity is 80 characters long
-/// would trade a real page for a marginal signal. A non-array value is
-/// still an error — that's a structural mistake, not a bad item.
+/// Two sources, merged and normalised:
+///
+/// 1. The explicit `entities:` list an LLM consolidator emits when it
+///    runs. Highest precision, but absent on the bulk of a real store —
+///    bootstrapped pages predate it and stable pages are never
+///    re-consolidated, so relying on it alone leaves the entity index
+///    (and therefore `as_of`) empty on any mature deployment.
+/// 2. The frontmatter `tags:` list, which nearly every page carries and
+///    which is, by construction, "what this page is about" — the same
+///    thing entities are meant to capture. Deriving from tags populates
+///    the index deterministically, with no LLM and no re-consolidation,
+///    for the whole corpus. Broad tags do not distort ranking: the
+///    entity stream weights each match by inverse page-frequency, so a
+///    tag shared by many pages contributes proportionally little.
+///
+/// Explicit entities come first so they win the per-page cap
+/// ([`normalize_entities`] dedupes and bounds the result). A non-array
+/// `entities` value is still a structural error; `tags` is treated
+/// leniently (a malformed or missing list simply contributes nothing),
+/// because a bad tag must never fail a page write.
 pub(crate) fn parse_entities(
     path: &PagePath,
     frontmatter: &serde_json::Value,
 ) -> WikiResult<Vec<String>> {
-    let raw = match frontmatter.get("entities") {
-        None | Some(serde_json::Value::Null) => return Ok(Vec::new()),
-        Some(serde_json::Value::Array(items)) => items,
+    // Strict structural check on the write path only: a non-array
+    // `entities` value is a mistake worth surfacing. `tags` stays lenient
+    // (see below); the derivation itself is shared with the store's
+    // one-shot backfill so the two never drift.
+    match frontmatter.get("entities") {
+        None | Some(serde_json::Value::Null | serde_json::Value::Array(_)) => {}
         Some(_) => {
             return Err(ai_memory_wiki_error(&format!(
                 "invalid non-array entities in frontmatter for {}",
                 path.as_str()
             )));
         }
-    };
-    let strings = raw.iter().filter_map(|v| v.as_str());
-    Ok(ai_memory_core::normalize_entities(strings))
+    }
+    Ok(ai_memory_core::frontmatter_entity_names(frontmatter))
 }
 
 /// Parse the optional frontmatter `expires_at:` key. Accepts RFC3339
@@ -4450,6 +4468,44 @@ mod tests {
         let err = parse_entities(&path, &serde_json::json!({"entities": "sqlite"}))
             .expect_err("a string instead of a list is a structural error");
         assert!(err.to_string().contains("non-array entities"), "{err}");
+    }
+
+    /// Entities are derived from `tags` too, so the index (and `as_of`)
+    /// populate on real stores whose pages predate LLM entity extraction.
+    #[test]
+    fn parse_entities_derives_from_tags() {
+        let path = PagePath::new("concepts/x.md").unwrap();
+
+        // Tags alone populate entities — the common case on a mature store.
+        assert_eq!(
+            parse_entities(&path, &serde_json::json!({"tags": ["Storage", "SQLite"]})).unwrap(),
+            vec!["storage".to_string(), "sqlite".to_string()],
+            "tags become entities, normalised",
+        );
+
+        // Explicit entities come first (they win the cap), tags fill in,
+        // and a tag duplicating an entity is de-duplicated.
+        assert_eq!(
+            parse_entities(
+                &path,
+                &serde_json::json!({"entities": ["FTS5"], "tags": ["fts5", "search"]}),
+            )
+            .unwrap(),
+            vec!["fts5".to_string(), "search".to_string()],
+            "explicit first, tags merged, duplicates dropped",
+        );
+
+        // A malformed tags list is lenient — it must never fail a write —
+        // while a malformed entities list still errors.
+        assert_eq!(
+            parse_entities(
+                &path,
+                &serde_json::json!({"entities": ["ok"], "tags": "not-a-list"}),
+            )
+            .unwrap(),
+            vec!["ok".to_string()],
+            "non-array tags contribute nothing rather than erroring",
+        );
     }
 
     /// Two projects in one workspace, one ended session in the first with a

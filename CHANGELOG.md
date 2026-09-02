@@ -8,6 +8,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Fixed
+- `as_of` time-travel queries and the entity retrieval stream now work
+  on real stores. Both read the entity index, which was populated only
+  from an LLM consolidator's `entities:` frontmatter — absent on the
+  bulk of a mature store (bootstrapped pages predate it; stable pages
+  are never re-consolidated), so the index sat empty and `as_of`
+  returned nothing. Entities are now also derived from each page's
+  `tags:` (the nouns a page is already labelled with) at write time, and
+  a one-shot idempotent backfill runs on the first start after upgrading
+  to populate the index for existing pages from their frontmatter —
+  opening each entity-link window at the page version's own `created_at`
+  so historical `as_of` is correct. Broad tags don't distort ranking
+  (the entity stream is inverse-frequency weighted), and a store already
+  written through the current path is a no-op. See `docs/temporal.md`.
 - The Windows PowerShell wrapper (`ai-memory.ps1`) no longer crashes with
   `git.exe : fatal: not a git repository … NativeCommandError` when run
   outside a git repository — which broke `ai-memory status` and every

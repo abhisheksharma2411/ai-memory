@@ -62,7 +62,7 @@ pub use ids::{
 pub use observation::{NewObservation, NewSession, Observation, ObservationKind};
 pub use page::{
     FeedbackKind, LinkTarget, MAX_ENTITIES_PER_PAGE, MAX_ENTITY_LEN, NewPage, Page, Relation, Tier,
-    normalize_entities, normalize_entity,
+    frontmatter_entity_names, normalize_entities, normalize_entity,
 };
 pub use routing_snippet::{MARKER_END, MARKER_START, SNIPPET_BODY, find_marker_line, full_block};
 pub use sanitize::{
