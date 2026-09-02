@@ -4684,6 +4684,7 @@ mod page_copy_differs_tests {
             body: body.into(),
             frontmatter_json: fm.to_string(),
             tier: "semantic".into(),
+            pinned: false,
         }
     }
 

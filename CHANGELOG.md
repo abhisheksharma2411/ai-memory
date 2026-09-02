@@ -8,6 +8,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Fixed
+- Merging a project no longer reports a spurious content conflict when
+  the only difference is `generated.at`: the merge comparison now uses
+  the same modulo-timestamp projection as the store's idempotency rule.
+  The old raw comparison made conflict detection timing-dependent — the
+  identical page re-written across a second boundary 409'd as
+  "different content" (the `copy_purge_rerun_is_idempotent` flake,
+  root-caused via its diagnosable failure body on the Windows matrix
+  run and now pinned by a deterministic cross-boundary test).
 - `install-hooks` now writes the capture-mode opt-in atomically. It was
   written in place, and every reader maps an unrecognised value onto
   `denylist` — the less private mode — so a crash, a full disk or a killed
