@@ -43,3 +43,5 @@ evals/runs/
 
 # ai-memory atomic-write backups (apply_atomic in apply_shared.rs)
 *.bak-*
+evals/datasets/
+evals/models/

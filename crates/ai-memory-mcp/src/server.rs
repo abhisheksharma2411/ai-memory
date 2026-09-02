@@ -320,7 +320,10 @@ search EVERY project in EVERY workspace at once when you don't know \
 where the knowledge lives — each hit then carries its workspace + \
 project name. `global=true` cannot be combined with \
 `scopes`/`project`/`workspace`. Don't conclude 'we never recorded \
-it' after one project misses. Note also that `memory_query` returns \
+it' after one project misses. For \"what did we know about X back \
+then\" questions, pass `as_of` (ISO-8601 instant) — the query becomes \
+an entity-timeline lookup returning the page versions valid at that \
+moment, including ones superseded since. Note also that `memory_query` returns \
 SNIPPETS, not full page bodies — an empty or short snippet does NOT \
 mean the page is empty (a large page can match outside the snippet \
 window); to read the whole page use `memory_read_page` (by `path`, \
@@ -507,6 +510,15 @@ struct QueryArgs {
     /// Default false.
     #[serde(default)]
     explain: Option<bool>,
+    /// Time-travel: an ISO-8601 instant (e.g. `2026-06-01T00:00:00Z`).
+    /// When set, the query becomes an ENTITY-TIMELINE lookup: it returns
+    /// the page versions whose entity-link validity windows contained
+    /// that instant — what the store knew about the named entities then,
+    /// including versions superseded since (docs/temporal.md). FTS /
+    /// vector / graph streams are skipped in this mode; cannot be
+    /// combined with `global` or `scopes`. Omit for a normal search.
+    #[serde(default)]
+    as_of: Option<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize, schemars::JsonSchema)]
@@ -1904,6 +1916,46 @@ impl AiMemoryServer {
                 "scopes cannot be combined with workspace/project",
                 None,
             ));
+        }
+
+        // Time-travel entity lookup (docs/temporal.md): entity stream
+        // only, against the ingestion-time validity windows.
+        if let Some(raw_as_of) = args.as_of.as_deref().filter(|s| !s.trim().is_empty()) {
+            if args.global.unwrap_or(false) || !args.scopes.is_empty() {
+                return Err(McpError::internal_error(
+                    "as_of cannot be combined with global or scopes",
+                    None,
+                ));
+            }
+            let instant: jiff::Timestamp = raw_as_of.trim().parse().map_err(|e| {
+                McpError::internal_error(format!("as_of must be an ISO-8601 instant: {e}"), None)
+            })?;
+            let (ws, proj) = self
+                .effective_ids_for_read_args_with_actor(
+                    args.workspace.as_deref(),
+                    args.project.as_deref(),
+                    &aps_actor,
+                )
+                .await?;
+            let hits = self
+                .reader
+                .entity_hits_for_project_at(
+                    ws,
+                    proj,
+                    &args.query,
+                    limit,
+                    None,
+                    Some(instant.as_microsecond()),
+                )
+                .await
+                .map_err(|e| McpError::internal_error(e.to_string(), None))?;
+            return ok_json(&MemoryQueryResponse {
+                hits: hits.into_iter().map(|h| QueryHit::from(h.hit)).collect(),
+                raw_hits: Vec::new(),
+                global_hits: Vec::new(),
+                global_scope_hits: Vec::new(),
+                streams_active: explain.then(|| vec!["entity"]),
+            });
         }
 
         let query = args.query.clone();
@@ -4902,6 +4954,7 @@ mod tests {
                         global: None,
                         include_expired: None,
                         explain: Some(true),
+                        as_of: None,
                     }),
                     test_optional_parts(),
                 )
@@ -4932,6 +4985,7 @@ mod tests {
                         global: Some(true),
                         include_expired: None,
                         explain: None,
+                        as_of: None,
                     }),
                     test_optional_parts(),
                 )
@@ -6354,6 +6408,102 @@ mod tests {
         );
     }
 
+    /// `as_of` turns memory_query into an entity-timeline lookup
+    /// (docs/temporal.md): a superseded version answers for the instant
+    /// it was valid, the current version answers for now, and the mode
+    /// refuses to combine with global/scopes.
+    #[tokio::test]
+    async fn memory_query_as_of_travels_the_entity_timeline() {
+        let (_tmp, store, server, ws, proj) = setup_server().await;
+        let mut v1 = ai_memory_core::NewPage {
+            workspace_id: ws,
+            project_id: proj,
+            path: ai_memory_core::PagePath::new("notes/db.md").unwrap(),
+            title: "DB".into(),
+            body: "we use postgres".into(),
+            tier: ai_memory_core::Tier::Semantic,
+            frontmatter_json: serde_json::json!({}),
+            pinned: false,
+            links: Vec::new(),
+            author_id: None,
+            expires_at: None,
+            entities: vec!["postgres".into()],
+        };
+        store.writer.upsert_page(v1.clone()).await.unwrap();
+        let between = jiff::Timestamp::now().to_string();
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        v1.body = "we migrated".into();
+        v1.entities = vec!["sqlite".into()];
+        store.writer.upsert_page(v1).await.unwrap();
+
+        let args = |as_of: Option<String>, global: Option<bool>| QueryArgs {
+            query: "postgres".into(),
+            limit: Some(5),
+            project: Some("scratch".into()),
+            scopes: Vec::new(),
+            workspace: Some("default".into()),
+            global,
+            include_expired: None,
+            explain: Some(true),
+            as_of,
+        };
+
+        // Historical instant → the superseded version answers.
+        let result = server
+            .memory_query(
+                Parameters(args(Some(between), None)),
+                OptionalParts(test_parts_default()),
+            )
+            .await
+            .unwrap();
+        let text = result
+            .content
+            .first()
+            .and_then(|c| c.as_text())
+            .unwrap()
+            .text
+            .clone();
+        assert!(text.contains("notes/db.md"), "{text}");
+        assert!(text.contains("\"entity\""), "entity-only mode: {text}");
+
+        // Same query without as_of → no postgres hit anymore... the FTS
+        // stream may still match old text? No: default searches latest
+        // pages only, whose body says "we migrated".
+        let now_result = server
+            .memory_query(
+                Parameters(args(None, None)),
+                OptionalParts(test_parts_default()),
+            )
+            .await
+            .unwrap();
+        let now_text = now_result
+            .content
+            .first()
+            .and_then(|c| c.as_text())
+            .unwrap()
+            .text
+            .clone();
+        assert!(!now_text.contains("notes/db.md"), "{now_text}");
+
+        // Refusal: as_of + global is ambiguous.
+        let err = server
+            .memory_query(
+                Parameters(args(Some("2026-06-01T00:00:00Z".into()), Some(true))),
+                OptionalParts(test_parts_default()),
+            )
+            .await;
+        assert!(err.is_err(), "as_of+global must be refused");
+
+        // Garbage instant is a clear error, not a silent default.
+        let bad = server
+            .memory_query(
+                Parameters(args(Some("not-a-time".into()), None)),
+                OptionalParts(test_parts_default()),
+            )
+            .await;
+        assert!(bad.is_err());
+    }
+
     #[tokio::test]
     async fn memory_query_returns_hits_via_tool_method() {
         let (_tmp, _store, server, _ws, _pj) = setup_server().await;
@@ -6368,6 +6518,7 @@ mod tests {
                     global: None,
                     include_expired: None,
                     explain: None,
+                    as_of: None,
                 }),
                 OptionalParts(test_parts_default()),
             )
@@ -6392,6 +6543,7 @@ mod tests {
                     global: None,
                     include_expired: None,
                     explain: Some(true),
+                    as_of: None,
                 }),
                 OptionalParts(test_parts_default()),
             )
@@ -6482,6 +6634,7 @@ mod tests {
                         global: None,
                         include_expired: None,
                         explain: Some(true),
+                        as_of: None,
                     }),
                     OptionalParts(test_parts_default()),
                 )
@@ -6567,6 +6720,7 @@ mod tests {
             global: None,
             include_expired: None,
             explain: None,
+            as_of: None,
         };
 
         let result = server
@@ -6643,6 +6797,7 @@ mod tests {
                     global: None,
                     include_expired: None,
                     explain: None,
+                    as_of: None,
                 }),
                 OptionalParts(test_parts_default()),
             )
@@ -6770,6 +6925,7 @@ mod tests {
                     global: None,
                     include_expired: None,
                     explain: None,
+                    as_of: None,
                 }),
                 OptionalParts(test_parts_default()),
             )
@@ -6848,6 +7004,7 @@ mod tests {
                     global: None,
                     include_expired: None,
                     explain: None,
+                    as_of: None,
                 }),
                 test_optional_parts(),
             )
@@ -6942,6 +7099,7 @@ mod tests {
                         global: None,
                         include_expired: None,
                         explain: None,
+                        as_of: None,
                     }),
                     test_optional_parts(),
                 )
@@ -7007,6 +7165,7 @@ mod tests {
                         global: None,
                         include_expired: None,
                         explain: None,
+                        as_of: None,
                     }),
                     test_optional_parts(),
                 )
@@ -7048,6 +7207,7 @@ mod tests {
                     global: None,
                     include_expired: None,
                     explain: None,
+                    as_of: None,
                 }),
                 test_optional_parts(),
             )
@@ -7121,6 +7281,7 @@ mod tests {
                         global: None,
                         include_expired: None,
                         explain: None,
+                        as_of: None,
                     }),
                     test_optional_parts(),
                 )
@@ -7185,6 +7346,7 @@ mod tests {
                     global: None,
                     include_expired: None,
                     explain: None,
+                    as_of: None,
                 }),
                 OptionalParts(test_parts_default()),
             )
@@ -8196,6 +8358,7 @@ mod tests {
                     global: None,
                     include_expired: None,
                     explain: Some(true),
+                    as_of: None,
                 }),
                 OptionalParts(test_parts_default()),
             )
@@ -8302,6 +8465,7 @@ mod tests {
                     global: Some(true),
                     include_expired: None,
                     explain: Some(true),
+                    as_of: None,
                 }),
                 OptionalParts(test_parts_default()),
             )
@@ -8348,6 +8512,7 @@ mod tests {
                     global: Some(true),
                     include_expired: Some(true),
                     explain: None,
+                    as_of: None,
                 }),
                 OptionalParts(test_parts_default()),
             )
@@ -8426,6 +8591,7 @@ mod tests {
                     global: None,
                     include_expired: None,
                     explain: None,
+                    as_of: None,
                 }),
                 OptionalParts(test_parts_default()),
             )
@@ -8457,6 +8623,7 @@ mod tests {
                     global: None,
                     include_expired: None,
                     explain: None,
+                    as_of: None,
                 }),
                 OptionalParts(test_parts_default()),
             )
@@ -8492,6 +8659,7 @@ mod tests {
                     global: Some(true),
                     include_expired: None,
                     explain: None,
+                    as_of: None,
                 }),
                 OptionalParts(test_parts_default()),
             )
@@ -10934,6 +11102,7 @@ mod tests {
                     global: None,
                     include_expired: None,
                     explain: None,
+                    as_of: None,
                 }),
                 OptionalParts(test_parts_default()),
             )
@@ -10967,6 +11136,7 @@ mod tests {
                     global: None,
                     include_expired: None,
                     explain: None,
+                    as_of: None,
                 }),
                 OptionalParts(test_parts_default()),
             )

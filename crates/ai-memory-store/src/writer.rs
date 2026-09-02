@@ -386,6 +386,20 @@ pub(crate) enum WriteCmd {
         author_id: Option<ai_memory_core::UserId>,
         reply: oneshot::Sender<StoreResult<()>>,
     },
+    /// One-shot in-place OKF conformance of every latest page row.
+    OkfMigrateLatestPages {
+        reply: oneshot::Sender<StoreResult<Vec<ops::OkfMigratedPage>>>,
+    },
+    /// Read-only count of latest rows still lacking OKF conformance.
+    OkfNonconformantCount {
+        reply: oneshot::Sender<StoreResult<u64>>,
+    },
+    /// Record a completed cross-session ("experience") pass for a scope.
+    MarkExperiencePassRun {
+        workspace_id: WorkspaceId,
+        project_id: ProjectId,
+        reply: oneshot::Sender<StoreResult<()>>,
+    },
     /// Record a successfully-applied wiki-structure migration.
     InsertWikiMigration {
         name: String,
@@ -1599,6 +1613,60 @@ impl WriterHandle {
             reply: tx,
         })
         .await?;
+        rx.await.map_err(|_| StoreError::WriterClosed)?
+    }
+
+    /// Conform every latest page row to OKF in place (docs/okf.md);
+    /// returns the rewritten pages so the wiki layer can align files.
+    ///
+    /// # Errors
+    /// Returns [`StoreError::WriterClosed`] if the actor has shut down, or
+    /// propagates the SQL error.
+    pub async fn okf_migrate_latest_pages(&self) -> StoreResult<Vec<ops::OkfMigratedPage>> {
+        let (tx, rx) = oneshot::channel();
+        self.send(WriteCmd::OkfMigrateLatestPages { reply: tx })
+            .await?;
+        rx.await.map_err(|_| StoreError::WriterClosed)?
+    }
+
+    /// Instantaneous write-queue depth as `(queued, capacity)`. A queue
+    /// pinned near capacity means writers are being backpressured — the
+    /// wedged-writer signal `status` surfaces (2.0 item 7).
+    #[must_use]
+    pub fn queue_depth(&self) -> (usize, usize) {
+        let max = self.inner.tx.max_capacity();
+        (max.saturating_sub(self.inner.tx.capacity()), max)
+    }
+
+    /// Record a completed cross-session ("experience") pass for a scope.
+    ///
+    /// # Errors
+    /// Returns [`StoreError::WriterClosed`] if the actor has shut down, or
+    /// propagates the SQL error.
+    pub async fn mark_experience_pass_run(
+        &self,
+        workspace_id: WorkspaceId,
+        project_id: ProjectId,
+    ) -> StoreResult<()> {
+        let (tx, rx) = oneshot::channel();
+        self.send(WriteCmd::MarkExperiencePassRun {
+            workspace_id,
+            project_id,
+            reply: tx,
+        })
+        .await?;
+        rx.await.map_err(|_| StoreError::WriterClosed)?
+    }
+
+    /// Count latest page rows still lacking OKF conformance (read-only).
+    ///
+    /// # Errors
+    /// Returns [`StoreError::WriterClosed`] if the actor has shut down, or
+    /// propagates the SQL error.
+    pub async fn okf_nonconformant_count(&self) -> StoreResult<u64> {
+        let (tx, rx) = oneshot::channel();
+        self.send(WriteCmd::OkfNonconformantCount { reply: tx })
+            .await?;
         rx.await.map_err(|_| StoreError::WriterClosed)?
     }
 
@@ -2862,6 +2930,26 @@ fn worker_loop(mut conn: Connection, mut rx: mpsc::Receiver<WriteCmd>) {
                     author_id,
                 );
                 send_or_warn(reply, result, "rename_project");
+            }
+            WriteCmd::OkfMigrateLatestPages { reply } => {
+                let result = ops::okf_migrate_latest_pages(&mut conn);
+                send_or_warn(reply, result, "okf_migrate_latest_pages");
+            }
+            WriteCmd::OkfNonconformantCount { reply } => {
+                let result = ops::okf_nonconformant_latest_pages(&conn);
+                send_or_warn(reply, result, "okf_nonconformant_count");
+            }
+            WriteCmd::MarkExperiencePassRun {
+                workspace_id,
+                project_id,
+                reply,
+            } => {
+                let result = crate::auto_improve::mark_experience_pass_run(
+                    &mut conn,
+                    workspace_id,
+                    project_id,
+                );
+                send_or_warn(reply, result, "mark_experience_pass_run");
             }
             WriteCmd::InsertWikiMigration {
                 name,

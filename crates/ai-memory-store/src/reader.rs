@@ -378,13 +378,13 @@ pub struct FeedbackFinding {
 /// A page matched by the entity stream, with the inverse-frequency
 /// weight that ranked it and the entity names that matched.
 #[derive(Debug, Clone)]
-pub(crate) struct EntityHit {
+pub struct EntityHit {
     /// The matched page.
-    pub(crate) hit: PageHit,
+    pub hit: PageHit,
     /// Sum of `1 / pages_carrying_entity` over the matched entities.
-    pub(crate) weight: f64,
+    pub weight: f64,
     /// Entity names that matched the query.
-    pub(crate) matched: Vec<String>,
+    pub matched: Vec<String>,
 }
 
 /// Escape a literal for use inside a SQL `LIKE` pattern with
@@ -946,8 +946,12 @@ pub struct DerivedIndexStatus {
     pub observations_rows: u64,
     /// Rows currently present in the observation FTS5 index.
     pub observations_fts_rows: u64,
-    /// Latest pages without any embedding row.
+    /// Latest pages without any embedding row whose body is non-empty —
+    /// i.e. the pages a backfill can actually act on.
     pub latest_pages_missing_embeddings: u64,
+    /// Latest pages without an embedding whose body is empty; no
+    /// embedder can ever cover these (the backfill skips them by rule).
+    pub latest_pages_unembeddable: u64,
     /// Latest pages whose last embed attempt failed or was skipped and which
     /// still have no embedding. These are the pages an operator can act on.
     pub embed_failures_unresolved: u64,
@@ -959,6 +963,9 @@ pub struct DerivedIndexStatus {
     pub embedding_rows: u64,
     /// Stored embedding triples and row counts.
     pub embedding_triples: Vec<EmbeddingTripleCount>,
+    /// Typed relation edges (`link_type != 'references'`) from latest
+    /// pages, as `(relation, count)` — the 2.0 typed-edge surface.
+    pub typed_links_from_latest_pages: Vec<(String, u64)>,
     /// Outgoing links whose source page is latest.
     pub links_from_latest_pages: u64,
     /// Latest-page outgoing links whose target path has not resolved yet.
@@ -1259,6 +1266,21 @@ pub struct CrossProjectEdge {
     pub to_project: String,
     /// Target page path.
     pub to_path: String,
+}
+
+/// One typed `contradicts` edge between two latest pages, surfaced as a
+/// lint finding (2.0 item 3): the declaration IS the signal — no LLM
+/// needed to notice that two pages disagree once an author or the
+/// consolidator said so.
+#[derive(Debug, Clone, Serialize)]
+pub struct ContradictionEdge {
+    /// Wiki path of the page declaring the contradiction.
+    pub from_path: String,
+    /// Wiki path of the contradicted page (as declared; the target may
+    /// be unresolved, in which case `resolved` is false).
+    pub to_path: String,
+    /// Whether the target currently resolves to a latest page.
+    pub resolved: bool,
 }
 
 /// An unresolved cross-project link — a declared dependency on another
@@ -3400,6 +3422,32 @@ impl ReaderPool {
         limit: usize,
         expiry_cutoff_us: Option<i64>,
     ) -> StoreResult<Vec<EntityHit>> {
+        self.entity_hits_for_project_at(
+            workspace_id,
+            project_id,
+            query,
+            limit,
+            expiry_cutoff_us,
+            None,
+        )
+        .await
+    }
+
+    /// Entity hits with an optional ingestion-time instant
+    /// (docs/temporal.md). `as_of_us: None` = current knowledge (latest
+    /// versions, expiry honoured). `Some(T)` = the page versions whose
+    /// entity-link windows contain `T` — expiry is deliberately ignored
+    /// there: a page valid at `T` that has since expired was still what
+    /// we knew at `T`.
+    pub async fn entity_hits_for_project_at(
+        &self,
+        workspace_id: WorkspaceId,
+        project_id: ProjectId,
+        query: &str,
+        limit: usize,
+        expiry_cutoff_us: Option<i64>,
+        as_of_us: Option<i64>,
+    ) -> StoreResult<Vec<EntityHit>> {
         let tokens = entity_query_tokens(query);
         if tokens.is_empty() || limit == 0 {
             return Ok(Vec::new());
@@ -3432,10 +3480,23 @@ impl ReaderPool {
             }
             sql_params.push(Value::Blob(workspace_id.as_bytes().to_vec()));
             sql_params.push(Value::Blob(project_id.as_bytes().to_vec()));
-            sql_params.push(Value::Integer(cutoff));
-            sql_params.push(Value::Blob(workspace_id.as_bytes().to_vec()));
-            sql_params.push(Value::Blob(project_id.as_bytes().to_vec()));
-            sql_params.push(Value::Integer(cutoff));
+            match as_of_us {
+                Some(t) => {
+                    // freq window + outer window: two params each.
+                    sql_params.push(Value::Integer(t));
+                    sql_params.push(Value::Integer(t));
+                    sql_params.push(Value::Blob(workspace_id.as_bytes().to_vec()));
+                    sql_params.push(Value::Blob(project_id.as_bytes().to_vec()));
+                    sql_params.push(Value::Integer(t));
+                    sql_params.push(Value::Integer(t));
+                }
+                None => {
+                    sql_params.push(Value::Integer(cutoff));
+                    sql_params.push(Value::Blob(workspace_id.as_bytes().to_vec()));
+                    sql_params.push(Value::Blob(project_id.as_bytes().to_vec()));
+                    sql_params.push(Value::Integer(cutoff));
+                }
+            }
             sql_params.push(Value::Integer(i64::try_from(limit).unwrap_or(i64::MAX)));
 
             let mut sql = String::with_capacity(placeholders.len() + 1_200);
@@ -3453,8 +3514,8 @@ impl ReaderPool {
                    SELECT m.entity_id, m.name, COUNT(*) AS pages \
                    FROM matched m \
                    JOIN entity_page_links l ON l.entity_id = m.entity_id \
-                   JOIN pages p ON p.id = l.page_id AND p.is_latest = 1 \
-                   WHERE 1 = 1{freq_not_expired} \
+                   JOIN pages p ON p.id = l.page_id \
+                   WHERE 1 = 1{freq_version_filter} \
                    GROUP BY m.entity_id, m.name \
                  ) \
                  SELECT pg.id, pg.path, pg.title, {descriptor} AS snippet, \
@@ -3464,13 +3525,26 @@ impl ReaderPool {
                  FROM freq f \
                  JOIN entity_page_links l ON l.entity_id = f.entity_id \
                  JOIN pages pg ON pg.id = l.page_id \
-                 WHERE pg.workspace_id = ? AND pg.project_id = ? AND pg.is_latest = 1{not_expired} \
+                 WHERE pg.workspace_id = ? AND pg.project_id = ?{version_filter} \
                  GROUP BY pg.id, pg.path, pg.title \
                  ORDER BY weight DESC, matches DESC, pg.path ASC \
                  LIMIT ?",
                 descriptor = page_descriptor_expr("pg.body", "pg.frontmatter_json"),
-                not_expired = not_expired("pg", "?"),
-                freq_not_expired = not_expired("p", "?"),
+                version_filter = if as_of_us.is_some() {
+                    // Window containment (docs/temporal.md); no expiry.
+                    " AND l.valid_from <= ? \
+                      AND (l.superseded_at IS NULL OR l.superseded_at > ?)"
+                        .to_string()
+                } else {
+                    format!(" AND pg.is_latest = 1{}", not_expired("pg", "?"))
+                },
+                freq_version_filter = if as_of_us.is_some() {
+                    " AND l.valid_from <= ? \
+                      AND (l.superseded_at IS NULL OR l.superseded_at > ?)"
+                        .to_string()
+                } else {
+                    format!(" AND p.is_latest = 1{}", not_expired("p", "?"))
+                },
             )
             .expect("writing SQL into String cannot fail");
 
@@ -5586,6 +5660,57 @@ impl ReaderPool {
         .await
     }
 
+    /// Cross-session pass cadence probe: completed sessions newer than
+    /// the pass's last run for this scope (docs/experience.md).
+    ///
+    /// # Errors
+    /// Propagates SQL errors from the read pool.
+    pub async fn experience_pass_due(
+        &self,
+        workspace_id: WorkspaceId,
+        project_id: ProjectId,
+    ) -> StoreResult<(u64, i64)> {
+        self.with_conn(move |conn| {
+            crate::auto_improve::experience_pass_due(conn, workspace_id, project_id)
+        })
+        .await
+    }
+
+    /// Typed `contradicts` edges declared by latest pages of one project
+    /// (docs/okf.md relations vocabulary). Each row feeds one rule-based
+    /// lint finding.
+    ///
+    /// # Errors
+    /// Propagates SQL errors from the read pool.
+    pub async fn contradiction_edges(
+        &self,
+        workspace_id: WorkspaceId,
+        project_id: ProjectId,
+    ) -> StoreResult<Vec<ContradictionEdge>> {
+        self.with_conn(move |conn| {
+            let mut stmt = conn.prepare(
+                "SELECT fp.path, l.to_path,                         l.to_page_id IS NOT NULL AS resolved                  FROM links l                  JOIN pages fp ON fp.id = l.from_page_id                      AND fp.workspace_id = ?1 AND fp.project_id = ?2 AND fp.is_latest = 1                  WHERE l.link_type = 'contradicts'                  ORDER BY fp.path, l.to_path",
+            )?;
+            let rows = stmt.query_map(
+                params![workspace_id.as_bytes(), project_id.as_bytes()],
+                |row| {
+                    let resolved: i64 = row.get(2)?;
+                    Ok(ContradictionEdge {
+                        from_path: row.get(0)?,
+                        to_path: row.get(1)?,
+                        resolved: resolved != 0,
+                    })
+                },
+            )?;
+            let mut out = Vec::new();
+            for r in rows {
+                out.push(r?);
+            }
+            Ok(out)
+        })
+        .await
+    }
+
     /// Resolved cross-project edges (links whose endpoints are in different
     /// projects). When `scope` is `Some((ws, proj))`, only edges that touch
     /// that project (as source or target) are returned; `None` returns the
@@ -6961,15 +7086,43 @@ impl ReaderPool {
                      JOIN pages pg ON pg.id = f.page_id AND pg.is_latest = 1 \
                      JOIN page_embeddings pe ON pe.page_id = f.page_id",
                 )?,
+                // Aligned with the backfill's own skip rule: an
+                // empty-body page can never be embedded, so counting it
+                // as \"missing\" overstated the actionable number forever
+                // (observed live: a stable 427 that no backfill could
+                // ever clear). Unembeddable pages are reported apart.
                 latest_pages_missing_embeddings: count(
                     conn,
                     "SELECT COUNT(*) \
                      FROM pages pg \
                      LEFT JOIN page_embeddings pe ON pe.page_id = pg.id \
-                     WHERE pg.is_latest = 1 AND pe.page_id IS NULL",
+                     WHERE pg.is_latest = 1 AND pe.page_id IS NULL \
+                       AND TRIM(pg.body) != ''",
+                )?,
+                latest_pages_unembeddable: count(
+                    conn,
+                    "SELECT COUNT(*) \
+                     FROM pages pg \
+                     LEFT JOIN page_embeddings pe ON pe.page_id = pg.id \
+                     WHERE pg.is_latest = 1 AND pe.page_id IS NULL \
+                       AND TRIM(pg.body) = ''",
                 )?,
                 embedding_rows: count(conn, "SELECT COUNT(*) FROM page_embeddings")?,
                 embedding_triples,
+                typed_links_from_latest_pages: {
+                    let mut stmt = conn.prepare(
+                        "SELECT l.link_type, COUNT(*) FROM links l \
+                         JOIN pages fp ON fp.id = l.from_page_id AND fp.is_latest = 1 \
+                         WHERE l.link_type != 'references' \
+                         GROUP BY l.link_type ORDER BY l.link_type",
+                    )?;
+                    let rows: Vec<(String, i64)> = stmt
+                        .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?
+                        .collect::<Result<_, _>>()?;
+                    rows.into_iter()
+                        .map(|(k, v)| (k, u64::try_from(v).unwrap_or(0)))
+                        .collect()
+                },
                 links_from_latest_pages: count(
                     conn,
                     "SELECT COUNT(*) \

@@ -81,6 +81,23 @@ than its name, nothing else moves — including which workstream a bare
 a rename deliberately does not touch `selected_at` or `updated_at`. A run that
 is already live keeps displaying the name it launched with until it exits.
 
+## Do you need this?
+
+Probably not at first — hooks alone already carry most continuity.
+
+- **Skip it** when a handoff is all you want: you quit Claude Code
+  mid-task, open Codex in the same directory, and the next session
+  starts with "where you left off, what failed, what's open". That
+  works with nothing but `install-hooks`; no `ai-memory run` involved.
+- **Use it** when you want the harness's own native resume (`claude
+  --resume` / the picker) to survive a harness SWITCH — the managed
+  ledger records the visible event stream portably, so `ai-memory
+  continue` can reopen the same workstream in a different agent with
+  the exact tool-call history, not just a summary.
+
+If you never switch harnesses mid-workstream, the default path is
+simpler and loses you nothing.
+
 ## Project-first launcher
 
 `ai-memory show` reverses the usual `cd` then `run` flow: choose a local

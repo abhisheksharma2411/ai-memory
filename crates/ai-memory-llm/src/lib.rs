@@ -45,6 +45,8 @@ pub mod factory;
 pub mod gemini;
 pub mod google;
 pub mod health;
+#[cfg(feature = "local-embeddings")]
+pub mod local;
 pub mod oidc;
 pub mod openai;
 pub mod openai_compat;
@@ -79,6 +81,8 @@ pub use google::{DEFAULT_MODEL as GOOGLE_DEFAULT_EMBED_MODEL, GoogleEmbedder};
 pub use health::{
     ProviderHealth, ProviderHealthSnapshot, ProviderHealthStatus, ProviderRoleHealthSnapshot,
 };
+#[cfg(feature = "local-embeddings")]
+pub use local::{LOCAL_DIM, LOCAL_MODEL, LocalEmbedder, fetch_model, model_present};
 pub use oidc::{
     DeviceAuthorizationResponse, OIDC_DEFAULT_SCOPE, OidcDiscovery, OidcExtras, OidcToken,
     OidcTokenResponse, PollOutcome, discover, poll_token_once, refresh_access_token,

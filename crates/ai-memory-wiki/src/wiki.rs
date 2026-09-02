@@ -19,7 +19,7 @@ use crate::admission::{AdmissionChain, AdmissionContext, AdmissionOp};
 use crate::atomic;
 use crate::error::{WikiError, WikiResult};
 use crate::git::{Checkpoint, GitAdapter};
-use crate::markdown::{Markdown, derive_title, emit, extract_links, parse};
+use crate::markdown::{Markdown, derive_title, emit, parse};
 use crate::watcher::is_pending_path;
 
 /// Summary of a [`Wiki::reindex_all`] run.
@@ -254,6 +254,14 @@ impl Wiki {
     #[must_use]
     pub fn root(&self) -> &Path {
         &self.root
+    }
+
+    /// The data directory this wiki lives under (`<data_dir>/wiki` is
+    /// the root, so this is its parent). Used by the web layer to read
+    /// the pre-migration backup receipt.
+    #[must_use]
+    pub fn data_dir(&self) -> &Path {
+        self.root.parent().unwrap_or(&self.root)
     }
 
     /// Resolve the on-disk root for a project: `<wiki_root>/<ws>/<proj>`.
@@ -536,7 +544,7 @@ impl Wiki {
         })?;
         let md = parse(&raw)?;
         let title = derive_title(&md.frontmatter, &md.body, &path);
-        let links = extract_links(&md.body, &path);
+        let links = crate::markdown::extract_all_links(&md.frontmatter, &md.body, &path);
         let meta = derive_index_metadata(&path, &md.frontmatter)?;
 
         let _guard = self.mutation_lock.read().await;
@@ -1193,8 +1201,20 @@ impl Wiki {
         }
         markdown.body = self.sanitizer.scrub(&markdown.body);
         scrub_frontmatter_strings(&mut markdown.frontmatter, &self.sanitizer);
+        // Approved pages must land conformant like every other write —
+        // this emit skipped the disk conformance seam, leaving files
+        // without type/generated that blocked export-okf and, worse,
+        // phantom-superseded on the first reindex after a binary upgrade
+        // (the row was conformed with the approving binary's version, the
+        // file with the reindexing one's). Post-audit finding.
+        conform_frontmatter_for_disk(
+            &self.abs_path(workspace_id, project_id, &path),
+            path.as_str(),
+            &mut markdown,
+        );
         let title = self.sanitizer.scrub(&detail.summary.title);
-        let links = extract_links(&markdown.body, &path);
+        let links =
+            crate::markdown::extract_all_links(&markdown.frontmatter, &markdown.body, &path);
         let expires_at = parse_expires_at(&path, &markdown.frontmatter)?;
         let entities = parse_entities(&path, &markdown.frontmatter)?;
         let emitted = emit(&markdown)?;
@@ -1304,7 +1324,7 @@ impl Wiki {
         }
         let md = self.read_page(workspace_id, project_id, &path)?;
         let title = derive_title(&md.frontmatter, &md.body, &path);
-        let links = extract_links(&md.body, &path);
+        let links = crate::markdown::extract_all_links(&md.frontmatter, &md.body, &path);
         // Markdown is the source of truth: preserve explicit tier/pinned
         // metadata on reindex instead of forcing every page back to semantic.
         let meta = derive_index_metadata(&path, &md.frontmatter)?;
@@ -1425,7 +1445,18 @@ impl Wiki {
     /// Write a `_meta.md` scope manifest under `dir` from `frontmatter`,
     /// idempotently — unchanged content is left untouched so a startup
     /// backfill never churns the wiki git history. Returns `true` if written.
-    fn write_scope_manifest(dir: &Path, frontmatter: serde_json::Value) -> WikiResult<bool> {
+    fn write_scope_manifest(dir: &Path, mut frontmatter: serde_json::Value) -> WikiResult<bool> {
+        // OKF conformance at the manifest choke point: every non-reserved
+        // .md needs a `type`, and the startup backfill's byte-compare must
+        // agree with what the OKF migration writes — a typeless emit here
+        // silently reverted migrated manifests on the same boot
+        // (post-audit finding). `type` is appended last, matching the
+        // migration's entry-insertion order, so the two emitters converge
+        // on identical bytes.
+        if let Some(map) = frontmatter.as_object_mut() {
+            map.entry("type".to_string())
+                .or_insert(serde_json::Value::String("Scope Manifest".into()));
+        }
         let content = emit(&Markdown {
             frontmatter,
             body: String::new(),
@@ -1544,6 +1575,11 @@ impl Wiki {
                     .unwrap_or(false);
             markdown.frontmatter =
                 canonicalize_index_frontmatter(markdown.frontmatter, req.tier, req.pinned);
+            conform_frontmatter_for_disk(
+                &self.abs_path(req.workspace_id, req.project_id, &req.path),
+                req.path.as_str(),
+                &mut markdown,
+            );
 
             let title = req
                 .title
@@ -1597,7 +1633,11 @@ impl Wiki {
                         tier: req.tier,
                         frontmatter_json: req.frontmatter.clone(),
                         pinned: req.pinned,
-                        links: extract_links(&req.body, &req.path),
+                        links: crate::markdown::extract_all_links(
+                            &req.frontmatter,
+                            &req.body,
+                            &req.path,
+                        ),
                         author_id: req.author_id,
                         expires_at: parse_expires_at(&req.path, &req.frontmatter)?,
                         entities: parse_entities(&req.path, &req.frontmatter)?,
@@ -1727,6 +1767,11 @@ impl Wiki {
                 .and_then(|v| v.as_bool())
                 .unwrap_or(false);
         markdown.frontmatter = canonicalize_index_frontmatter(markdown.frontmatter, tier, pinned);
+        conform_frontmatter_for_disk(
+            &self.abs_path(workspace_id, project_id, &path),
+            path.as_str(),
+            &mut markdown,
+        );
 
         // Re-derive title + links from the (possibly mutated) markdown.
         // We do this after the chain so explicit title overrides survive
@@ -1736,7 +1781,8 @@ impl Wiki {
             .clone()
             .map(|t| self.sanitizer.scrub(&t))
             .unwrap_or_else(|| derive_title(&markdown.frontmatter, &markdown.body, &path));
-        let links = extract_links(&markdown.body, &path);
+        let links =
+            crate::markdown::extract_all_links(&markdown.frontmatter, &markdown.body, &path);
         let expires_at = parse_expires_at(&path, &markdown.frontmatter)?;
         let entities = parse_entities(&path, &markdown.frontmatter)?;
 
@@ -2001,6 +2047,30 @@ pub(crate) fn parse_expires_at(
         "invalid expires_at in frontmatter for {} (want RFC3339 or YYYY-MM-DD): {raw}",
         path.as_str()
     )))
+}
+
+/// OKF conformance for the on-disk file (docs/okf.md): fill the
+/// deterministic keys, then stamp `generated.at` — inheriting the
+/// current file's value when nothing but the timestamp would change, so
+/// an idempotent rewrite emits byte-identical markdown (no git churn,
+/// and the store's modulo-`generated.at` comparison keeps the row).
+fn conform_frontmatter_for_disk(abs: &Path, page_path: &str, markdown: &mut Markdown) {
+    ai_memory_core::okf::conform_frontmatter(page_path, &mut markdown.frontmatter);
+    let inherited = std::fs::read_to_string(abs)
+        .ok()
+        .and_then(|s| crate::markdown::parse(&s).ok())
+        .filter(|cur| {
+            ai_memory_core::okf::strip_generated_at(&cur.frontmatter)
+                == ai_memory_core::okf::strip_generated_at(&markdown.frontmatter)
+                && cur.body == markdown.body
+        })
+        .and_then(|cur| ai_memory_core::okf::generated_at(&cur.frontmatter).map(str::to_string));
+    let at = inherited.unwrap_or_else(|| {
+        jiff::Timestamp::now()
+            .strftime("%Y-%m-%dT%H:%M:%SZ")
+            .to_string()
+    });
+    ai_memory_core::okf::stamp_generated_at(&mut markdown.frontmatter, &at);
 }
 
 fn canonicalize_index_frontmatter(
@@ -2324,6 +2394,139 @@ mod tests {
                 .join(ws.to_string())
                 .join(proj.to_string()),
         );
+    }
+
+    /// The file a consumer reads off disk is the OKF concept file
+    /// (docs/okf.md): required `type`, a `generated {by, at}` stanza,
+    /// provenance — emitted by the wiki, not just stored in the index.
+    #[tokio::test]
+    async fn written_files_are_okf_conformant_on_disk() {
+        let tmp = TempDir::new().unwrap();
+        let store = Store::open(tmp.path()).unwrap();
+        let ws = store.writer.get_or_create_workspace("w").await.unwrap();
+        let proj = store
+            .writer
+            .get_or_create_project(ws, "p", None)
+            .await
+            .unwrap();
+        let wiki = Wiki::new(tmp.path(), store.writer.clone()).unwrap();
+
+        wiki.write_page(req(
+            ws,
+            proj,
+            "gotchas/linker.md",
+            "mind the linker",
+            serde_json::json!({"title": "Linker gotcha"}),
+        ))
+        .await
+        .unwrap();
+
+        let raw =
+            std::fs::read_to_string(wiki.project_root(ws, proj).join("gotchas/linker.md")).unwrap();
+        let parsed = crate::markdown::parse(&raw).unwrap();
+        assert_eq!(parsed.frontmatter["type"], "Gotcha");
+        assert!(
+            parsed.frontmatter["generated"]["by"]
+                .as_str()
+                .unwrap()
+                .starts_with("process:ai-memory/")
+        );
+        assert!(
+            parsed.frontmatter["generated"]["at"]
+                .as_str()
+                .unwrap()
+                .ends_with('Z')
+        );
+        assert!(ai_memory_core::okf::is_conformant(&parsed.frontmatter));
+    }
+
+    /// An unchanged rewrite must emit byte-identical markdown: the
+    /// `generated.at` inheritance keeps the timestamp, so neither git
+    /// nor the store sees a phantom new version.
+    #[tokio::test]
+    async fn an_idempotent_rewrite_keeps_the_file_bytes_and_the_row() {
+        let tmp = TempDir::new().unwrap();
+        let store = Store::open(tmp.path()).unwrap();
+        let ws = store.writer.get_or_create_workspace("w").await.unwrap();
+        let proj = store
+            .writer
+            .get_or_create_project(ws, "p", None)
+            .await
+            .unwrap();
+        let wiki = Wiki::new(tmp.path(), store.writer.clone()).unwrap();
+
+        let request = || {
+            req(
+                ws,
+                proj,
+                "notes/idem.md",
+                "stable body",
+                serde_json::json!({"title": "Idem"}),
+            )
+        };
+        let id1 = wiki.write_page(request()).await.unwrap();
+        let abs = wiki.project_root(ws, proj).join("notes/idem.md");
+        let bytes1 = std::fs::read(&abs).unwrap();
+
+        // Far enough apart that a re-stamped `generated.at` would differ.
+        tokio::time::sleep(std::time::Duration::from_millis(1100)).await;
+        let id2 = wiki.write_page(request()).await.unwrap();
+        let bytes2 = std::fs::read(&abs).unwrap();
+
+        assert_eq!(id1, id2, "identical rewrite superseded the page");
+        assert_eq!(bytes1, bytes2, "identical rewrite changed the file bytes");
+    }
+
+    /// A real content change updates `generated.at` — inheritance only
+    /// covers the unchanged case.
+    #[tokio::test]
+    async fn a_content_change_updates_generated_at() {
+        let tmp = TempDir::new().unwrap();
+        let store = Store::open(tmp.path()).unwrap();
+        let ws = store.writer.get_or_create_workspace("w").await.unwrap();
+        let proj = store
+            .writer
+            .get_or_create_project(ws, "p", None)
+            .await
+            .unwrap();
+        let wiki = Wiki::new(tmp.path(), store.writer.clone()).unwrap();
+
+        wiki.write_page(req(
+            ws,
+            proj,
+            "notes/evolving.md",
+            "v1",
+            serde_json::json!({"title": "Evolving"}),
+        ))
+        .await
+        .unwrap();
+        let abs = wiki.project_root(ws, proj).join("notes/evolving.md");
+        let at1 = ai_memory_core::okf::generated_at(
+            &crate::markdown::parse(&std::fs::read_to_string(&abs).unwrap())
+                .unwrap()
+                .frontmatter,
+        )
+        .unwrap()
+        .to_string();
+
+        tokio::time::sleep(std::time::Duration::from_millis(1100)).await;
+        wiki.write_page(req(
+            ws,
+            proj,
+            "notes/evolving.md",
+            "v2 - changed",
+            serde_json::json!({"title": "Evolving"}),
+        ))
+        .await
+        .unwrap();
+        let at2 = ai_memory_core::okf::generated_at(
+            &crate::markdown::parse(&std::fs::read_to_string(&abs).unwrap())
+                .unwrap()
+                .frontmatter,
+        )
+        .unwrap()
+        .to_string();
+        assert_ne!(at1, at2, "content change kept the old generated.at");
     }
 
     #[tokio::test]
@@ -4151,6 +4354,38 @@ mod tests {
         )
         .unwrap();
         assert!(meta.contains("workspace: empty-ws"));
+    }
+
+    /// Post-audit regression: manifests are OKF-typed at the writer
+    /// choke point, and a typeless manifest (the tug-of-war era, or a
+    /// hand edit) is HEALED by the next backfill instead of reverting
+    /// the migration's typing.
+    #[tokio::test]
+    async fn backfill_types_manifests_and_heals_typeless_ones() {
+        let tmp = TempDir::new().unwrap();
+        let store = Store::open(tmp.path()).unwrap();
+        let ws = store.writer.get_or_create_workspace("w").await.unwrap();
+        let wiki = Wiki::new(tmp.path(), store.writer.clone())
+            .unwrap()
+            .with_store_reader(store.reader.clone());
+
+        wiki.backfill_scope_manifests().await.unwrap();
+        let meta_path = tmp
+            .path()
+            .join("wiki")
+            .join(ws.to_string())
+            .join("_meta.md");
+        let meta = std::fs::read_to_string(&meta_path).unwrap();
+        assert!(meta.contains("type: Scope Manifest"), "{meta}");
+
+        // Second backfill: byte-stable, no churn.
+        assert_eq!(wiki.backfill_scope_manifests().await.unwrap(), 0);
+
+        // A typeless manifest (pre-fix state) is healed, not preserved.
+        std::fs::write(&meta_path, "---\nworkspace: w\n---\n").unwrap();
+        assert_eq!(wiki.backfill_scope_manifests().await.unwrap(), 1);
+        let healed = std::fs::read_to_string(&meta_path).unwrap();
+        assert!(healed.contains("type: Scope Manifest"), "{healed}");
     }
 
     #[cfg(any(unix, windows))]

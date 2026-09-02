@@ -147,6 +147,11 @@ hybrid paths apply the same bounded page-authority adjustment after candidate
 generation; embeddings improve relevance recall but do not decide which source
 is canonical.
 
+`AI_MEMORY_EMBEDDING_PROVIDER=local` needs no key and no server at all:
+sentence embeddings run in-process (pure-Rust `all-MiniLM-L6-v2`,
+384-dim), with the model fetched once into `<data_dir>/models/` under
+pinned checksums — see [`docs/local-embeddings.md`](local-embeddings.md).
+
 See [`docs/install.md#llm-provider-tiers`](docs/install.md#llm-provider-tiers)
 for env vars and Ollama/OpenRouter/Atlas Cloud/OrcaRouter examples, and
 [`docs/llm-provider-comparison.md`](docs/llm-provider-comparison.md)

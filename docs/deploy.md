@@ -188,6 +188,13 @@ gateway's worst-case generation time.
 
 ## Backups
 
+> **2.0 upgrade note:** the first start of a 2.0 image runs the OKF
+> format migration, which archives the entire data dir to
+> `/data/backups/` on the volume before touching anything (containers
+> are detected automatically; `AI_MEMORY_BACKUP_DIR` overrides). The
+> wiki homepage shows the archive's location until you delete it. See
+> [`MIGRATION-2.0.md`](MIGRATION-2.0.md).
+
 The data dir is whatever you mounted in `docker-compose.prod.yml`
 (default: `/var/opt/docker/utils/ai-memory/data/`). It contains:
 

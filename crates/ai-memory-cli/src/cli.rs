@@ -86,6 +86,8 @@ pub enum Command {
     Compact(CompactArgs),
     /// Snapshot wiki/, db/, and config.toml into a gzipped tarball.
     Backup(BackupArgs),
+    /// Export one project's wiki as an OKF v0.2 bundle tarball.
+    ExportOkf(ExportOkfArgs),
     /// Restore a backup tarball into the data directory.
     Restore(RestoreArgs),
     /// Rebuild the SQLite index from the wiki/ markdown (the "DB is
@@ -1295,6 +1297,20 @@ pub struct BackupArgs {
     pub to: PathBuf,
 }
 
+/// Arguments for `export-okf`.
+#[derive(Debug, Args)]
+pub struct ExportOkfArgs {
+    /// Workspace the project lives in.
+    #[arg(long, default_value = "default")]
+    pub workspace: String,
+    /// Project to export.
+    #[arg(long)]
+    pub project: String,
+    /// Destination tarball (`.tar.gz`).
+    #[arg(long, short = 'o')]
+    pub to: PathBuf,
+}
+
 /// Arguments for `restore`.
 #[derive(Debug, Args)]
 pub struct RestoreArgs {
@@ -2116,6 +2132,14 @@ pub struct ServeArgs {
     /// Skip the filesystem watcher; useful for transient debugging.
     #[arg(long)]
     pub no_watcher: bool,
+    /// DANGEROUS: start even when another process holds the single-instance
+    /// serve lock.
+    ///
+    /// Only for an operator who is certain the previous server is gone (a
+    /// hung holder, or a mount with unreliable locking): two live servers on
+    /// one data directory corrupt wiki and index state.
+    #[arg(long)]
+    pub force: bool,
     /// Workspace name (auto-created).
     ///
     /// Not marker-aware, unlike the client commands: the server has no
