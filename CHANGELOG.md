@@ -8,6 +8,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- Added a per-user launchd agent for macOS at
+  `packaging/launchd/com.github.akitaonrails.ai-memory.plist`, the counterpart
+  of the systemd user unit, shipped in both macOS release tarballs and
+  documented in [`docs/macos.md`](docs/macos.md). Until now macOS had no
+  documented way to keep the server running once the terminal that started it
+  closed, which silently stopped hook delivery. (#569)
+
+  launchd expands nothing, so the template carries explicit
+  `__AI_MEMORY_BIN__` / `__HOME__` placeholders rather than a home specifier,
+  and passes neither `--data-dir` nor `--config` — both already resolve to the
+  macOS platform defaults. `ProcessType` is pinned to `Interactive` because
+  leaving it unset makes launchd throttle the job's CPU and I/O bandwidth,
+  which the hook ingress budget cannot absorb. A bearer token, if one is
+  configured at all, goes in the rendered plist's `EnvironmentVariables`:
+  launchd has no `EnvironmentFile` equivalent.
 - `status` tells more of the truth (2.0 status audit): the wiki-format
   line (OKF migration state and the pre-migration backup archive while
   it exists), stored embedding triples by provider/model/dim, typed-edge
@@ -75,7 +90,41 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   OpenAI/OpenRouter/Codex; Anthropic `xhigh`/`max` per model; `none`
   does not send `thinking: disabled` on always-on Claude models).
 
-||||||| a613bf6d
+### Changed
+- Hybrid retrieval is on by default: an install with no
+  `embedding_provider` configured now gets in-process local embeddings
+  best-effort — the model downloads in the background on first start
+  (hybrid search enables on the next restart), existing pages are
+  backfilled by a one-shot startup pass, and hosts that cannot fetch
+  the model keep the previous FTS-only behaviour with a warning. Opt
+  out with `embedding_provider = "none"`; configured providers are
+  never overridden. Measured on LongMemEval-S: overall hit@5 rises
+  from 0.617 (FTS-only) to 0.779 with local embeddings.
+- An unscoped `memory_write_page` / `memory_handoff_begin` from a caller whose
+  active-project pointer does not resolve is now refused instead of written to
+  the server's default project. The page such a write produced was real,
+  attributed and searchable, and in a project nobody goes looking in. The error
+  names both remedies — pass explicit `workspace`/`project`, or install the
+  lifecycle hooks so the pointer is populated. Reads are unchanged: a read
+  answering from the default is a wrong answer the caller can see, a write is a
+  misfile they cannot. Callers with no identity coordinate at all
+  (anonymous/legacy) keep resolving through the shared slot, and an install with
+  no pointer information anywhere still resolves to the configured default
+  ([#564]).
+- The wiki's on-disk format is now natively the Open Knowledge Format
+  (OKF) v0.2: every page write fills the spec's `type`, `generated`,
+  `sources` and `stale_after` keys (ai-memory's own fields ride along as
+  spec-safe extensions), and each project directory is a conformant OKF
+  bundle with an `okf_version` index. Existing stores are migrated
+  automatically on the first 2.0 start — **backup-gated**: the entire
+  data dir is archived to the user's home (or `AI_MEMORY_BACKUP_DIR`)
+  and verified first, or the migration refuses to run; pages are
+  rewritten in place (same ids, same version rows, timestamps
+  untouched), and the wiki homepage shows where the archive is until it
+  is deleted. A data dir migrated by a newer binary is refused by older
+  2.0+ binaries instead of silently mixing formats. See
+  `docs/okf.md` and `docs/MIGRATION-2.0.md`.
+
 ### Fixed
 - The generated TypeScript integrations (OpenCode, OMP, Pi, OpenClaw)
   no longer silently drop lifecycle events when the server is
@@ -118,7 +167,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   is correct and stays; the torn write that triggered it is gone. Now routed
   through the same `write_atomic` (tmp + fsync + rename) the rest of the CLI
   already uses, per the project's atomic-writes invariant.
-||||||| parent of f14775e5 (fix: post-audit findings across the 2.0 range)
 - The 2.0 pre-release audit findings (post-merge adversarial review of
   the whole range): `export-okf` no longer fails on real deployments —
   scope manifests are OKF-typed at their writer (ending a startup
@@ -155,7 +203,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   quoted bag of words when the preserved operator form does not parse;
   deliberate well-formed operator queries are preserved as before. Found by
   the new LongMemEval retrieval harness on its first full run.
-
 - `ai-memory serve` now takes an exclusive lock on `<data-dir>/.serve.lock`
   before opening the store, so a second server pointed at the same data
   directory refuses at startup and names the holding process instead of
@@ -165,147 +212,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   unguarded for an operator who knows the previous server is gone, and a
   filesystem that cannot lock at all downgrades the guard to a warning
   instead of refusing to start. (#563)
-
-- `install-hooks` now writes the capture-mode opt-in atomically. It was
-  written in place, and every reader maps an unrecognised value onto
-  `denylist` — the less private mode — so a crash, a full disk or a killed
-  `ai-memory upgrade` mid-write left a truncated file that silently reverted
-  an `--capture-mode allowlist` opt-in to capture-by-default, which is exactly
-  what `persist_capture_mode` documents it must never do. The fallback itself
-  is correct and stays; the torn write that triggered it is gone. Now routed
-  through the same `write_atomic` (tmp + fsync + rename) the rest of the CLI
-  already uses, per the project's atomic-writes invariant.
-- `status` no longer overstates missing embeddings: empty-body pages —
-  which no embedder can ever cover and the backfill skips by rule — are
-  excluded from the "latest pages missing" figure and reported on their
-  own line (observed live as a permanently stuck 427).
-- Natural-language searches no longer surface stopword trash: bare
-  queries drop English stopwords before the FTS5 OR-join, so a page
-  containing five "the"s cannot outrank the page whose content matches,
-  and pages matching only stopwords no longer appear at all. Quoted
-  phrases and explicit-operator queries are untouched, and an
-  all-stopword query still searches its literal terms. Guarded by a
-  CI-runnable search-quality suite asserting ranking usefulness, not
-  just machinery.
-- `memory_query` no longer fails with `fts5: syntax error` when the query is
-  natural language containing parentheses, apostrophe-quoted phrases, or a
-  stray `OR`/`AND` (e.g. *"my visit to the Museum of Modern Art (MoMA) and
-  the 'Ancient Civilizations' exhibit"*). Prepared FTS5 queries are now
-  validated against the engine's own parser and degrade to an always-valid
-  quoted bag of words when the preserved operator form does not parse;
-  deliberate well-formed operator queries are preserved as before. Found by
-  the new LongMemEval retrieval harness on its first full run.
-
-- `ai-memory serve` now takes an exclusive lock on `<data-dir>/.serve.lock`
-  before opening the store, so a second server pointed at the same data
-  directory refuses at startup and names the holding process instead of
-  silently contending the single-writer actor, the wiki git handle, and the
-  active-project pointer. The OS releases the lock when the process exits,
-  so a crashed server never leaves the operator locked out; `--force` starts
-  unguarded for an operator who knows the previous server is gone, and a
-  filesystem that cannot lock at all downgrades the guard to a warning
-  instead of refusing to start. (#563)
-
-- `install-hooks` now writes the capture-mode opt-in atomically. It was
-  written in place, and every reader maps an unrecognised value onto
-  `denylist` — the less private mode — so a crash, a full disk or a killed
-  `ai-memory upgrade` mid-write left a truncated file that silently reverted
-  an `--capture-mode allowlist` opt-in to capture-by-default, which is exactly
-  what `persist_capture_mode` documents it must never do. The fallback itself
-  is correct and stays; the torn write that triggered it is gone. Now routed
-  through the same `write_atomic` (tmp + fsync + rename) the rest of the CLI
-  already uses, per the project's atomic-writes invariant.
-- `status` no longer overstates missing embeddings: empty-body pages —
-  which no embedder can ever cover and the backfill skips by rule — are
-  excluded from the "latest pages missing" figure and reported on their
-  own line (observed live as a permanently stuck 427).
-- Natural-language searches no longer surface stopword trash: bare
-  queries drop English stopwords before the FTS5 OR-join, so a page
-  containing five "the"s cannot outrank the page whose content matches,
-  and pages matching only stopwords no longer appear at all. Quoted
-  phrases and explicit-operator queries are untouched, and an
-  all-stopword query still searches its literal terms. Guarded by a
-  CI-runnable search-quality suite asserting ranking usefulness, not
-  just machinery.
-- `memory_query` no longer fails with `fts5: syntax error` when the query is
-  natural language containing parentheses, apostrophe-quoted phrases, or a
-  stray `OR`/`AND` (e.g. *"my visit to the Museum of Modern Art (MoMA) and
-  the 'Ancient Civilizations' exhibit"*). Prepared FTS5 queries are now
-  validated against the engine's own parser and degrade to an always-valid
-  quoted bag of words when the preserved operator form does not parse;
-  deliberate well-formed operator queries are preserved as before. Found by
-  the new LongMemEval retrieval harness on its first full run.
-
-- `ai-memory serve` now takes an exclusive lock on `<data-dir>/.serve.lock`
-  before opening the store, so a second server pointed at the same data
-  directory refuses at startup and names the holding process instead of
-  silently contending the single-writer actor, the wiki git handle, and the
-  active-project pointer. The OS releases the lock when the process exits,
-  so a crashed server never leaves the operator locked out; `--force` starts
-  unguarded for an operator who knows the previous server is gone, and a
-  filesystem that cannot lock at all downgrades the guard to a warning
-  instead of refusing to start. (#563)
-
 - Preserved third-party string-form lifecycle hooks whose commands merely
   contain `ai-memory` or `ai_memory` when `install-hooks --apply` refreshes
   ai-memory's own entries. Legacy ai-memory script and native hook commands
   remain recognized by their specific hook signatures.
-||||||| a613bf6d
-### Changed
-- Hybrid retrieval is on by default: an install with no
-  `embedding_provider` configured now gets in-process local embeddings
-  best-effort — the model downloads in the background on first start
-  (hybrid search enables on the next restart), existing pages are
-  backfilled by a one-shot startup pass, and hosts that cannot fetch
-  the model keep the previous FTS-only behaviour with a warning. Opt
-  out with `embedding_provider = "none"`; configured providers are
-  never overridden. Measured on LongMemEval-S: overall hit@5 rises
-  from 0.617 (FTS-only) to 0.779 with local embeddings.
-- An unscoped `memory_write_page` / `memory_handoff_begin` from a caller whose
-  active-project pointer does not resolve is now refused instead of written to
-  the server's default project. The page such a write produced was real,
-  attributed and searchable, and in a project nobody goes looking in. The error
-  names both remedies — pass explicit `workspace`/`project`, or install the
-  lifecycle hooks so the pointer is populated. Reads are unchanged: a read
-  answering from the default is a wrong answer the caller can see, a write is a
-  misfile they cannot. Callers with no identity coordinate at all
-  (anonymous/legacy) keep resolving through the shared slot, and an install with
-  no pointer information anywhere still resolves to the configured default
-  ([#564]).
-- The wiki's on-disk format is now natively the Open Knowledge Format
-  (OKF) v0.2: every page write fills the spec's `type`, `generated`,
-  `sources` and `stale_after` keys (ai-memory's own fields ride along as
-  spec-safe extensions), and each project directory is a conformant OKF
-  bundle with an `okf_version` index. Existing stores are migrated
-  automatically on the first 2.0 start — **backup-gated**: the entire
-  data dir is archived to the user's home (or `AI_MEMORY_BACKUP_DIR`)
-  and verified first, or the migration refuses to run; pages are
-  rewritten in place (same ids, same version rows, timestamps
-  untouched), and the wiki homepage shows where the archive is until it
-  is deleted. A data dir migrated by a newer binary is refused by older
-  2.0+ binaries instead of silently mixing formats. See
-  `docs/okf.md` and `docs/MIGRATION-2.0.md`.
 
-||||||| 7907fd4d
 ## [1.39.0] - 2026-09-01
 
 ### Added
-- Added a per-user launchd agent for macOS at
-  `packaging/launchd/com.github.akitaonrails.ai-memory.plist`, the counterpart
-  of the systemd user unit, shipped in both macOS release tarballs and
-  documented in [`docs/macos.md`](docs/macos.md). Until now macOS had no
-  documented way to keep the server running once the terminal that started it
-  closed, which silently stopped hook delivery. (#569)
-
-  launchd expands nothing, so the template carries explicit
-  `__AI_MEMORY_BIN__` / `__HOME__` placeholders rather than a home specifier,
-  and passes neither `--data-dir` nor `--config` — both already resolve to the
-  macOS platform defaults. `ProcessType` is pinned to `Interactive` because
-  leaving it unset makes launchd throttle the job's CPU and I/O bandwidth,
-  which the hook ingress budget cannot absorb. A bearer token, if one is
-  configured at all, goes in the rendered plist's `EnvironmentVariables`:
-  launchd has no `EnvironmentFile` equivalent.
-
 - Added `ai-memory resume`, an interactive picker for recent managed
   workstreams from the current checkout and validated client-local links. It
   launches the selected named workstream with the established automatic harness
