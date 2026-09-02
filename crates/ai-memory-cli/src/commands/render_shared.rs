@@ -1759,6 +1759,114 @@ fn claude_code_windows_command_is_unchanged_by_the_codex_fix() {
     assert!(cmd.starts_with('"'), "expected a quoted exe path: {cmd}");
 }
 
+/// TypeScript runtime shared by every generated integration that must
+/// survive an unreachable server (#580): a spool writer emitting the CLI
+/// `hook-spool` on-disk contract (same filenames, same `SpoolEntry` JSON,
+/// same permissions) plus a self-drain. Callers only need `TOKEN`,
+/// `timeoutSignal`, and the node `join`/`homedir`/fs imports in scope.
+pub(crate) fn ts_spool_runtime() -> &'static str {
+    r#"
+// ---- offline spool (#580): the same on-disk contract as `ai-memory hook` ----
+// <data_dir>/hook-spool, entries the CLI's hook-drain understands. Written on
+// delivery failure, drained here on first use and after each queue flush; the
+// ingest_key minted at spool time makes a double drain idempotent server-side.
+function hookSpoolDir(): string {
+  const env = process.env.AI_MEMORY_DATA_DIR;
+  if (env && env.trim()) return join(env, "hook-spool");
+  const home = homedir();
+  const base =
+    process.platform === "darwin"
+      ? join(home, "Library", "Application Support", "ai-memory")
+      : process.platform === "win32"
+        ? join(process.env.LOCALAPPDATA ?? join(home, "AppData", "Local"), "ai-memory")
+        : join(process.env.XDG_DATA_HOME?.trim() || join(home, ".local", "share"), "ai-memory");
+  return join(base, "hook-spool");
+}
+
+let spoolSeq = 0;
+
+function spoolFailedHook(url: URL | string, payload: Record<string, unknown>): void {
+  try {
+    const dir = hookSpoolDir();
+    mkdirSync(dir, { recursive: true, mode: 0o700 });
+    const createdMs = Date.now();
+    // Idempotency key minted ONCE at spool time and baked into the URL,
+    // so this plugin's drain and the CLI's drain can both deliver the
+    // entry without double-ingesting.
+    const key = `ts${createdMs.toString(16)}${Math.floor(Math.random() * 0xffffffff).toString(16)}`;
+    const u = new URL(String(url));
+    if (!u.searchParams.has("ingest_key")) u.searchParams.set("ingest_key", key);
+    const token = TOKEN;
+    const entry = {
+      url: u.toString(),
+      body: JSON.stringify(payload),
+      created_ms: createdMs,
+      auth_mode: token ? "static" : "none",
+      ...(token ? { token } : {}),
+      attempts: 0,
+    };
+    const seq = (spoolSeq++ & 0xffffffff).toString(16).padStart(16, "0");
+    const name = `${String(createdMs).padStart(13, "0")}-${process.pid}-${seq}.json`;
+    const tmp = join(dir, `${name}.tmp`);
+    writeFileSync(tmp, JSON.stringify(entry), { mode: 0o600 });
+    renameSync(tmp, join(dir, name));
+  } catch (_e) {
+    // Spooling is best-effort on top of best-effort capture.
+  }
+}
+
+let spoolDrainPromise: Promise<void> | undefined;
+
+function requestSpoolDrain(): void {
+  if (spoolDrainPromise) return;
+  spoolDrainPromise = drainHookSpool().finally(() => {
+    spoolDrainPromise = undefined;
+  });
+}
+
+async function drainHookSpool(): Promise<void> {
+  let names: string[];
+  try {
+    names = readdirSync(hookSpoolDir()).filter((n) => n.endsWith(".json"));
+  } catch (_e) {
+    return; // no spool dir = nothing queued
+  }
+  names.sort();
+  for (const name of names.slice(0, 500)) {
+    const file = join(hookSpoolDir(), name);
+    let entry: { url?: string; body?: string; token?: string };
+    try {
+      entry = JSON.parse(readMarkerText(file, "utf8"));
+    } catch (_e) {
+      continue; // torn or foreign file; leave it for the CLI drain
+    }
+    if (!entry.url || typeof entry.body !== "string") continue;
+    try {
+      const headers: Record<string, string> = { "Content-Type": "application/json" };
+      if (entry.token) headers["Authorization"] = `Bearer ${entry.token}`;
+      const resp = await fetch(entry.url, {
+        method: "POST",
+        headers,
+        body: entry.body,
+        signal: timeoutSignal(2000),
+      }).catch(() => undefined);
+      if (!resp) return; // still unreachable; stop, keep the backlog
+      if (resp.ok || (resp.status >= 400 && resp.status < 500)) {
+        // Delivered, or permanently rejected - either way, done with it.
+        try { unlinkSync(file); } catch (_e) {}
+      } else {
+        return; // 5xx: server unhappy; retry a later drain
+      }
+    } catch (_e) {
+      return;
+    }
+    await new Promise<void>((r) => setTimeout(r, 50));
+  }
+}
+
+"#
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

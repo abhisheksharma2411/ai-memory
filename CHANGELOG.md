@@ -77,6 +77,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ||||||| a613bf6d
 ### Fixed
+- The generated TypeScript integrations (OpenCode, OMP, Pi, OpenClaw)
+  no longer silently drop lifecycle events when the server is
+  unreachable (#580). A failed or 5xx delivery is spooled to
+  `<data_dir>/hook-spool/` in the CLI's exact on-disk format — so
+  `ai-memory hook-drain` and the shell hooks' piggyback drain deliver
+  the backlog too — and each integration drains its own spool once the
+  server is reachable again. Entries carry an idempotency key minted at
+  spool time, so concurrent drains cannot double-ingest an event.
 - `memory_read_page` no longer ships a root-level `anyOf` in its tool
   schema (#577): the Anthropic Messages API rejects root combinators
   outright, so any provider-agnostic client routing tools through it

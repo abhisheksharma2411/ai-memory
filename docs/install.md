@@ -1353,6 +1353,17 @@ OpenClaw, OMP / Oh My Pi, and Pi do not need script extraction because
 `install-hooks` generates TypeScript plugin/extension files for them
 instead. For Pi, the generated extension also provides the MCP bridge.
 
+The generated TypeScript integrations survive an unreachable server the
+same way the native hooks do: a delivery that fails at the network level
+(or gets a 5xx) is written to `<data_dir>/hook-spool/` in the exact
+format `ai-memory hook-drain` reads, and the plugin drains that backlog
+itself once the server is reachable again — so a day of laptop work off
+the server's network is captured, not silently dropped. Each spooled
+entry carries an idempotency key, so the plugin's own drain and a
+manual `hook-drain` can race without double-ingesting. Note the spool
+lands in the *agent host's* data dir (`AI_MEMORY_DATA_DIR` or the
+platform default), which is where a native `ai-memory` install looks.
+
 This path is friction-free when:
 - You have curl + bash but not docker
 - You don't need to run a local ai-memory server (you're a client of
