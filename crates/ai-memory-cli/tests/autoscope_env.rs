@@ -45,6 +45,9 @@ fn spawn_and_wait_for_log(
     ])
     .arg(tmp.path())
     .env("AI_MEMORY_DATA_DIR", tmp.path())
+    // Hermetic: the 2.0 default would otherwise start a background
+    // model download on every spawned server.
+    .env("AI_MEMORY_EMBEDDING_PROVIDER", "none")
     // Force tracing to spit at least info-level so the
     // "active-project isolation mode" line is rendered to stderr.
     .env("RUST_LOG", "info")

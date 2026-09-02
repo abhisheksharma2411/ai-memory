@@ -704,7 +704,11 @@ fn persist_capture_mode(data_dir: &Path, requested: Option<CaptureModeArg>) -> R
     };
     fs::create_dir_all(data_dir)
         .with_context(|| format!("creating data dir {}", data_dir.display()))?;
-    fs::write(&path, format!("{value}\n"))
+    // Atomically, because every reader maps an unrecognised value onto
+    // `denylist`: a torn write would not corrupt the opt-in, it would silently
+    // revert it to capture-by-default (`CONTRIBUTING.md`, "Atomic file writes
+    // only").
+    ai_memory_wiki::write_atomic(&path, format!("{value}\n").as_bytes())
         .with_context(|| format!("writing {}", path.display()))?;
     Ok(value.to_string())
 }
@@ -5017,6 +5021,52 @@ mod tests {
                 .unwrap()
                 .trim(),
             "allowlist"
+        );
+    }
+
+    /// #446's opt-in is stored as a bare word, and every reader maps anything
+    /// it does not recognise onto `denylist` — the *less* private mode. That
+    /// fallback is deliberate and tested
+    /// (`hook.rs`: `unreadable_or_unknown_mode_falls_back_to_denylist_not_allowlist`);
+    /// what must never happen is the truncated file that triggers it. An
+    /// in-place write truncates before it writes, so a crash, a full disk or a
+    /// killed `upgrade` mid-write leaves exactly that — and the next hook run
+    /// reads it as capture-by-default, silently undoing the opt-in the doc
+    /// comment on `persist_capture_mode` promises to preserve.
+    ///
+    /// Replacement rather than truncation is the property that rules the window
+    /// out, and it is observable: a rename gives the path a new inode, an
+    /// in-place rewrite keeps the old one. This fails against `fs::write`.
+    #[cfg(unix)]
+    #[test]
+    fn rewriting_the_capture_mode_replaces_the_file_rather_than_truncating_it() {
+        use std::os::unix::fs::MetadataExt;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join(crate::commands::hook::CAPTURE_MODE_FILE);
+
+        persist_capture_mode(tmp.path(), Some(CaptureModeArg::Allowlist)).unwrap();
+        let before = fs::metadata(&path).unwrap().ino();
+
+        persist_capture_mode(tmp.path(), Some(CaptureModeArg::Denylist)).unwrap();
+        let after = fs::metadata(&path).unwrap().ino();
+
+        assert_ne!(
+            before, after,
+            "the capture mode must be replaced by rename, not rewritten in \
+             place: an in-place write is observable truncated, and a truncated \
+             file reads back as denylist"
+        );
+
+        let leftovers: Vec<String> = fs::read_dir(tmp.path())
+            .unwrap()
+            .flatten()
+            .map(|entry| entry.file_name().to_string_lossy().into_owned())
+            .filter(|name| name.starts_with(".ai-memory-tmp."))
+            .collect();
+        assert!(
+            leftovers.is_empty(),
+            "the staging tempfile must not survive the write: {leftovers:?}"
         );
     }
 

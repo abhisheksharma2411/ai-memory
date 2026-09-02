@@ -205,11 +205,18 @@ fn docker_publish_jobs_use_prebuilt_binaries() {
 
     let ci = read_repo(".github/workflows/ci.yml");
     assert!(ci.contains("ci-ai-memory-${{ matrix.artifact }}"));
-    assert!(ci.contains("artifact: linux-x86_64"));
-    assert!(ci.contains("artifact: macos-aarch64"));
-    assert!(ci.contains("artifact: macos-x86_64"));
-    assert!(ci.contains("runner: macos-15"));
-    assert!(ci.contains("runner: macos-15-intel"));
+    // The release-build matrix is a conditional expression since the
+    // fast-CI split: Linux always, the macOS legs on full-ci/dispatch.
+    // The full branch must keep every release artifact and runner.
+    assert!(ci.contains(r#"{"artifact": "linux-x86_64", "runner": "ubuntu-22.04"}"#));
+    assert!(ci.contains(r#"{"artifact": "macos-aarch64", "runner": "macos-15"}"#));
+    assert!(ci.contains(r#"{"artifact": "macos-x86_64", "runner": "macos-15-intel"}"#));
+    // and the reduced branch still builds the Linux artifact docker uses
+    assert!(
+        ci.matches(r#"{"artifact": "linux-x86_64", "runner": "ubuntu-22.04"}"#)
+            .count()
+            >= 2
+    );
     assert!(ci.contains("--target runtime-prebuilt-amd64"));
 }
 

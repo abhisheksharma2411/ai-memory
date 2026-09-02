@@ -96,6 +96,17 @@ log_level = "info"
 # will not shrink after the first prune; the `ai-memory backup` tarball will.
 #   - A quarter of raw capture: observation_retention_days = 90
 #   - Smaller transactions on a slow disk: observation_prune_batch = 2000
+# --- Embeddings (hybrid retrieval) ---------------------------------------
+# Unset = the 2.0 default: in-process local embeddings (all-MiniLM-L6-v2,
+# 384-dim), no API key, no data egress. The ~87 MB model is fetched once
+# into <data_dir>/models/ in the background (checksum-pinned; hybrid search
+# enables on the next start), and existing pages are backfilled
+# automatically at startup. See docs/local-embeddings.md.
+#   embedding_provider = "none"           # opt out (FTS + entity + graph only)
+#   embedding_provider = "openai"         # or voyage | google | openai-compat
+#   embedding_model    = "..."            # provider-specific override
+#   embedding_dim      = 384              # must match the model
+
 [decay]
 lambda = 0.02
 sigma = 0.6
@@ -148,6 +159,9 @@ allowlist = []
 # operator's bounded namespace and only shared plus own slots are injected into
 # that operator's session brief and consolidation prompt. Exact page reads and
 # searches remain project-wide: this is context-injection isolation, not RBAC.
+# Slots are the few always-loaded pages (project context, invariants)
+# injected into every session brief. Adjust only if briefs feel bloated
+# (lower the caps) or your project context page keeps getting clipped.
 [slots]
 per_user = false
 
@@ -155,6 +169,10 @@ per_user = false
 # differ by provider and model. Their sum must fit the model's context window;
 # leave additional headroom for tokenizer variance. Small local models must
 # lower both values together. Startup minimums are 6000 input and 1000 output.
+# Consolidation turns a finished session's raw observations into wiki
+# pages. Off (zero-LLM) you still get session pages + search; with an
+# LLM you get distilled concept/gotcha/rule pages. Reach for these knobs
+# when summaries feel too chatty (lower max tokens) or truncated (raise).
 [consolidation]
 max_input_tokens = 100000
 max_output_tokens = 32000
@@ -195,6 +213,14 @@ targets = ["_rules", "procedures"]
 min_delta = 0.0
 
 [auto_improve.scheduler]
+# Cross-session "experience" pass (2.0, docs/experience.md): every N new
+# completed sessions, read the last few session summaries side by side and
+# stage proposals for knowledge only visible ACROSS sessions (repeated
+# workflows, re-stated preferences, contradictions with stored decisions).
+# Same review/staging/approval path as per-session auto-improve. 0 = off
+# (the default; opt in once per-session auto-improve is working for you).
+#   experience_every_sessions = 5
+#   experience_sessions = 10
 enabled = true
 interval_secs = 3600
 max_sessions_per_tick = 1 # per project

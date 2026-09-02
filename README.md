@@ -106,11 +106,10 @@ caveats is in [`docs/support-matrix.md`](docs/support-matrix.md).
 | Grok Build CLI | Supported |
 | Swival CLI | MCP-only |
 | Zero | Supported |
-| ZCode | MCP-only |
+| ZCode | Supported |
 | Kimi Code | Supported |
 | Kiro CLI | Supported |
 | Pool | Hooks-only |
-| ZCode | Hooks-only |
 | VS Code Copilot | MCP-only |
 | Zed | MCP-only |
 | Hermes Agent | Community |
@@ -344,7 +343,13 @@ diagram, crate breakdown, schema notes, and invariants.
 - [`docs/security.md`](docs/security.md) - the full security model.
 - [`docs/research-2026-landscape.md`](docs/research-2026-landscape.md) - how the field looks and where we sit in it.
 - [`docs/ROADMAP-2.0.md`](docs/ROADMAP-2.0.md) - the plan for the 2.0 release, one item at a time.
-- [`docs/ROADMAP-2.0.md`](docs/ROADMAP-2.0.md) - the 2.0 plan.
+- [`docs/okf.md`](docs/okf.md) - the wiki is natively an Open Knowledge Format (OKF v0.2) bundle; design and field mapping.
+- [`docs/typed-edges.md`](docs/typed-edges.md) - typed relation edges (`causes` / `fixes` / `contradicts`) and how lint uses them.
+- [`docs/temporal.md`](docs/temporal.md) - ingestion-time validity on the entity index and `as_of` time-travel queries.
+- [`docs/local-embeddings.md`](docs/local-embeddings.md) - in-process embeddings with no API key (`embedding_provider = "local"`).
+- [`docs/experience.md`](docs/experience.md) - the opt-in cross-session abstraction pass: knowledge visible only across trajectories.
+- [`docs/MIGRATION-2.0.md`](docs/MIGRATION-2.0.md) - upgrading an existing store to 2.0: the backup-gated automatic migration and how to restore.
+- [`docs/benchmarks/`](docs/benchmarks/README.md) - published retrieval-quality numbers with provenance, reproducible from the in-repo harness.
 
 ## Influences and prior art
 

@@ -598,6 +598,116 @@ pub(crate) fn path_search_text(path: &str) -> String {
     format!("{segments} {words}")
 }
 
+/// Count latest page rows whose frontmatter is not yet OKF-conformant
+/// (missing `type` or `generated.at`). Read-only; the migration uses it
+/// to decide whether the backup gate must engage at all.
+pub fn okf_nonconformant_latest_pages(conn: &Connection) -> StoreResult<u64> {
+    let mut stmt = conn.prepare("SELECT path, frontmatter_json FROM pages WHERE is_latest = 1")?;
+    let rows: Vec<(String, String)> = stmt
+        .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?
+        .collect::<Result<_, _>>()?;
+    let mut pending = 0u64;
+    for (path, fm_str) in rows {
+        let fm: serde_json::Value = serde_json::from_str(&fm_str).unwrap_or_default();
+        let mut conformed = fm.clone();
+        ai_memory_core::okf::conform_frontmatter(&path, &mut conformed);
+        if conformed != fm || ai_memory_core::okf::generated_at(&fm).is_none() {
+            pending += 1;
+        }
+    }
+    Ok(pending)
+}
+
+/// One latest-page row rewritten in place by [`okf_migrate_latest_pages`].
+#[derive(Debug, Clone)]
+pub struct OkfMigratedPage {
+    /// Owning workspace.
+    pub workspace_id: ai_memory_core::WorkspaceId,
+    /// Owning project.
+    pub project_id: ai_memory_core::ProjectId,
+    /// Wiki-relative page path.
+    pub path: String,
+    /// The `generated.at` stamped from the row's own `updated_at`.
+    pub generated_at: String,
+}
+
+/// One-shot OKF migration of every latest page row (docs/okf.md): conform
+/// the frontmatter IN PLACE — same id, same version row, `updated_at`
+/// untouched, body untouched — stamping `generated.at` from the row's own
+/// `updated_at` so nothing looks freshly written. Historical versions
+/// (`is_latest = 0`) stay as they were. Idempotent: conformed rows are
+/// left alone, so a re-run rewrites zero pages.
+pub fn okf_migrate_latest_pages(conn: &mut Connection) -> StoreResult<Vec<OkfMigratedPage>> {
+    type LatestPageRow = (Vec<u8>, Vec<u8>, Vec<u8>, String, String, i64);
+    let tx = conn.transaction()?;
+    let mut migrated = Vec::new();
+    {
+        let mut stmt = tx.prepare(
+            "SELECT id, workspace_id, project_id, path, frontmatter_json, updated_at              FROM pages WHERE is_latest = 1",
+        )?;
+        let rows: Vec<LatestPageRow> = stmt
+            .query_map([], |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                    row.get(5)?,
+                ))
+            })?
+            .collect::<Result<_, _>>()?;
+        drop(stmt);
+        for (id, ws, proj, path, fm_str, updated_at) in rows {
+            let fm: serde_json::Value = serde_json::from_str(&fm_str).unwrap_or_default();
+            let mut conformed = fm.clone();
+            ai_memory_core::okf::conform_frontmatter(&path, &mut conformed);
+            let at = jiff::Timestamp::from_microsecond(updated_at)
+                .unwrap_or(jiff::Timestamp::UNIX_EPOCH)
+                .strftime("%Y-%m-%dT%H:%M:%SZ")
+                .to_string();
+            if ai_memory_core::okf::generated_at(&conformed).is_none() {
+                ai_memory_core::okf::stamp_generated_at(&mut conformed, &at);
+            }
+            if conformed == fm {
+                continue;
+            }
+            tx.execute(
+                "UPDATE pages SET frontmatter_json = ?1 WHERE id = ?2",
+                params![serde_json::to_string(&conformed)?, id],
+            )?;
+            migrated.push(OkfMigratedPage {
+                workspace_id: ai_memory_core::WorkspaceId::from_slice(&ws)?,
+                project_id: ai_memory_core::ProjectId::from_slice(&proj)?,
+                path,
+                generated_at: ai_memory_core::okf::generated_at(&conformed)
+                    .unwrap_or(&at)
+                    .to_string(),
+            });
+        }
+    }
+    tx.commit()?;
+    Ok(migrated)
+}
+
+/// Stamp the per-version `generated.at` (write time, UTC) onto conformed
+/// frontmatter and serialize it. Runs only on the paths that create a new
+/// version row — the idempotent short-circuit above never reaches it, so
+/// an unchanged page keeps its original timestamp.
+fn stamped_frontmatter(mut conformed: serde_json::Value, now_us: i64) -> StoreResult<String> {
+    // The wiki layer stamps (or inherits) `generated.at` before the file
+    // is emitted; keep that value so file and row stay byte-aligned. The
+    // stamp here covers writers that reach the store without a wiki file.
+    if ai_memory_core::okf::generated_at(&conformed).is_none() {
+        let ts = jiff::Timestamp::from_microsecond(now_us)
+            .unwrap_or(jiff::Timestamp::UNIX_EPOCH)
+            .strftime("%Y-%m-%dT%H:%M:%SZ")
+            .to_string();
+        ai_memory_core::okf::stamp_generated_at(&mut conformed, &ts);
+    }
+    Ok(serde_json::to_string(&conformed)?)
+}
+
 pub(crate) fn upsert_page_in_tx(
     tx: &rusqlite::Transaction<'_>,
     page: &NewPage,
@@ -609,7 +719,12 @@ pub(crate) fn upsert_page_in_tx(
         hasher.update(page.body.as_bytes());
         hasher.finalize().into()
     };
-    let frontmatter_str = serde_json::to_string(&page.frontmatter_json)?;
+    // OKF conformance at the single write choke point (docs/okf.md):
+    // fill the deterministic keys, compare idempotency modulo the
+    // per-version `generated.at`, and stamp `at` only when content
+    // actually changed (below).
+    let mut conformed = page.frontmatter_json.clone();
+    ai_memory_core::okf::conform_frontmatter(page.path.as_str(), &mut conformed);
     let tier_str = page.tier.as_str();
 
     let existing: Option<ExistingPageVersion> = tx
@@ -635,18 +750,29 @@ pub(crate) fn upsert_page_in_tx(
         .optional()?;
 
     if let Some(existing) = existing {
+        let existing_fm: serde_json::Value =
+            serde_json::from_str(&existing.frontmatter_json).unwrap_or_default();
         if existing.body_sha256 == body_sha256
-            && existing.frontmatter_json == frontmatter_str
+            && ai_memory_core::okf::strip_generated_at(&existing_fm)
+                == ai_memory_core::okf::strip_generated_at(&conformed)
             && existing.title == page.title
             && existing.tier == tier_str
             && existing.pinned == i64::from(page.pinned)
         {
             return PageId::from_slice(&existing.id).map_err(StoreError::from);
         }
+        let frontmatter_str = stamped_frontmatter(conformed, now)?;
         let new_id = PageId::new();
         tx.execute(
             "UPDATE pages SET is_latest = 0 WHERE id = ?1",
             params![&existing.id],
+        )?;
+        // Close the superseded version's entity-link windows at the new
+        // version's birth instant (docs/temporal.md).
+        tx.execute(
+            "UPDATE entity_page_links SET superseded_at = ?2 \
+             WHERE page_id = ?1 AND superseded_at IS NULL",
+            params![&existing.id, now],
         )?;
         tx.execute(
             "INSERT INTO pages \
@@ -673,7 +799,7 @@ pub(crate) fn upsert_page_in_tx(
             ],
         )?;
         replace_links_in_tx(tx, &new_id, page)?;
-        attach_entities_in_tx(tx, &new_id, page)?;
+        attach_entities_in_tx(tx, &new_id, page, now)?;
         refresh_incoming_links_for_path(tx, page, &new_id)?;
         audit(
             tx,
@@ -688,6 +814,7 @@ pub(crate) fn upsert_page_in_tx(
         )?;
         return Ok(new_id);
     }
+    let frontmatter_str = stamped_frontmatter(conformed, now)?;
     let new_id = PageId::new();
     tx.execute(
         "INSERT INTO pages \
@@ -712,7 +839,7 @@ pub(crate) fn upsert_page_in_tx(
         ],
     )?;
     replace_links_in_tx(tx, &new_id, page)?;
-    attach_entities_in_tx(tx, &new_id, page)?;
+    attach_entities_in_tx(tx, &new_id, page, now)?;
     refresh_incoming_links_for_path(tx, page, &new_id)?;
     audit(
         tx,
@@ -735,6 +862,7 @@ fn attach_entities_in_tx(
     tx: &rusqlite::Transaction<'_>,
     page_id: &PageId,
     page: &NewPage,
+    version_created_at: i64,
 ) -> StoreResult<()> {
     if page.entities.is_empty() {
         return Ok(());
@@ -757,10 +885,14 @@ fn attach_entities_in_tx(
             ],
             |row| row.get(0),
         )?;
+        // Bi-temporal-lite (docs/temporal.md): the link's window opens
+        // when its page version was created and stays open until the
+        // version is superseded (closed in `upsert_page_in_tx`).
         tx.execute(
-            "INSERT INTO entity_page_links (entity_id, page_id) VALUES (?1, ?2) \
+            "INSERT INTO entity_page_links (entity_id, page_id, valid_from) \
+             VALUES (?1, ?2, ?3) \
              ON CONFLICT (entity_id, page_id) DO NOTHING",
-            params![entity_id, page_id.as_bytes()],
+            params![entity_id, page_id.as_bytes(), version_created_at],
         )?;
     }
     Ok(())
@@ -778,10 +910,14 @@ fn replace_links_in_tx(
 
     let mut seen = BTreeSet::new();
     for link in &page.links {
+        // The relation joins the dedupe key (and the table's PK): a
+        // typed edge and a plain reference to the same target are two
+        // different rows, mirroring `link_type` in the schema.
         let key = (
             link.workspace.clone(),
             link.project.clone(),
             link.path.as_str().to_string(),
+            link.relation,
         );
         if !seen.insert(key) {
             continue;
@@ -791,13 +927,15 @@ fn replace_links_in_tx(
         tx.execute(
             "INSERT INTO links \
                  (from_page_id, to_page_id, to_workspace, to_project, to_path, link_type) \
-             VALUES (?1, ?2, ?3, ?4, ?5, 'references')",
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
             params![
                 from_page_id.as_bytes(),
                 to_page_blob,
                 link.workspace,
                 link.project,
                 link.path.as_str(),
+                link.relation
+                    .map_or("references", ai_memory_core::Relation::as_str),
             ],
         )?;
     }
@@ -4229,7 +4367,70 @@ pub(crate) mod tests {
         }
     }
 
+    /// A subscriber that exists only to be counted (#558).
+    ///
+    /// `tracing` resolves a callsite's interest **once**, on first execution,
+    /// and caches the answer process-globally. While only one `Dispatch` is
+    /// alive — which `WARNING_CAPTURE_LOCK` guarantees, since it serialises the
+    /// captures — `tracing-core` takes a fast path that resolves that answer
+    /// from the *registering thread's own* default subscriber
+    /// (`callsite.rs`: `if has_just_one { … dispatcher::get_default(f) }`).
+    /// A thread without one resolves to `Interest::never()`, and every later
+    /// capture of that callsite goes blind.
+    ///
+    /// Keeping a second `Dispatch` alive for the life of the test binary
+    /// defeats that: with more than one registered, resolution consults every
+    /// live dispatcher instead of only the current thread's, so the capture's
+    /// own subscriber counts no matter which thread registers first.
+    ///
+    /// **Being counted is the whole contribution.** It is never installed as
+    /// anyone's default and never receives an event. Verified by control: see
+    /// `a_subscriberless_thread_must_not_disable_a_callsite_the_capture_needs`,
+    /// which fails when this pin is removed and passes with it, whatever this
+    /// subscriber answers.
+    ///
+    /// The two ways it could stop being invisible are not symmetric, and the
+    /// difference is easy to get backwards:
+    ///
+    /// - **Interest is not a maximum.** `Interest::and` keeps the value when
+    ///   two dispatchers agree and collapses to `sometimes()` when they differ.
+    ///   This pin answers `never` (its `enabled` is false, and the default
+    ///   `register_callsite` follows that), so pairing it with a capture that
+    ///   answers `always` yields `sometimes` — a per-event `enabled()` call,
+    ///   answered by whichever subscriber is actually in scope. That is why an
+    ///   inert pin cannot silence a callsite someone else wants.
+    /// - **The level hint *is* a maximum**, and a `None` hint is read as
+    ///   `TRACE`. Hence the explicit `Some(OFF)` below.
+    struct RegistryPin;
+
+    impl tracing::Subscriber for RegistryPin {
+        /// Explicit, and load-bearing — see
+        /// `the_registry_pin_stays_invisible_to_the_global_max_level`.
+        fn max_level_hint(&self) -> Option<tracing::level_filters::LevelFilter> {
+            Some(tracing::level_filters::LevelFilter::OFF)
+        }
+
+        fn enabled(&self, _: &tracing::Metadata<'_>) -> bool {
+            false
+        }
+
+        fn new_span(&self, _: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+            tracing::span::Id::from_u64(1)
+        }
+
+        fn record(&self, _: &tracing::span::Id, _: &tracing::span::Record<'_>) {}
+        fn record_follows_from(&self, _: &tracing::span::Id, _: &tracing::span::Id) {}
+        fn event(&self, _: &tracing::Event<'_>) {}
+        fn enter(&self, _: &tracing::span::Id) {}
+        fn exit(&self, _: &tracing::span::Id) {}
+    }
+
+    /// Holds the second dispatcher alive. Constructing a `Dispatch` is what
+    /// registers it, so simply keeping this initialised is the mechanism.
+    static REGISTRY_PIN: std::sync::OnceLock<tracing::Dispatch> = std::sync::OnceLock::new();
+
     fn capture_warnings(run: impl FnOnce()) -> String {
+        REGISTRY_PIN.get_or_init(|| tracing::Dispatch::new(RegistryPin));
         let _guard = WARNING_CAPTURE_LOCK.lock().unwrap();
         let logs = CapturedLogs::default();
         let subscriber = tracing_subscriber::fmt()
@@ -4239,6 +4440,84 @@ pub(crate) mod tests {
             .finish();
         tracing::subscriber::with_default(subscriber, run);
         String::from_utf8(logs.0.lock().unwrap().clone()).unwrap()
+    }
+
+    /// Guards the `max_level_hint` override on [`RegistryPin`] against being
+    /// removed as apparent dead code.
+    ///
+    /// The pin has to be *registered* to do its job, and every registered
+    /// dispatcher feeds `tracing`'s global max level — which `rebuild_interest`
+    /// computes as the maximum across live dispatchers, reading a `None` hint
+    /// as `TRACE`. Dropping the override therefore raises this binary's global
+    /// level from `OFF` to `TRACE` for good after the first capture. Measured
+    /// both ways: with `Some(OFF)` the level follows exactly the `OFF -> WARN`
+    /// path it follows with no pin at all; without the override it goes to
+    /// `TRACE` and stays there.
+    ///
+    /// Nothing observable breaks when that happens, which is precisely why it
+    /// wants a guard rather than a comment — every `trace!` and `debug!`
+    /// callsite in the crate would quietly start being evaluated instead of
+    /// short-circuiting.
+    #[test]
+    fn the_registry_pin_stays_invisible_to_the_global_max_level() {
+        use tracing::Subscriber as _;
+
+        assert_eq!(
+            RegistryPin.max_level_hint(),
+            Some(tracing::level_filters::LevelFilter::OFF),
+            "a None hint is read as TRACE, which would raise the whole binary's \
+             global max level as a side effect of pinning the dispatcher"
+        );
+    }
+
+    /// A `warn!` callsite reachable from nowhere but the control test below.
+    ///
+    /// The defect being reproduced is in `tracing`'s **one-shot** callsite
+    /// registration, so the callsite has to still be unregistered when the
+    /// control runs. Any second caller would register it first and make the
+    /// control vacuous.
+    fn control_only_warn() {
+        tracing::warn!("control-callsite-canary");
+    }
+
+    /// #558: a thread with no subscriber must not be able to disable a
+    /// callsite that a concurrent capture depends on.
+    ///
+    /// The flake is `Interest::never()` cached **globally** for a callsite,
+    /// resolved from whichever thread happens to register it first:
+    ///
+    /// - `tracing`'s event macro gates on the global max level *before*
+    ///   consulting the callsite's interest. With no other subscriber in this
+    ///   binary that level starts at `OFF`, so a subscriberless thread normally
+    ///   short-circuits and never registers anything.
+    /// - While a capture holds a live `Dispatch`, the level is `WARN`, and now
+    ///   a subscriberless thread *does* reach the registration.
+    /// - With a single live dispatcher, registration resolves interest from the
+    ///   registering thread's own default — `NoSubscriber` — writing
+    ///   `Interest::never()` into a process-global cache.
+    ///
+    /// The capturing thread then skips its `warn!` entirely and the capture
+    /// comes back **empty**, which is the reported symptom. Under `--workspace`
+    /// the foreign thread is real: the homonym `warn!` in this module is also
+    /// driven by the `ai-memory-writer` thread and by other libtest threads,
+    /// none of which hold a subscriber.
+    ///
+    /// Ordering, not luck, reproduces it: register from the foreign thread
+    /// first, then ask the capture to observe the same callsite.
+    #[test]
+    fn a_subscriberless_thread_must_not_disable_a_callsite_the_capture_needs() {
+        let logs = capture_warnings(|| {
+            std::thread::spawn(control_only_warn)
+                .join()
+                .expect("control thread panicked");
+            control_only_warn();
+        });
+
+        assert!(
+            logs.contains("control-callsite-canary"),
+            "a subscriberless thread registered this callsite as Interest::never() \
+             and the capture went blind: {logs:?}"
+        );
     }
 
     fn handoff_acceptance(
@@ -5927,6 +6206,91 @@ pub(crate) mod tests {
         assert_eq!(total, 1, "no duplicate row for unchanged content");
     }
 
+    /// OKF conformance happens at this choke point for every writer
+    /// (docs/okf.md): a page stored with bare frontmatter comes back
+    /// with the required `type`, a `generated {by, at}` stanza, and
+    /// provenance derived from the session stamp. Breaking the
+    /// conform call fails this test.
+    #[test]
+    fn stored_pages_are_okf_conformant() {
+        let (_tmp, mut conn, ws, proj) = fresh_db();
+        let mut p = page(ws, proj, "gotchas/build.md", "watch out");
+        p.frontmatter_json = serde_json::json!({
+            "title": "Build gotcha",
+            "session_id": "0192aaaa-0000-7000-8000-000000000000",
+            "agent": "claude-code",
+        });
+        let id = upsert_page(&mut conn, &p).unwrap();
+        let fm: String = conn
+            .query_row(
+                "SELECT frontmatter_json FROM pages WHERE id = ?1",
+                params![id.as_bytes()],
+                |r| r.get(0),
+            )
+            .unwrap();
+        let fm: serde_json::Value = serde_json::from_str(&fm).unwrap();
+        assert_eq!(fm["type"], "Gotcha");
+        assert!(
+            fm["generated"]["by"]
+                .as_str()
+                .unwrap()
+                .starts_with("process:ai-memory/")
+        );
+        assert!(
+            fm["generated"]["at"].as_str().unwrap().ends_with('Z'),
+            "generated.at stamped on the new version"
+        );
+        assert_eq!(
+            fm["sources"][0]["resource"],
+            "ai-memory://session/0192aaaa-0000-7000-8000-000000000000"
+        );
+        // producer keys survive as extensions
+        assert_eq!(fm["agent"], "claude-code");
+    }
+
+    /// The critical interaction: conformance adds `generated.at`, which
+    /// differs per write — an unchanged page must STILL be a noop, or
+    /// every rewrite would supersede itself over a timestamp.
+    #[test]
+    fn conformance_does_not_break_idempotent_rewrites() {
+        let (_tmp, mut conn, ws, proj) = fresh_db();
+        let mut p = page(ws, proj, "notes/idem.md", "stable body");
+        p.frontmatter_json = serde_json::json!({"title": "Idem"});
+        let id1 = upsert_page(&mut conn, &p).unwrap();
+        let id2 = upsert_page(&mut conn, &p).unwrap();
+        assert_eq!(
+            id1, id2,
+            "conformed rewrite of identical content superseded"
+        );
+        let versions: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM pages WHERE path = ?1",
+                params!["notes/idem.md"],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(versions, 1);
+    }
+
+    /// A producer that already writes a `type` keeps it verbatim — the
+    /// choke point repairs, it never overrules.
+    #[test]
+    fn an_explicit_producer_type_survives_the_choke_point() {
+        let (_tmp, mut conn, ws, proj) = fresh_db();
+        let mut p = page(ws, proj, "notes/custom.md", "body");
+        p.frontmatter_json = serde_json::json!({"type": "Custom Kind"});
+        let id = upsert_page(&mut conn, &p).unwrap();
+        let fm: String = conn
+            .query_row(
+                "SELECT frontmatter_json FROM pages WHERE id = ?1",
+                params![id.as_bytes()],
+                |r| r.get(0),
+            )
+            .unwrap();
+        let fm: serde_json::Value = serde_json::from_str(&fm).unwrap();
+        assert_eq!(fm["type"], "Custom Kind");
+    }
+
     #[test]
     fn upsert_page_supersedes_on_frontmatter_change() {
         let (_tmp, mut conn, ws, proj) = fresh_db();
@@ -6003,6 +6367,7 @@ pub(crate) mod tests {
             workspace: None,
             project: Some("infra".into()),
             path: PagePath::new("runbooks/02.md").unwrap(),
+            relation: None,
         }];
         let source_id = upsert_page(&mut conn, &source).unwrap();
 

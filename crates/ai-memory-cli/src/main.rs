@@ -117,6 +117,7 @@ async fn main() -> Result<()> {
         Command::Reset(args) => commands::reset::run(&config, args),
         Command::Compact(args) => commands::compact::run(&config, args).await,
         Command::Backup(args) => commands::backup::run(&config, args).await,
+        Command::ExportOkf(args) => commands::export_okf::run(&config, args).await,
         Command::Restore(args) => commands::restore::run(&config, args),
         Command::Reindex(args) => commands::reindex::run(&config, args).await,
         Command::InstallHooks(args) => commands::install_hooks::run(&config, args),

@@ -175,6 +175,33 @@ pub struct ActorKey {
     pub session_id: Option<String>,
 }
 
+/// Outcome of resolving the active-project pointer for one actor.
+///
+/// Distinguishes the two cases [`ActiveProject::get_for`] returns `None` for,
+/// which callers that *write* need to tell apart.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ActiveProjectLookup {
+    /// The pointer resolved to a concrete workspace/project.
+    Resolved(WorkspaceId, ProjectId),
+    /// The actor carries a coordinate, this install's pointer is live, and
+    /// nothing matched it. Answering from the shared slot or the server default
+    /// would route the call somewhere the caller did not mean.
+    Mismatch,
+    /// No pointer information exists anywhere for this caller — an anonymous or
+    /// legacy call site, or an install with no lifecycle hooks feeding the
+    /// pointer. The configured default is the best and only answer.
+    Unset,
+}
+
+impl ActiveProjectLookup {
+    fn from_single(slot: Option<(WorkspaceId, ProjectId)>) -> Self {
+        match slot {
+            Some((workspace_id, project_id)) => Self::Resolved(workspace_id, project_id),
+            None => Self::Unset,
+        }
+    }
+}
+
 impl ActorKey {
     /// `true` when neither identity coordinate is present — used to short-
     /// circuit the per-key map and fall back to the single slot.
@@ -485,19 +512,37 @@ impl ActiveProject {
     /// whichever project published hook activity last.
     #[must_use]
     pub fn get_for(&self, actor: &ActorKey) -> Option<(WorkspaceId, ProjectId)> {
+        match self.lookup_for(actor) {
+            ActiveProjectLookup::Resolved(workspace_id, project_id) => {
+                Some((workspace_id, project_id))
+            }
+            ActiveProjectLookup::Mismatch | ActiveProjectLookup::Unset => None,
+        }
+    }
+
+    /// Same resolution as [`Self::get_for`], but says *why* it failed.
+    ///
+    /// `get_for` collapses two very different outcomes into `None`, which is fine
+    /// for a read (both mean "use your configured default") and wrong for a write.
+    /// A [`ActiveProjectLookup::Mismatch`] is a caller that carries a coordinate on
+    /// an install whose pointer is live — writing it to the default silently misfiles
+    /// a real page. [`ActiveProjectLookup::Unset`] is an install with no pointer
+    /// information at all, which has always used the default and must keep doing so.
+    #[must_use]
+    pub fn lookup_for(&self, actor: &ActorKey) -> ActiveProjectLookup {
         if self.mode == ActiveProjectMode::Single || actor.is_empty() {
-            return self.read_single();
+            return ActiveProjectLookup::from_single(self.read_single());
         }
 
         let scoped = self.scoped_key(actor);
         if scoped.is_empty() {
-            return self.read_single();
+            return ActiveProjectLookup::from_single(self.read_single());
         }
 
         let now = Instant::now();
         let mut guard = self.per_actor.write().unwrap_or_else(|e| e.into_inner());
-        if let Some(found) = guard.get(&scoped, now) {
-            return Some(found);
+        if let Some((workspace_id, project_id)) = guard.get(&scoped, now) {
+            return ActiveProjectLookup::Resolved(workspace_id, project_id);
         }
 
         // A keyed miss means one of two very different things.
@@ -519,14 +564,14 @@ impl ActiveProject {
                 session_id: None,
             };
             if guard.get(&identity_only, now).is_some() {
-                return None;
+                return ActiveProjectLookup::Mismatch;
             }
         }
         drop(guard);
         if self.ever_keyed.load(Ordering::Relaxed) {
-            return None;
+            return ActiveProjectLookup::Mismatch;
         }
-        self.read_single()
+        ActiveProjectLookup::from_single(self.read_single())
     }
 
     /// Whether the actor opted this session into `default_global` recall (via

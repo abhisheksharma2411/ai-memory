@@ -8,10 +8,141 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Fixed
+- `install-hooks` now writes the capture-mode opt-in atomically. It was
+  written in place, and every reader maps an unrecognised value onto
+  `denylist` — the less private mode — so a crash, a full disk or a killed
+  `ai-memory upgrade` mid-write left a truncated file that silently reverted
+  an `--capture-mode allowlist` opt-in to capture-by-default, which is exactly
+  what `persist_capture_mode` documents it must never do. The fallback itself
+  is correct and stays; the torn write that triggered it is gone. Now routed
+  through the same `write_atomic` (tmp + fsync + rename) the rest of the CLI
+  already uses, per the project's atomic-writes invariant.
+- `status` no longer overstates missing embeddings: empty-body pages —
+  which no embedder can ever cover and the backfill skips by rule — are
+  excluded from the "latest pages missing" figure and reported on their
+  own line (observed live as a permanently stuck 427).
+- Natural-language searches no longer surface stopword trash: bare
+  queries drop English stopwords before the FTS5 OR-join, so a page
+  containing five "the"s cannot outrank the page whose content matches,
+  and pages matching only stopwords no longer appear at all. Quoted
+  phrases and explicit-operator queries are untouched, and an
+  all-stopword query still searches its literal terms. Guarded by a
+  CI-runnable search-quality suite asserting ranking usefulness, not
+  just machinery.
+- `memory_query` no longer fails with `fts5: syntax error` when the query is
+  natural language containing parentheses, apostrophe-quoted phrases, or a
+  stray `OR`/`AND` (e.g. *"my visit to the Museum of Modern Art (MoMA) and
+  the 'Ancient Civilizations' exhibit"*). Prepared FTS5 queries are now
+  validated against the engine's own parser and degrade to an always-valid
+  quoted bag of words when the preserved operator form does not parse;
+  deliberate well-formed operator queries are preserved as before. Found by
+  the new LongMemEval retrieval harness on its first full run.
+
+- `ai-memory serve` now takes an exclusive lock on `<data-dir>/.serve.lock`
+  before opening the store, so a second server pointed at the same data
+  directory refuses at startup and names the holding process instead of
+  silently contending the single-writer actor, the wiki git handle, and the
+  active-project pointer. The OS releases the lock when the process exits,
+  so a crashed server never leaves the operator locked out; `--force` starts
+  unguarded for an operator who knows the previous server is gone, and a
+  filesystem that cannot lock at all downgrades the guard to a warning
+  instead of refusing to start. (#563)
+
 - Preserved third-party string-form lifecycle hooks whose commands merely
   contain `ai-memory` or `ai_memory` when `install-hooks --apply` refreshes
   ai-memory's own entries. Legacy ai-memory script and native hook commands
   remain recognized by their specific hook signatures.
+||||||| a613bf6d
+### Added
+- `status` tells more of the truth (2.0 status audit): the wiki-format
+  line (OKF migration state and the pre-migration backup archive while
+  it exists), stored embedding triples by provider/model/dim, typed-edge
+  counts by relation, and a write-queue depth gauge that surfaces a
+  backpressured (wedged) writer — shown only when non-zero.
+- An opt-in cross-session "experience" pass
+  (`[auto_improve.scheduler] experience_every_sessions`): every N newly
+  completed sessions, the last few session summaries are reviewed side
+  by side and knowledge visible only ACROSS trajectories — repeated
+  workflows, re-stated preferences, architecture facts every session
+  re-discovers, contradictions with stored decisions — is proposed
+  through the identical schema-constrained, validated, eval-gated,
+  pending-writes staging path as per-session auto-improve. Evidence
+  must span at least two sessions; off by default and LLM-hosted, so
+  the zero-LLM path is untouched. See `docs/experience.md`.
+- `AI_MEMORY_EMBEDDING_PROVIDER=local` — in-process sentence embeddings
+  (pure-Rust candle BERT, `all-MiniLM-L6-v2`, 384-dim) with no API key
+  and no external server. The ~87 MB model is fetched once into
+  `<data_dir>/models/` with source-pinned sha256s (offline installs drop
+  the files in manually); vectors coexist with any provider's via the
+  stored `(provider, model, dim)` triple, and switching is a config
+  change. Feature-gated (`local-embeddings`, default on). The eval
+  harness gained `--embeddings local` and publishes the hybrid
+  LongMemEval row next to the zero-LLM baseline. See
+  `docs/local-embeddings.md`.
+- The entity index carries ingestion-time validity windows
+  (bi-temporal-lite): entity links open at their page version's creation
+  and close when the version is superseded, backfilled for existing
+  stores by an additive migration. `memory_query` gains an `as_of`
+  ISO-8601 argument that turns the call into an entity-timeline lookup —
+  "what did we know about X then" — returning the page versions valid at
+  that instant, including ones superseded since. Ingestion time only,
+  documented honestly as such. See `docs/temporal.md`.
+- Pages can declare typed relation edges in `relations:` frontmatter —
+  a closed `causes` / `fixes` / `contradicts` vocabulary riding the
+  existing `links.link_type` column (no schema migration). Declared
+  `contradicts` edges surface as zero-LLM `contradiction` lint findings
+  (including stale declarations whose target no longer resolves), and
+  the session-end consolidation prompt may emit relations under the
+  same schema-constrained vocabulary. See `docs/typed-edges.md`.
+- `ai-memory export-okf --project <p> -o <bundle.tar.gz>` and
+  `POST /admin/export-okf` — stream one project's wiki as a validated
+  OKF v0.2 bundle with a freshly generated index; a non-conformant page
+  fails the export. Importing needs no command: unpack a bundle's
+  concept files into a project's wiki directory and the watcher (or
+  `reindex`) ingests them.
+- Added a LongMemEval retrieval benchmark to the evaluation harness
+  (`cargo run -p ai-memory-eval -- retrieval`). It drives a real
+  `ai-memory serve` subprocess end to end: haystack chat histories replay
+  through `POST /hook/batch` at the production hook cadence, questions run
+  through MCP `memory_query`, and results are scored session-level
+  (`hit@k` / `recall@k` per question category, abstention questions
+  reported separately). The 278 MB dataset is fetched on demand with a
+  pinned sha256; baselines are published under `docs/benchmarks/`. The
+  existing LLM A/B harness moved to the `ab` subcommand.
+### Changed
+- Hybrid retrieval is on by default: an install with no
+  `embedding_provider` configured now gets in-process local embeddings
+  best-effort — the model downloads in the background on first start
+  (hybrid search enables on the next restart), existing pages are
+  backfilled by a one-shot startup pass, and hosts that cannot fetch
+  the model keep the previous FTS-only behaviour with a warning. Opt
+  out with `embedding_provider = "none"`; configured providers are
+  never overridden. Measured on LongMemEval-S: overall hit@5 rises
+  from 0.617 (FTS-only) to 0.779 with local embeddings.
+- An unscoped `memory_write_page` / `memory_handoff_begin` from a caller whose
+  active-project pointer does not resolve is now refused instead of written to
+  the server's default project. The page such a write produced was real,
+  attributed and searchable, and in a project nobody goes looking in. The error
+  names both remedies — pass explicit `workspace`/`project`, or install the
+  lifecycle hooks so the pointer is populated. Reads are unchanged: a read
+  answering from the default is a wrong answer the caller can see, a write is a
+  misfile they cannot. Callers with no identity coordinate at all
+  (anonymous/legacy) keep resolving through the shared slot, and an install with
+  no pointer information anywhere still resolves to the configured default
+  ([#564]).
+- The wiki's on-disk format is now natively the Open Knowledge Format
+  (OKF) v0.2: every page write fills the spec's `type`, `generated`,
+  `sources` and `stale_after` keys (ai-memory's own fields ride along as
+  spec-safe extensions), and each project directory is a conformant OKF
+  bundle with an `okf_version` index. Existing stores are migrated
+  automatically on the first 2.0 start — **backup-gated**: the entire
+  data dir is archived to the user's home (or `AI_MEMORY_BACKUP_DIR`)
+  and verified first, or the migration refuses to run; pages are
+  rewritten in place (same ids, same version rows, timestamps
+  untouched), and the wiki homepage shows where the archive is until it
+  is deleted. A data dir migrated by a newer binary is refused by older
+  2.0+ binaries instead of silently mixing formats. See
+  `docs/okf.md` and `docs/MIGRATION-2.0.md`.
 
 ## [1.39.0] - 2026-09-01
 

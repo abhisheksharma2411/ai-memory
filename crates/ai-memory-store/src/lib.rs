@@ -51,19 +51,20 @@ pub use maintenance::MaintenanceJob;
 pub use ops::{
     AdmittedSession, CompactSummary, Compaction, DeleteWorkspaceSummary, EmbedOutcome,
     EmbeddingWrite, HookSessionAdmission, IngestObservationOutcome, LifecycleOnlyEndOutcome,
-    MoveSessionSummary, MoveSummary, ObservationPruneOutcome, PagesMode, PurgeSessionSummary,
-    PurgeSummary, ReorgSummary, purge_session, record_embed_failure,
+    MoveSessionSummary, MoveSummary, ObservationPruneOutcome, OkfMigratedPage, PagesMode,
+    PurgeSessionSummary, PurgeSummary, ReorgSummary, purge_session, record_embed_failure,
 };
 pub use reader::{
     ActivityWindow, AgentSessionCount, AuditEvent, AuditLogFilter, AutoImproveCandidateSession,
     BriefPageBody, BriefingPage, BriefingSnapshot, ClientActivity, ContaminationFinding,
-    ContaminationReport, ContaminationSummary, DecayCandidate, DecayTombstone, DerivedIndexStatus,
-    EmbeddingTripleCount, FeedbackFinding, GraphVia, HealthDetail, HealthPage, ObservationHit,
-    ObservationOrder, ObservationPage, ObservationPageResult, ObservationRecord, OpenSession,
-    PageAuthor, PageHit, PageHitWithMeta, PageLinks, PageMeta, PageSummary, ProjectSummary,
-    ReaderPool, ReindexTargetStatus, RelatedPage, RrfContributions, ScopeRow, SearchExplain,
-    SessionDependentRows, SessionEndDisposition, SessionSummary, StatusCounts, StorageStatus,
-    StoredEmbedding, StoredPageBody, WorkspaceScopeRow, WorkspaceSummary, f32_vec_to_bytes,
+    ContaminationReport, ContaminationSummary, ContradictionEdge, DecayCandidate, DecayTombstone,
+    DerivedIndexStatus, EmbeddingTripleCount, FeedbackFinding, GraphVia, HealthDetail, HealthPage,
+    ObservationHit, ObservationOrder, ObservationPage, ObservationPageResult, ObservationRecord,
+    OpenSession, PageAuthor, PageHit, PageHitWithMeta, PageLinks, PageMeta, PageSummary,
+    ProjectSummary, ReaderPool, ReindexTargetStatus, RelatedPage, RrfContributions, ScopeRow,
+    SearchExplain, SessionDependentRows, SessionEndDisposition, SessionSummary, StatusCounts,
+    StorageStatus, StoredEmbedding, StoredPageBody, WorkspaceScopeRow, WorkspaceSummary,
+    f32_vec_to_bytes,
 };
 pub use scope::{
     ResolvedScope, ScopeName, ScopeResolutionError, ScopeResolver, WORKSPACE_PROJECT_PAIR_REQUIRED,
@@ -1882,11 +1883,13 @@ mod tests {
                 workspace: None,
                 project: Some("infra".into()),
                 path: PagePath::new("runbooks/02.md").unwrap(),
+                relation: None,
             },
             LinkTarget {
                 workspace: None,
                 project: Some("nope".into()),
                 path: PagePath::new("ghost.md").unwrap(),
+                relation: None,
             },
         ];
         store.writer.upsert_page(dep).await.unwrap();
@@ -6328,6 +6331,283 @@ mod tests {
             "active"
         );
     }
+    /// Bi-temporal-lite (docs/temporal.md): entity-link windows follow
+    /// page supersession, and `as_of` returns what the store knew at
+    /// that instant — including versions that have since been replaced.
+    #[tokio::test]
+    async fn as_of_returns_the_version_that_was_valid_then() {
+        let tmp = TempDir::new().unwrap();
+        let store = Store::open(tmp.path()).unwrap();
+        let ws = store
+            .writer
+            .get_or_create_workspace("default")
+            .await
+            .unwrap();
+        let proj = store
+            .writer
+            .get_or_create_project(ws, "temporal", None)
+            .await
+            .unwrap();
+
+        // v1 carries the entity.
+        let mut v1 = sample_page(ws, proj, "notes/db.md", "we use postgres");
+        v1.entities = vec!["postgres".into()];
+        let v1_id = store.writer.upsert_page(v1).await.unwrap();
+        let between = jiff::Timestamp::now().as_microsecond();
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+
+        // v2 supersedes; the entity moved on.
+        let mut v2 = sample_page(ws, proj, "notes/db.md", "we migrated to sqlite");
+        v2.entities = vec!["sqlite".into()];
+        let v2_id = store.writer.upsert_page(v2).await.unwrap();
+        assert_ne!(v1_id, v2_id);
+
+        // Current query: postgres is gone.
+        let now_hits = store
+            .reader
+            .entity_hits_for_project(ws, proj, "postgres", 10, None)
+            .await
+            .unwrap();
+        assert!(now_hits.is_empty(), "{now_hits:?}");
+
+        // as_of between v1 and v2: the superseded version answers.
+        let then_hits = store
+            .reader
+            .entity_hits_for_project_at(ws, proj, "postgres", 10, None, Some(between))
+            .await
+            .unwrap();
+        assert_eq!(then_hits.len(), 1, "{then_hits:?}");
+        assert_eq!(then_hits[0].hit.id, v1_id);
+
+        // as_of now: identical to the default view for the new entity.
+        let sqlite_now = store
+            .reader
+            .entity_hits_for_project_at(
+                ws,
+                proj,
+                "sqlite",
+                10,
+                None,
+                Some(jiff::Timestamp::now().as_microsecond()),
+            )
+            .await
+            .unwrap();
+        assert_eq!(sqlite_now.len(), 1);
+        assert_eq!(sqlite_now[0].hit.id, v2_id);
+
+        // And before v1 existed: nothing was known.
+        let before = store
+            .reader
+            .entity_hits_for_project_at(ws, proj, "postgres", 10, None, Some(1))
+            .await
+            .unwrap();
+        assert!(before.is_empty(), "{before:?}");
+    }
+
+    /// The windows themselves: insert opens at the version's
+    /// `created_at`; supersession closes the old version's links.
+    #[tokio::test]
+    async fn supersession_closes_the_entity_link_window() {
+        let tmp = TempDir::new().unwrap();
+        let store = Store::open(tmp.path()).unwrap();
+        let ws = store
+            .writer
+            .get_or_create_workspace("default")
+            .await
+            .unwrap();
+        let proj = store
+            .writer
+            .get_or_create_project(ws, "temporal2", None)
+            .await
+            .unwrap();
+        let mut v1 = sample_page(ws, proj, "notes/x.md", "v1");
+        v1.entities = vec!["thing".into()];
+        let v1_id = store.writer.upsert_page(v1).await.unwrap();
+        let mut v2 = sample_page(ws, proj, "notes/x.md", "v2");
+        v2.entities = vec!["thing".into()];
+        store.writer.upsert_page(v2).await.unwrap();
+
+        let db = rusqlite::Connection::open(tmp.path().join("db").join("memory.sqlite")).unwrap();
+        let rows: Vec<(Vec<u8>, i64, Option<i64>)> = db
+            .prepare(
+                "SELECT page_id, valid_from, superseded_at FROM entity_page_links \
+                 ORDER BY valid_from",
+            )
+            .unwrap()
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        assert_eq!(rows.len(), 2, "{rows:?}");
+        assert_eq!(rows[0].0, v1_id.as_bytes().to_vec());
+        assert!(
+            rows[0].2.is_some(),
+            "superseded version's window must be closed"
+        );
+        assert!(rows[1].2.is_none(), "latest version's window stays open");
+        assert!(
+            rows[0].2.unwrap() >= rows[0].1,
+            "window must not be inverted"
+        );
+    }
+
+    /// The V56 backfill reconstructs the same windows the write path
+    /// produces: `valid_from` from each version's `created_at`,
+    /// `superseded_at` from the superseding version, NULL for latest.
+    #[tokio::test]
+    async fn v56_backfill_reconstructs_the_windows() {
+        let tmp = TempDir::new().unwrap();
+        let store = Store::open(tmp.path()).unwrap();
+        let ws = store
+            .writer
+            .get_or_create_workspace("default")
+            .await
+            .unwrap();
+        let proj = store
+            .writer
+            .get_or_create_project(ws, "backfill", None)
+            .await
+            .unwrap();
+        for body in ["v1", "v2", "v3"] {
+            let mut page = sample_page(ws, proj, "notes/x.md", body);
+            page.entities = vec!["thing".into()];
+            store.writer.upsert_page(page).await.unwrap();
+            tokio::time::sleep(std::time::Duration::from_millis(3)).await;
+        }
+
+        let db = rusqlite::Connection::open(tmp.path().join("db").join("memory.sqlite")).unwrap();
+        let live: Vec<(Vec<u8>, Option<i64>, Option<i64>)> = db
+            .prepare(
+                "SELECT page_id, valid_from, superseded_at FROM entity_page_links \
+                 ORDER BY valid_from",
+            )
+            .unwrap()
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        assert_eq!(live.len(), 3);
+
+        // Fabricate the pre-V56 state, then replay the migration's
+        // backfill statements.
+        db.execute(
+            "UPDATE entity_page_links SET valid_from = NULL, superseded_at = NULL",
+            [],
+        )
+        .unwrap();
+        db.execute_batch(
+            "UPDATE entity_page_links \
+             SET valid_from = (SELECT p.created_at FROM pages p WHERE p.id = page_id); \
+             UPDATE entity_page_links \
+             SET superseded_at = ( \
+                 SELECT p2.created_at FROM pages p2 WHERE p2.supersedes = page_id \
+             ) \
+             WHERE page_id IN (SELECT id FROM pages WHERE is_latest = 0);",
+        )
+        .unwrap();
+        let backfilled: Vec<(Vec<u8>, Option<i64>, Option<i64>)> = db
+            .prepare(
+                "SELECT page_id, valid_from, superseded_at FROM entity_page_links \
+                 ORDER BY valid_from",
+            )
+            .unwrap()
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        // Same shape: two closed windows, one open; same version order.
+        assert_eq!(backfilled.len(), 3);
+        for (i, (live_row, back_row)) in live.iter().zip(backfilled.iter()).enumerate() {
+            assert_eq!(live_row.0, back_row.0, "row {i} page id");
+            assert_eq!(
+                live_row.2.is_some(),
+                back_row.2.is_some(),
+                "row {i} open/closed"
+            );
+            assert_eq!(back_row.1, {
+                let created: i64 = db
+                    .query_row(
+                        "SELECT created_at FROM pages WHERE id = ?1",
+                        rusqlite::params![back_row.0],
+                        |r| r.get(0),
+                    )
+                    .unwrap();
+                Some(created)
+            });
+        }
+    }
+
+    /// Item 7 truthfulness: "missing embeddings" counts only pages a
+    /// backfill can act on; empty-body pages are reported apart instead
+    /// of inflating the actionable number forever.
+    #[tokio::test]
+    async fn missing_embeddings_excludes_unembeddable_pages() {
+        let tmp = TempDir::new().unwrap();
+        let store = Store::open(tmp.path()).unwrap();
+        let ws = store
+            .writer
+            .get_or_create_workspace("default")
+            .await
+            .unwrap();
+        let proj = store
+            .writer
+            .get_or_create_project(ws, "s", None)
+            .await
+            .unwrap();
+        store
+            .writer
+            .upsert_page(sample_page(ws, proj, "notes/real.md", "actual content"))
+            .await
+            .unwrap();
+        store
+            .writer
+            .upsert_page(sample_page(ws, proj, "notes/empty.md", "   "))
+            .await
+            .unwrap();
+        let derived = store.reader.derived_index_status().await.unwrap();
+        assert_eq!(derived.latest_pages_missing_embeddings, 1, "{derived:?}");
+        assert_eq!(derived.latest_pages_unembeddable, 1, "{derived:?}");
+    }
+
+    /// Typed edges surface in the derived status by relation.
+    #[tokio::test]
+    async fn typed_links_are_counted_by_relation() {
+        let tmp = TempDir::new().unwrap();
+        let store = Store::open(tmp.path()).unwrap();
+        let ws = store
+            .writer
+            .get_or_create_workspace("default")
+            .await
+            .unwrap();
+        let proj = store
+            .writer
+            .get_or_create_project(ws, "s", None)
+            .await
+            .unwrap();
+        let mut page = sample_page(ws, proj, "notes/a.md", "body");
+        page.links = vec![
+            ai_memory_core::LinkTarget {
+                workspace: None,
+                project: None,
+                path: ai_memory_core::PagePath::new("notes/b.md").unwrap(),
+                relation: Some(ai_memory_core::Relation::Fixes),
+            },
+            ai_memory_core::LinkTarget {
+                workspace: None,
+                project: None,
+                path: ai_memory_core::PagePath::new("notes/c.md").unwrap(),
+                relation: None,
+            },
+        ];
+        store.writer.upsert_page(page).await.unwrap();
+        let derived = store.reader.derived_index_status().await.unwrap();
+        assert_eq!(
+            derived.typed_links_from_latest_pages,
+            vec![("fixes".to_string(), 1)],
+            "{derived:?}"
+        );
+    }
+
     #[tokio::test]
     async fn entity_stream_finds_and_weights_pages() {
         let tmp = TempDir::new().unwrap();
