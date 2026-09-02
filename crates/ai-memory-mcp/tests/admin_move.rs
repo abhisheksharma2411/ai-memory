@@ -1803,7 +1803,13 @@ async fn copy_purge_rerun_is_idempotent() {
     .await;
     assert_eq!(r1.status(), StatusCode::OK);
 
-    // Re-create the source identically and run the merge again.
+    // Re-create the source identically and run the merge again — across
+    // a full second boundary, so the re-seeded page's `generated.at`
+    // provably differs from the copy the first merge landed. Identical
+    // CONTENT with a different write instant must not be a merge
+    // conflict (this was the timing flake: sub-second reruns passed,
+    // second-crossing reruns 409'd).
+    tokio::time::sleep(std::time::Duration::from_millis(1100)).await;
     let s2 = build_state(&store, &tmp);
     seed_page(&store, &s2.wiki, "src", "proj", "notes/a.md", "body a").await;
     let r2 = post(

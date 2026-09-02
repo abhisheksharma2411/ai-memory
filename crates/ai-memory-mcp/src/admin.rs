@@ -4658,15 +4658,82 @@ fn page_copy_differs(
     source_tier: Tier,
     source_pinned: bool,
 ) -> bool {
-    let source_frontmatter = match serde_json::to_string(&source.frontmatter) {
-        Ok(value) => value,
-        Err(_) => return true,
-    };
+    // Frontmatter comparison is modulo the per-version `generated.at`,
+    // matching the store's own idempotency projection: two pages whose
+    // only difference is WHEN they were written are the same content.
+    // Comparing it raw made merge-conflict detection timing-flaky — the
+    // same seeded page written across a second boundary 409'd as
+    // "different content" (found via the copy_purge flake on Windows).
+    let existing_frontmatter: serde_json::Value =
+        serde_json::from_str(&existing.frontmatter_json).unwrap_or_default();
     existing.body != source.body
-        || existing.frontmatter_json != source_frontmatter
+        || ai_memory_core::okf::strip_generated_at(&existing_frontmatter)
+            != ai_memory_core::okf::strip_generated_at(&source.frontmatter)
         || existing.title != source_title
         || existing.tier != source_tier.as_str()
         || existing.pinned != source_pinned
+}
+
+#[cfg(test)]
+mod page_copy_differs_tests {
+    use super::*;
+
+    fn stored(fm: serde_json::Value, body: &str) -> ai_memory_store::StoredPageBody {
+        ai_memory_store::StoredPageBody {
+            title: "T".into(),
+            body: body.into(),
+            frontmatter_json: fm.to_string(),
+            tier: "semantic".into(),
+        }
+    }
+
+    /// Two pages whose only difference is WHEN they were written are the
+    /// same content — the projection matches the store's idempotency rule.
+    #[test]
+    fn generated_at_alone_is_not_a_conflict() {
+        let existing = stored(
+            serde_json::json!({"title": "T", "generated": {"by": "x", "at": "2026-09-01T00:00:00Z"}}),
+            "same",
+        );
+        let source = Markdown {
+            frontmatter: serde_json::json!({"title": "T", "generated": {"by": "x", "at": "2026-09-02T00:00:00Z"}}),
+            body: "same".into(),
+        };
+        assert!(!page_copy_differs(
+            &existing,
+            &source,
+            "T",
+            Tier::Semantic,
+            false
+        ));
+    }
+
+    #[test]
+    fn body_and_real_frontmatter_changes_still_conflict() {
+        let existing = stored(serde_json::json!({"title": "T"}), "one");
+        let body_diff = Markdown {
+            frontmatter: serde_json::json!({"title": "T"}),
+            body: "two".into(),
+        };
+        assert!(page_copy_differs(
+            &existing,
+            &body_diff,
+            "T",
+            Tier::Semantic,
+            false
+        ));
+        let fm_diff = Markdown {
+            frontmatter: serde_json::json!({"title": "T", "tags": ["x"]}),
+            body: "one".into(),
+        };
+        assert!(page_copy_differs(
+            &existing,
+            &fm_diff,
+            "T",
+            Tier::Semantic,
+            false
+        ));
+    }
 }
 
 async fn handle_move_project(
