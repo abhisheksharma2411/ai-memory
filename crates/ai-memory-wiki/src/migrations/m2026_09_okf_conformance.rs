@@ -6,8 +6,11 @@
 //! 3. DB pass: conform every latest page row IN PLACE (same id, same
 //!    version row, `updated_at` untouched);
 //! 4. file pass: conform every wiki `.md` in place (body untouched),
-//!    `generated.at` from the row's `updated_at` when the page is
-//!    indexed, else the file's mtime; scope `_meta.md` manifests get
+//!    `generated.at` from the row's `updated_at` when the DB pass
+//!    rewrote that row, else the file's mtime (already-conformant rows
+//!    are skipped by the DB pass, so their files fall back to mtime —
+//!    the strip-comparison keeps row and file in agreement either
+//!    way); scope `_meta.md` manifests get
 //!    their `type` only; each project bundle root gains an `index.md`
 //!    declaring `okf_version` when absent;
 //! 5. single "okf-migration" git commit.

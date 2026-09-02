@@ -6404,6 +6404,62 @@ mod tests {
         assert!(before.is_empty(), "{before:?}");
     }
 
+    /// Post-audit regression: retirement WITHOUT a successor (a decay
+    /// tombstone) closes the entity-link window too — `as_of` instants
+    /// after retirement must not resurrect the page.
+    #[tokio::test]
+    async fn decay_tombstone_closes_the_entity_window() {
+        let tmp = TempDir::new().unwrap();
+        let store = Store::open(tmp.path()).unwrap();
+        let ws = store
+            .writer
+            .get_or_create_workspace("default")
+            .await
+            .unwrap();
+        let proj = store
+            .writer
+            .get_or_create_project(ws, "t", None)
+            .await
+            .unwrap();
+        let mut page = sample_page(ws, proj, "notes/old.md", "we use postgres");
+        page.entities = vec!["postgres".into()];
+        let id = store.writer.upsert_page(page).await.unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        let retired_at = jiff::Timestamp::now().as_microsecond();
+        store
+            .writer
+            .soft_delete_for_decay_if_latest(
+                ws,
+                proj,
+                ai_memory_core::PagePath::new("notes/old.md").unwrap(),
+                id,
+            )
+            .await
+            .unwrap();
+
+        // Before retirement: visible.
+        let before = store
+            .reader
+            .entity_hits_for_project_at(ws, proj, "postgres", 10, None, Some(retired_at - 1000))
+            .await
+            .unwrap();
+        assert_eq!(before.len(), 1, "{before:?}");
+        // After retirement: gone.
+        let after = store
+            .reader
+            .entity_hits_for_project_at(
+                ws,
+                proj,
+                "postgres",
+                10,
+                None,
+                Some(jiff::Timestamp::now().as_microsecond()),
+            )
+            .await
+            .unwrap();
+        assert!(after.is_empty(), "retired page resurrected: {after:?}");
+    }
+
     /// The windows themselves: insert opens at the version's
     /// `created_at`; supersession closes the old version's links.
     #[tokio::test]

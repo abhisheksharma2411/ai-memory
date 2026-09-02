@@ -97,6 +97,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   is correct and stays; the torn write that triggered it is gone. Now routed
   through the same `write_atomic` (tmp + fsync + rename) the rest of the CLI
   already uses, per the project's atomic-writes invariant.
+||||||| parent of f14775e5 (fix: post-audit findings across the 2.0 range)
+- The 2.0 pre-release audit findings (post-merge adversarial review of
+  the whole range): `export-okf` no longer fails on real deployments —
+  scope manifests are OKF-typed at their writer (ending a startup
+  tug-of-war that reverted the migration's typing on the same boot and
+  self-healing manifests reverted by pre-fix binaries), approved
+  auto-improve pages land conformant like every other write (also
+  preventing phantom supersedes on the first reindex after a binary
+  upgrade), and `_pending/` proposal sidecars are excluded from the
+  export walk. Pages retired WITHOUT a successor (decay tombstones,
+  purge-regenerate, workspace merges) now close their entity-link
+  validity windows so `as_of` cannot resurrect retired knowledge, with
+  a V58 backfill for previously retired rows. The experience pass no
+  longer burns its cadence window or stages an empty run when a scope
+  has too few session pages. Backup destination guards canonicalize
+  paths; `as_of` parse errors return invalid-params; the FTS5 probe
+  connection is cached per thread.
 - `status` no longer overstates missing embeddings: empty-body pages —
   which no embedder can ever cover and the backfill skips by rule — are
   excluded from the "latest pages missing" figure and reported on their

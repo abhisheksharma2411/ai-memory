@@ -1201,6 +1201,17 @@ impl Wiki {
         }
         markdown.body = self.sanitizer.scrub(&markdown.body);
         scrub_frontmatter_strings(&mut markdown.frontmatter, &self.sanitizer);
+        // Approved pages must land conformant like every other write —
+        // this emit skipped the disk conformance seam, leaving files
+        // without type/generated that blocked export-okf and, worse,
+        // phantom-superseded on the first reindex after a binary upgrade
+        // (the row was conformed with the approving binary's version, the
+        // file with the reindexing one's). Post-audit finding.
+        conform_frontmatter_for_disk(
+            &self.abs_path(workspace_id, project_id, &path),
+            path.as_str(),
+            &mut markdown,
+        );
         let title = self.sanitizer.scrub(&detail.summary.title);
         let links =
             crate::markdown::extract_all_links(&markdown.frontmatter, &markdown.body, &path);
@@ -1434,7 +1445,18 @@ impl Wiki {
     /// Write a `_meta.md` scope manifest under `dir` from `frontmatter`,
     /// idempotently — unchanged content is left untouched so a startup
     /// backfill never churns the wiki git history. Returns `true` if written.
-    fn write_scope_manifest(dir: &Path, frontmatter: serde_json::Value) -> WikiResult<bool> {
+    fn write_scope_manifest(dir: &Path, mut frontmatter: serde_json::Value) -> WikiResult<bool> {
+        // OKF conformance at the manifest choke point: every non-reserved
+        // .md needs a `type`, and the startup backfill's byte-compare must
+        // agree with what the OKF migration writes — a typeless emit here
+        // silently reverted migrated manifests on the same boot
+        // (post-audit finding). `type` is appended last, matching the
+        // migration's entry-insertion order, so the two emitters converge
+        // on identical bytes.
+        if let Some(map) = frontmatter.as_object_mut() {
+            map.entry("type".to_string())
+                .or_insert(serde_json::Value::String("Scope Manifest".into()));
+        }
         let content = emit(&Markdown {
             frontmatter,
             body: String::new(),
@@ -4332,6 +4354,38 @@ mod tests {
         )
         .unwrap();
         assert!(meta.contains("workspace: empty-ws"));
+    }
+
+    /// Post-audit regression: manifests are OKF-typed at the writer
+    /// choke point, and a typeless manifest (the tug-of-war era, or a
+    /// hand edit) is HEALED by the next backfill instead of reverting
+    /// the migration's typing.
+    #[tokio::test]
+    async fn backfill_types_manifests_and_heals_typeless_ones() {
+        let tmp = TempDir::new().unwrap();
+        let store = Store::open(tmp.path()).unwrap();
+        let ws = store.writer.get_or_create_workspace("w").await.unwrap();
+        let wiki = Wiki::new(tmp.path(), store.writer.clone())
+            .unwrap()
+            .with_store_reader(store.reader.clone());
+
+        wiki.backfill_scope_manifests().await.unwrap();
+        let meta_path = tmp
+            .path()
+            .join("wiki")
+            .join(ws.to_string())
+            .join("_meta.md");
+        let meta = std::fs::read_to_string(&meta_path).unwrap();
+        assert!(meta.contains("type: Scope Manifest"), "{meta}");
+
+        // Second backfill: byte-stable, no churn.
+        assert_eq!(wiki.backfill_scope_manifests().await.unwrap(), 0);
+
+        // A typeless manifest (pre-fix state) is healed, not preserved.
+        std::fs::write(&meta_path, "---\nworkspace: w\n---\n").unwrap();
+        assert_eq!(wiki.backfill_scope_manifests().await.unwrap(), 1);
+        let healed = std::fs::read_to_string(&meta_path).unwrap();
+        assert!(healed.contains("type: Scope Manifest"), "{healed}");
     }
 
     #[cfg(any(unix, windows))]
