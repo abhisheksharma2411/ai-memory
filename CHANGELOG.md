@@ -77,6 +77,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ||||||| a613bf6d
 ### Fixed
+- `memory_read_page` no longer ships a root-level `anyOf` in its tool
+  schema (#577): the Anthropic Messages API rejects root combinators
+  outright, so any provider-agnostic client routing tools through it
+  (OpenCode with an Anthropic key, and every other Messages-API
+  consumer) had its entire session 400 before a single tool ran. The
+  exactly-one-of-`path`/`query` contract stays in the field
+  descriptions and runtime validation; a new fence test asserts NO
+  registered tool carries a root combinator so the class cannot return.
 - Docker-wrapper installs stage hook scripts back to the host-reachable
   `~/.local/share/ai-memory/hooks` instead of the container's `/data`
   volume (#581): the #554 change made staging follow the resolved data

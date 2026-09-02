@@ -1078,22 +1078,18 @@ struct ExploreArgs {
     workspace: Option<String>,
 }
 
-// The `anyOf` encodes the "you MUST pass exactly one of path/query"
-// contract in the machine-readable schema (issue #155): each branch
-// demands the key's PRESENCE via `required` AND a non-null `type`, because
-// clients that null-fill defaulted args (OpenCode) would satisfy a bare
-// `required` with `path: null` and still hit the runtime error. Encoding
-// it here lets schema-respecting clients refuse the invalid call before
-// it ever reaches the server.
-//
-// Moonshot ("moonshot flavored json schema") rejects this root-level
-// `anyOf`; Kimi Code sessions get a patched schema instead
-// (`moonshot_safe_tool_list`). Every other client keeps this exact shape.
+// The "you MUST pass exactly one of path/query" contract lives in the
+// field descriptions and the runtime validation, NOT in a root-level
+// `anyOf` (#577). The machine-readable encoding (#155) let
+// schema-respecting clients refuse a null-filled call pre-flight — but
+// the Anthropic Messages API rejects root-level `anyOf`/`oneOf`/`allOf`
+// outright, so ANY provider-agnostic client routing tools through it
+// (OpenCode with an Anthropic key, and every other Messages-API
+// consumer) had its WHOLE session 400 before a single tool ran. One
+// wasted round-trip for a null-filling client is a far smaller cost
+// than dead sessions on the most common upstream; the per-flavor strip
+// machinery (#412) stays for any future dialect that needs it.
 #[derive(Debug, Serialize, Deserialize, schemars::JsonSchema)]
-#[schemars(extend("anyOf" = [
-    {"required": ["path"], "properties": {"path": {"type": "string"}}},
-    {"required": ["query"], "properties": {"query": {"type": "string"}}},
-]))]
 struct ReadPageArgs {
     /// FTS5 query to find the page (searches and returns the top hit's full
     /// body). You MUST pass exactly one of `query` or `path` — never neither,
@@ -7366,23 +7362,49 @@ mod tests {
     // non-null type — a bare `required` is satisfied by OpenCode-style
     // `path: null` filling. Pins against a schemars upgrade silently
     // dropping the `extend` attribute.
+    /// #577's class fence: NO registered tool may carry a root-level
+    /// combinator — one bad tool 400s the entire session for every
+    /// Messages-API-routed client.
+    #[tokio::test]
+    async fn no_tool_schema_carries_root_combinators() {
+        let (_tmp, _store, server, _ws, _pj) = setup_server().await;
+        for tool in server.tool_router.list_all() {
+            let schema = serde_json::to_value(&tool.input_schema).unwrap();
+            for key in ["anyOf", "oneOf", "allOf"] {
+                assert!(
+                    schema.get(key).is_none(),
+                    "tool `{}` carries root-level `{key}`; Anthropic-routed \
+                     clients reject the whole session over it",
+                    tool.name
+                );
+            }
+        }
+    }
+
     #[test]
-    fn read_page_schema_encodes_one_of_path_or_query() {
+    fn read_page_schema_carries_no_root_combinators() {
+        // #577: the Anthropic Messages API rejects root-level
+        // anyOf/oneOf/allOf on input_schema — a tool carrying one kills
+        // the WHOLE session for every Messages-API-routed client before
+        // any tool runs. The exactly-one contract lives in the field
+        // descriptions and runtime validation instead. This pins every
+        // tool schema, not just memory_read_page, so the class cannot
+        // come back through another tool.
         let schema = serde_json::to_value(schemars::schema_for!(ReadPageArgs)).unwrap();
-        let any_of = schema
-            .get("anyOf")
-            .and_then(|v| v.as_array())
-            .unwrap_or_else(|| panic!("schema must carry the anyOf constraint: {schema}"));
-        for key in ["path", "query"] {
-            let branch = any_of
-                .iter()
-                .find(|b| b["required"] == serde_json::json!([key]))
-                .unwrap_or_else(|| panic!("missing anyOf branch requiring `{key}`: {schema}"));
-            assert_eq!(
-                branch["properties"][key]["type"],
-                serde_json::json!("string"),
-                "`{key}` branch must demand a non-null string so null-filling \
-                 clients cannot satisfy it"
+        for key in ["anyOf", "oneOf", "allOf"] {
+            assert!(
+                schema.get(key).is_none(),
+                "root-level `{key}` breaks Anthropic-routed clients: {schema}"
+            );
+        }
+        // The contract itself is still declared to the model.
+        for field in ["path", "query"] {
+            let desc = schema["properties"][field]["description"]
+                .as_str()
+                .unwrap_or_default();
+            assert!(
+                desc.contains("exactly one"),
+                "`{field}` description must state the exactly-one contract"
             );
         }
     }
