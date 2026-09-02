@@ -112,18 +112,6 @@ pub(crate) struct ProjectCard {
     pub href: String,
 }
 
-/// The pre-migration backup notice shown on the homepage while the
-/// archive still exists (docs/okf.md): where it is, how big, and the
-/// two exits — delete it, or restore from it.
-pub(crate) struct BackupNotice {
-    /// Absolute archive path, displayed verbatim.
-    pub archive_path: String,
-    /// Human-readable size (e.g. "12.4 MB").
-    pub size_human: String,
-    /// ISO date of the backup.
-    pub created_at: String,
-}
-
 /// The one-time 2.0 migration explainer dialog (docs/okf.md): shown
 /// whenever a migration receipt exists, dismissed per browser via a
 /// "do not show me again" checkbox persisted in localStorage keyed by
@@ -145,8 +133,6 @@ pub(crate) struct OkfDialog {
 pub(crate) struct ProjectsView {
     /// All project cards, sorted by most recently active first.
     pub projects: Vec<ProjectCard>,
-    /// Present while a pre-migration backup archive still exists.
-    pub backup_notice: Option<BackupNotice>,
     /// Present whenever a migration receipt exists (dialog dismissal is
     /// client-side, per browser).
     pub okf_dialog: Option<OkfDialog>,
@@ -186,9 +172,12 @@ pub(crate) struct ProjectView {
     pub workspace: String,
     /// Project name.
     pub project: String,
-    /// Sidebar folder tree.
+    /// Sidebar folder tree — knowledge pages only.
     pub folders: Vec<Folder>,
-    /// N most-recent pages for the right column.
+    /// Machinery pages (lint reports, sessions, logs, indexes),
+    /// rendered collapsed below the knowledge tree.
+    pub system: Vec<Folder>,
+    /// N most-recent knowledge pages for the right column.
     pub recent: Vec<PageRow>,
 }
 

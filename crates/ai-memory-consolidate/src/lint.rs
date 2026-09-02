@@ -10,7 +10,7 @@
 //!    semantic pages, feeds them to the LLM with a structured-output
 //!    prompt asking for contradictions / stale claims.
 //!
-//! Findings are written to `wiki/_lint/<YYYY-MM-DD>.md` so they're
+//! Findings are written to `wiki/_lint/report.md` so they're
 //! grep-able and tracked in git.
 
 /// System prompt for the contradiction-detection lint pass. Loaded
@@ -105,8 +105,10 @@ const STALE_SCORE_LN: f64 = 0.6;
 ///
 /// Concretely, at `lambda = 0.008` real eviction lands near day 201 while a
 /// fixed threshold still called the page stale on day 31 — and because the
-/// lint writes `_lint/<date>.md` whenever any finding exists, one page
+/// lint wrote `_lint/<date>.md` whenever any finding exists, one page
 /// nobody intends to read produced a new page every day, forever (#426).
+/// (The report now supersedes a single `_lint/report.md`, so even a
+/// permanently-stale page costs one page, not one per day.)
 ///
 /// `lambda = 0.02` (the default) yields exactly 30 days, so an operator who
 /// never touched decay sees no change.
@@ -129,7 +131,8 @@ pub fn stale_days_for(lambda: f64) -> f64 {
 /// input has to travel alongside them.
 #[derive(Debug, Clone, Copy)]
 pub struct LintOptions {
-    /// When `true`, no `_lint/<date>.md` page is written.
+    /// When `true`, no `_lint/report.md` page is written (and no legacy
+    /// dated reports are pruned).
     pub dry_run: bool,
     /// When `false`, the LLM contradiction pass is skipped even if a
     /// provider was supplied.
@@ -283,8 +286,21 @@ pub async fn run_lint(
 
     let report = LintReport { findings };
 
-    if !dry_run && !report.findings.is_empty() {
-        write_report_page(wiki, workspace_id, project_id, &report).await?;
+    if !dry_run {
+        if report.findings.is_empty() {
+            // A clean project carries no lint page at all: a stale
+            // report claiming findings that no longer exist is itself
+            // the kind of noise the lint exists to flag.
+            remove_report_page(wiki, workspace_id, project_id, &candidates).await;
+        } else {
+            write_report_page(wiki, workspace_id, project_id, &report).await?;
+        }
+        // One report per project: the daily `_lint/<YYYY-MM-DD>.md`
+        // pages the pre-2.0.1 lint accumulated (thousands across a
+        // long-lived store — indexed, searched, and embedded) are
+        // machinery, not knowledge. Each pass prunes any it finds, so
+        // existing stores self-heal without a migration.
+        prune_legacy_dated_reports(wiki, workspace_id, project_id, &candidates).await;
     }
 
     Ok(report)
@@ -437,6 +453,87 @@ async fn contradiction_pass(
     Ok(report.findings)
 }
 
+/// Stable per-project lint report path — superseded in place each run.
+const REPORT_PATH: &str = "_lint/report.md";
+
+/// Matches the legacy daily report naming: `_lint/YYYY-MM-DD.md`.
+fn is_legacy_dated_report(path: &str) -> bool {
+    let Some(name) = path
+        .strip_prefix("_lint/")
+        .and_then(|rest| rest.strip_suffix(".md"))
+    else {
+        return false;
+    };
+    name.len() == 10
+        && name.bytes().enumerate().all(|(i, b)| match i {
+            4 | 7 => b == b'-',
+            _ => b.is_ascii_digit(),
+        })
+}
+
+/// Delete `_lint/report.md` when the current pass found nothing.
+/// Best-effort: a delete rejected by an admission webhook or racing
+/// write only leaves a stale report for the next pass to retry.
+async fn remove_report_page(
+    wiki: &Wiki,
+    workspace_id: WorkspaceId,
+    project_id: ProjectId,
+    candidates: &[ai_memory_store::DecayCandidate],
+) {
+    if !candidates.iter().any(|c| c.path.as_str() == REPORT_PATH) {
+        return;
+    }
+    let Ok(path) = PagePath::new(REPORT_PATH) else {
+        return;
+    };
+    if let Err(e) = wiki
+        .delete_page(
+            workspace_id,
+            project_id,
+            &path,
+            Some(AdmissionContext {
+                op: AdmissionOp::Consolidate,
+                ..Default::default()
+            }),
+            None,
+        )
+        .await
+    {
+        warn!(error = %e, "lint: could not remove clean project's stale report");
+    }
+}
+
+/// Delete the accumulated pre-2.0.1 daily reports. Best-effort per
+/// page; anything that survives is retried by the next pass.
+async fn prune_legacy_dated_reports(
+    wiki: &Wiki,
+    workspace_id: WorkspaceId,
+    project_id: ProjectId,
+    candidates: &[ai_memory_store::DecayCandidate],
+) {
+    for cand in candidates {
+        if !is_legacy_dated_report(cand.path.as_str()) {
+            continue;
+        }
+        let path = cand.path.clone();
+        if let Err(e) = wiki
+            .delete_page(
+                workspace_id,
+                project_id,
+                &path,
+                Some(AdmissionContext {
+                    op: AdmissionOp::Consolidate,
+                    ..Default::default()
+                }),
+                None,
+            )
+            .await
+        {
+            warn!(path = %cand.path, error = %e, "lint: could not prune legacy dated report");
+        }
+    }
+}
+
 async fn write_report_page(
     wiki: &Wiki,
     workspace_id: WorkspaceId,
@@ -447,7 +544,10 @@ async fn write_report_page(
         .to_zoned(TimeZone::UTC)
         .strftime("%Y-%m-%d")
         .to_string();
-    let path = PagePath::new(format!("_lint/{date}.md"))?;
+    // One stable path per project: each run supersedes the previous
+    // report (history stays in the version chain) instead of minting a
+    // new page per day.
+    let path = PagePath::new(REPORT_PATH)?;
     let title = format!("Lint report {date}");
     let body = render_markdown(report);
     wiki.write_page(WritePageRequest {

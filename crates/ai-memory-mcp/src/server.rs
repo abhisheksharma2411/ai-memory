@@ -868,7 +868,7 @@ struct SweepArgs {
 
 #[derive(Debug, Serialize, Deserialize, schemars::JsonSchema)]
 struct LintArgs {
-    /// If true, don't write wiki/_lint/<date>.md. Default false.
+    /// If true, don't write wiki/_lint/report.md. Default false.
     #[serde(default)]
     dry_run: Option<bool>,
     /// If true, skip the LLM contradiction pass (rule-based only).
@@ -2492,7 +2492,7 @@ impl AiMemoryServer {
     #[tool(description = "Audit the wiki for stale episodic pages, \
         duplicate titles, broken cross-references, and (if an LLM \
         provider is configured) contradictions across semantic pages. \
-        Findings land in wiki/_lint/<date>.md unless dry_run=true.")]
+        Findings land in wiki/_lint/report.md unless dry_run=true.")]
     async fn memory_lint(
         &self,
         Parameters(args): Parameters<LintArgs>,

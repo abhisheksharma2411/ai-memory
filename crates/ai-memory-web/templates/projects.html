@@ -8,7 +8,11 @@
   <p class="mt-1 text-sm text-slate-500 dark:text-slate-400">All workspaces and projects in your wiki.</p>
 </div>
 
-<div class="mb-6 rounded-md border border-amber-200 dark:border-amber-900/50 bg-amber-50 dark:bg-amber-950/30 p-4 text-sm text-amber-900 dark:text-amber-200">
+<div id="llm-notice" class="mb-6 hidden relative rounded-md border border-amber-200 dark:border-amber-900/50 bg-amber-50 dark:bg-amber-950/30 p-4 pr-10 text-sm text-amber-900 dark:text-amber-200">
+  <button id="llm-notice-close" type="button" aria-label="Dismiss permanently" title="Don't show this again"
+          class="absolute top-2 right-2 rounded p-1 text-amber-700 dark:text-amber-300 hover:bg-amber-100 dark:hover:bg-amber-900/40">
+    <svg class="w-4 h-4" viewBox="0 0 20 20" fill="currentColor" aria-hidden="true"><path d="M6.28 5.22a.75.75 0 0 0-1.06 1.06L8.94 10l-3.72 3.72a.75.75 0 1 0 1.06 1.06L10 11.06l3.72 3.72a.75.75 0 1 0 1.06-1.06L11.06 10l3.72-3.72a.75.75 0 0 0-1.06-1.06L10 8.94 6.28 5.22Z"/></svg>
+  </button>
   <p class="font-medium mb-1">This is LLM-optimised memory, not hand-curated documentation.</p>
   <p class="text-amber-800 dark:text-amber-300/90 leading-relaxed">
     Pages are compiled from session observations by an LLM and revised as you work — they're shaped
@@ -21,6 +25,21 @@
     documentation.
   </p>
 </div>
+<script>
+  (function () {
+    var notice = document.getElementById("llm-notice");
+    if (!notice) return;
+    var key = "ai-memory-llm-notice-dismissed";
+    try {
+      if (localStorage.getItem(key) === "1") return;
+    } catch (e) { /* storage blocked: still show the notice */ }
+    notice.classList.remove("hidden");
+    document.getElementById("llm-notice-close").addEventListener("click", function () {
+      try { localStorage.setItem(key, "1"); } catch (e) { /* best effort */ }
+      notice.classList.add("hidden");
+    });
+  })();
+</script>
 
 {% if let Some(dialog) = okf_dialog %}
 <div id="okf-dialog-overlay" class="hidden fixed inset-0 z-50 flex items-center justify-center bg-slate-900/50 p-4" data-dismiss-key="ai-memory-okf-dialog-{{ dialog.created_at }}">
@@ -49,8 +68,8 @@
         <p class="mt-1 text-xs text-slate-500 dark:text-slate-400">Full steps, including the surgical git-checkpoint rollback: <code class="font-mono">docs/MIGRATION-2.0.md</code> in the ai-memory repository.</p>
       </div>
       <p>
-        If everything looks right, you can delete the archive — the reminder banner on this
-        page disappears once the file is gone.
+        If everything looks right, you can delete the archive — <code class="font-mono text-xs bg-slate-100 dark:bg-slate-800 px-1 py-0.5 rounded">ai-memory status</code>
+        shows it until the file is gone.
       </p>
       {% else %}
       <p>
@@ -90,20 +109,6 @@
 </script>
 {% endif %}
 
-{% if let Some(notice) = backup_notice %}
-<div class="mb-6 rounded-md border border-sky-200 dark:border-sky-900/50 bg-sky-50 dark:bg-sky-950/30 p-4 text-sm text-sky-900 dark:text-sky-200">
-  <p class="font-medium mb-1">A pre-migration backup of your memory is still on disk.</p>
-  <p class="text-sky-800 dark:text-sky-300/90 leading-relaxed">
-    Before the OKF format migration ran, the entire data directory was archived to
-    <code class="font-mono text-xs bg-sky-100 dark:bg-sky-900/40 px-1 py-0.5 rounded">{{ notice.archive_path }}</code>
-    ({{ notice.size_human }}, {{ notice.created_at }}).
-  </p>
-  <ul class="mt-2 list-disc list-inside text-sky-800 dark:text-sky-300/90 leading-relaxed">
-    <li><span class="font-medium">Everything looks right?</span> Delete the archive file and this notice disappears.</li>
-    <li><span class="font-medium">Something is missing?</span> Stop the server, unpack the archive over your data directory, and start the old version — see the restore section of <code class="font-mono text-xs bg-sky-100 dark:bg-sky-900/40 px-1 py-0.5 rounded">docs/MIGRATION-2.0.md</code>.</li>
-  </ul>
-</div>
-{% endif %}
 
 {% if projects.is_empty() %}
 <div class="rounded-lg border border-dashed border-slate-300 dark:border-slate-700 p-12 text-center">
