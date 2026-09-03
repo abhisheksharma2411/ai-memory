@@ -8,6 +8,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Fixed
+- The OKF v0.2 migration no longer crash-loops on startup with a
+  libgit2 `invalid object specified … class=Tree` error that left the
+  server unable to boot (#594). The wiki commit re-hashed files through
+  libgit2's index, whose stat cache could trust a cached blob OID absent
+  from the object database (a store carried across libgit2/git versions,
+  or an interrupted earlier operation) — `write_tree` then aborted and,
+  because the migration commits through that path, every restart failed.
+  The commit now clears the index before staging so every file is
+  re-hashed from the working tree. (The Docker runtime ships no `git`,
+  so the fix is in-library, not a CLI fallback.)
 - `as_of` time-travel queries and the entity retrieval stream now work
   on real stores. Both read the entity index, which was populated only
   from an LLM consolidator's `entities:` frontmatter — absent on the
