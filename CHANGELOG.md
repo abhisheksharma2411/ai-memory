@@ -32,6 +32,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   preference, falling back to the working directory as before. The
   unredirected Docker invocations were never affected.
 
+
+### Security
+- Untrusted `relations:` frontmatter values (relation keys and targets)
+  are now length-bounded before being echoed into warning logs. On a
+  shared server one caller's page is parsed by a process whose logs
+  others read; a crafted or oversized relation key/target could bloat or
+  pollute the log. Bounded to 200 bytes (UTF-8-safe), matching the
+  bounding every other untrusted-content sink already uses. Found by a
+  data-layer security audit of the store/wiki crates.
+
 ## [2.0.1] - 2026-09-02
 
 ### Fixed
