@@ -8,6 +8,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Fixed
+- Pages with an empty frontmatter `title` no longer read back titleless
+  or trip a bogus duplicate-title lint (#599). Auto-improve could store
+  `title: ""` while the page had a proper `# H1`; now `memory_read_page`
+  derives the title from the H1 (then the path stem) when the stored one
+  is blank, the duplicate-title lint ignores blank titles instead of
+  collapsing them into one `Multiple pages share title ""` finding, and
+  the consolidator derives a title from the body H1 at write time so new
+  pages never store an empty one. The DB `title` column (search) was
+  already correct; this aligns the frontmatter-title readers with it
+  without rewriting stored pages.
 - Local-embedding model download (`fetch_model`) now bounds a stalled
   connection instead of hanging startup forever (#602): a 30s connect
   timeout and a generous 600s overall ceiling (large model files, so
