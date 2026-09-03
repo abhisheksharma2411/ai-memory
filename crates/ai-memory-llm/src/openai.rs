@@ -11,7 +11,7 @@ use tracing::debug;
 use crate::error::{LlmError, LlmResult};
 use crate::provider::LlmProvider;
 use crate::response::{provider_error_body, response_json_limited};
-use crate::types::{ChatRequest, ChatResponse, ReasoningEffort, Usage};
+use crate::types::{ChatRequest, ChatResponse, LlmOperationId, ReasoningEffort, Usage};
 
 /// Default OpenAI API base.
 pub const DEFAULT_BASE_URL: &str = "https://api.openai.com";
@@ -91,6 +91,13 @@ pub struct OpenAiProvider {
     dialect: RequestDialect,
     timeout: Duration,
     reasoning_effort: Option<ReasoningEffort>,
+    client_headers: Option<ClientHeaders>,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct ClientHeaders {
+    user_agent: &'static str,
+    operation_id: &'static str,
 }
 
 impl OpenAiProvider {
@@ -110,6 +117,7 @@ impl OpenAiProvider {
             dialect: RequestDialect::Official,
             timeout: Duration::from_secs(crate::DEFAULT_REQUEST_TIMEOUT_SECS),
             reasoning_effort: None,
+            client_headers: None,
         })
     }
 
@@ -151,6 +159,18 @@ impl OpenAiProvider {
     #[must_use]
     pub fn with_reasoning_effort(mut self, effort: Option<ReasoningEffort>) -> Self {
         self.reasoning_effort = effort;
+        self
+    }
+
+    pub(crate) fn with_client_headers(
+        mut self,
+        user_agent: &'static str,
+        operation_id: &'static str,
+    ) -> Self {
+        self.client_headers = Some(ClientHeaders {
+            user_agent,
+            operation_id,
+        });
         self
     }
 }
@@ -236,14 +256,47 @@ impl LlmProvider for OpenAiProvider {
     }
 
     async fn complete(&self, request: ChatRequest) -> LlmResult<ChatResponse> {
-        let response = self.post(&self.build_request(&request, None)).await?;
+        self.complete_with_operation_id(request, LlmOperationId::new())
+            .await
+    }
+
+    async fn complete_with_operation_id(
+        &self,
+        request: ChatRequest,
+        operation_id: LlmOperationId,
+    ) -> LlmResult<ChatResponse> {
+        let response = self
+            .post(&self.build_request(&request, None), operation_id)
+            .await?;
         Ok(self.to_chat_response(response))
     }
 
     async fn complete_structured_raw(
         &self,
         request: ChatRequest,
+        schema: serde_json::Value,
+    ) -> LlmResult<serde_json::Value> {
+        self.complete_structured_raw_with_operation_id(request, schema, LlmOperationId::new())
+            .await
+    }
+
+    async fn complete_structured_raw_with_operation_id(
+        &self,
+        request: ChatRequest,
+        schema: serde_json::Value,
+        operation_id: LlmOperationId,
+    ) -> LlmResult<serde_json::Value> {
+        self.complete_structured(request, schema, operation_id)
+            .await
+    }
+}
+
+impl OpenAiProvider {
+    async fn complete_structured(
+        &self,
+        request: ChatRequest,
         mut schema: serde_json::Value,
+        operation_id: LlmOperationId,
     ) -> LlmResult<serde_json::Value> {
         // Strict-mode normalisation is an `Official` concern — compat
         // backends typically ignore `response_format` entirely and fall
@@ -259,7 +312,10 @@ impl LlmProvider for OpenAiProvider {
             },
         };
         let response = self
-            .post(&self.build_request(&request, Some(response_format)))
+            .post(
+                &self.build_request(&request, Some(response_format)),
+                operation_id,
+            )
             .await?;
         let text = response
             .choices
@@ -268,9 +324,7 @@ impl LlmProvider for OpenAiProvider {
             .unwrap_or("");
         serde_json::from_str::<serde_json::Value>(text).map_err(LlmError::from)
     }
-}
 
-impl OpenAiProvider {
     fn build_request<'a>(
         &'a self,
         request: &'a ChatRequest,
@@ -359,18 +413,25 @@ impl OpenAiProvider {
         }
     }
 
-    async fn post<B: Serialize>(&self, body: &B) -> LlmResult<OpenAiResponse> {
+    async fn post<B: Serialize>(
+        &self,
+        body: &B,
+        operation_id: LlmOperationId,
+    ) -> LlmResult<OpenAiResponse> {
         let url = normalize_openai_base(&self.base_url, "chat/completions");
         debug!(url, "POST openai");
-        let resp = self
+        let mut request = self
             .client
             .post(&url)
             .timeout(self.timeout)
             .bearer_auth(self.api_key.expose_secret())
             .header("content-type", "application/json")
-            .json(body)
-            .send()
-            .await?;
+            .json(body);
+        if let Some(headers) = self.client_headers {
+            request = request.header(reqwest::header::USER_AGENT, headers.user_agent);
+            request = request.header(headers.operation_id, operation_id.to_string());
+        }
+        let resp = request.send().await?;
         let status = resp.status();
         if !status.is_success() {
             let body = provider_error_body(resp).await;
