@@ -8,6 +8,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Fixed
+- `bootstrap` no longer aborts the whole multi-chunk run when one chunk
+  returns no `pages` key (#614). Later chunks are told which paths
+  earlier ones wrote, so a model that judges the material already
+  covered legitimately answers with a rationale and no pages; because
+  Anthropic's `tool_use` schema does not enforce required fields the way
+  OpenAI's `strict: true` does, that answer reached serde and failed
+  deserialisation with `missing field 'pages'`. Since pages are only
+  written after every chunk completes, the error discarded the work of
+  all preceding chunks. `pages` now defaults to empty.
 - `install-hooks --agent antigravity-cli` on native Windows now emits
   an unquoted hook `command` (#611). The native-binary rendering wrapped
   the executable, `--data-dir`, and `--server-url` in double quotes, but
