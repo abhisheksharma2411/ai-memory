@@ -96,7 +96,9 @@ pub use openai_oauth::{
     OpenAiOAuthTokenResponse,
 };
 pub use opencode::{OPENCODE_DEFAULT_MODEL, OPENCODE_ZEN_BASE_URL, OpenCodeProvider};
-pub use provider::{LlmProvider, complete_structured};
+pub use provider::{LlmProvider, complete_structured, complete_structured_with_operation_id};
 pub use reranker::{LlmReranker, RerankCandidate, RerankScore, Reranker};
 pub use stored_token::StoredOAuthToken;
-pub use types::{ChatMessage, ChatRequest, ChatResponse, ReasoningEffort, Role, Usage};
+pub use types::{
+    ChatMessage, ChatRequest, ChatResponse, LlmOperationId, ReasoningEffort, Role, Usage,
+};

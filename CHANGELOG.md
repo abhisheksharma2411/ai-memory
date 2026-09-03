@@ -8,6 +8,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Fixed
+- OpenCode Go requests now send `User-Agent: ai-memory/<version>` and a
+  per-operation `x-opencode-session` header. Session consolidation and
+  auto-improvement reuse the captured ai-memory session ID, while retries and
+  structured-output fallback keep the same ID instead of appearing as unrelated
+  requests (#608).
 - `as_of` time-travel queries and the entity retrieval stream now work
   on real stores. Both read the entity index, which was populated only
   from an LLM consolidator's `entities:` frontmatter — absent on the
