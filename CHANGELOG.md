@@ -29,6 +29,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   The commit now clears the index before staging so every file is
   re-hashed from the working tree. (The Docker runtime ships no `git`,
   so the fix is in-library, not a CLI fallback.)
+- HTTP headers that carry a credential in an opaque value are now redacted
+  before reaching durable storage. Previously such a header matched no
+  built-in pattern unless it used the `Bearer` keyword or an
+  `UPPER_SNAKE_TOKEN=` shape. The bearer rule requires the literal keyword,
+  and the generic env-var rule requires `[A-Z][A-Z0-9_]*_TOKEN`, which never
+  matches a kebab-case header name. `X-Amz-Security-Token` (AWS SigV4),
+  `X-Api-Key`, `Private-Token` (GitLab), and `Ocp-Apim-Subscription-Key`
+  (Azure) all fall in that gap, and tool output echoing a `curl` invocation
+  is a common way they reach capture. A `key` or `token` suffix on its own
+  does not imply a secret, so it must be qualified by an auth word:
+  `Idempotency-Key`, `Continuation-Token` and storage partition keys are
+  left intact and stay readable in captured output.
 - `as_of` time-travel queries and the entity retrieval stream now work
   on real stores. Both read the entity index, which was populated only
   from an LLM consolidator's `entities:` frontmatter — absent on the
