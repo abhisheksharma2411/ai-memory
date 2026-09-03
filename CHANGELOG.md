@@ -8,6 +8,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Fixed
+- `install-hooks --agent zcode --apply` now removes stale ai-memory
+  hooks left under event keys this version no longer manages (e.g. a
+  legacy `SessionEnd`), instead of reporting "already up to date" while
+  a broken/orphaned entry lingered (#600). The dry-run printed snippet
+  also now states plainly that `--apply` persists the auth token to
+  `<data-dir>/auth-token` (0600) and writes token-less args, so the
+  applied config differs from the embedded-token snippet by design.
+- Local-embedding model download (`fetch_model`) now bounds a stalled
+  connection instead of hanging startup forever (#602): a 30s connect
+  timeout and a generous 600s overall ceiling (large model files, so
+  not the inference clients' flat 120s that would fail a slow download).
 - The OKF v0.2 migration no longer crash-loops on startup with a
   libgit2 `invalid object specified … class=Tree` error that left the
   server unable to boot (#594). The wiki commit re-hashed files through
