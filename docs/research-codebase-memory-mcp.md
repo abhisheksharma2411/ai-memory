@@ -116,6 +116,81 @@ rival. Its best lessons for us are operational, not architectural: **tiered
 tool profiles**, a **published token-efficiency metric**, and (optionally) a
 **git-committed compressed index** for teams that won't run a server.
 
+## 7. 2.1 Feasibility — grounded in ai-memory's code
+
+Each borrowable idea was checked against the current tree so the release call
+rests on real choke points, not analogy. Verdicts: one **2.1 feature**, one
+**land-now dev metric**, one **deferred design**.
+
+### 7.1 Tiered tool profiles — **recommend for 2.1**
+
+*Where it plugs in.* The MCP server exposes **19 tools** through the rmcp
+`#[tool_router]` macro (`crates/ai-memory-mcp/src/server.rs:1239`), and
+`list_tools` (`server.rs:3966`) is the **single choke point** — it returns
+`tool_router.list_all()` unfiltered, with only a per-dialect schema *reshape*
+(`restricted_schema_tool_list`, `server.rs:4021`) that never drops a tool. A
+read/write partition **already exists**: `tool_call_is_write` (`server.rs:757`)
+classifies 8 tools as read-only (query, read_page, read_session_observations,
+recent, briefing, explore, status, install_self_routing) — today used only for
+rate-limit accounting, not visibility.
+
+*Why 2.1.* 19 tools is heavy MCP prompt surface pushed to every client every
+turn. A **read-only "recall" tier** (the 8 already-classified tools) versus the
+full "curate" tier cuts prompt surface and over-permissioning for the common
+case (an agent that only *recalls* never needs `delete_page`/`forget_sweep`).
+It is small, self-contained, and **pairs directly with the rules-promotion
+work** (`docs/design-rules-promotion.md`) — both are about giving the agent
+*less, better-scoped* authority by default.
+
+*Shape.* Add a `--tool-profile recall|full` flag to `ServeArgs`
+(`crates/ai-memory-cli/src/cli.rs:2119`), or a per-request `?profile=` marker
+mirroring the existing `?flavor=` mechanism (`server.rs:3980`); filter
+`list_all()` by `tool_call_is_write` before returning. No new classification
+logic — the partition is already written.
+
+### 7.2 Token-efficiency metric — **land on main now (dev tooling, not a gated feature)**
+
+*Where it plugs in.* The `evals/` crate measures **hit@k / recall@k only**
+(`evals/src/retrieval/score.rs`). The full `memory_query` JSON payload is
+already materialized in exactly one place before parsing —
+`evals/src/retrieval/query.rs:114` (`text` holds the complete content string) —
+so `text.len()` / a tokenizer pass yields a per-question "tokens to answer"
+number with **zero server changes**, threaded into `report.rs`.
+
+*Why not gated to 2.1.* It changes no runtime behavior and ships nothing
+user-facing — it is an eval/benchmark improvement that strengthens our
+measurement story (the complement to LongMemEval recall: *recall* says we find
+the answer, *tokens-to-answer* says we deliver it cheaply). It can go to `main`
+as a quality improvement whenever, independent of the 2.1 train.
+
+### 7.3 Committed compressed derived-index — **defer (design-only until a server-less use-case exists)**
+
+*Where it plugs in.* The DB is **contractually derived and rebuildable**:
+markdown-in-git is the source of truth, SQLite `db/` is the index
+(`crates/ai-memory-wiki/src/lib.rs:3`, `docs/companion-crates.md:14`), with a
+working rebuild (`ai-memory reindex`, `crates/ai-memory-cli/src/commands/reindex.rs`)
+and an online-backup tarball producer (`POST /admin/backup`,
+`crates/ai-memory-mcp/src/admin.rs:746`). So a committed `graph.db.zst`-style
+artifact *fits the model* mechanically.
+
+*Why defer.* It is a **different distribution philosophy**, not a small
+feature. ai-memory's multi-user/multi-machine story is deliberately
+**server-mediated** (attributed writes, per-user scope, live handoff); a
+git-committed binary index is the *server-less* counterpart, and it drags in
+snapshot-consistency, staleness, regeneration cadence, and binary-blob merge
+conflicts. Building it before there is a concrete server-less-small-team
+customer would be speculative — it belongs in the same "consider a git-shared
+team scope" bucket as `research-ecc.md` §8.4, to be designed only if that path
+is chosen.
+
+### Recommendation summary
+
+| Insight | Verdict | Effort | Where |
+|---|---|---|---|
+| Tiered tool profiles | **2.1 feature** | small (choke point + existing partition) | `release/2.1` |
+| Token-efficiency metric | **land now** | low (additive, one choke point) | `main`, any time |
+| Committed compressed index | **defer** | large (distribution model) | design-only, needs use-case |
+
 ### Sources
 - <https://github.com/DeusData/codebase-memory-mcp> (README, metadata via GitHub API)
 - Preprint arXiv:2603.27277 — *Codebase-Memory: Tree-Sitter-Based Knowledge Graphs for LLM Code Exploration via MCP*
