@@ -6495,7 +6495,8 @@ command = "AI_MEMORY_HOOK_URL=http://h AI_MEMORY_PROJECT_STRATEGY=repo-root /x/a
         // A third-party hook under a managed key survives untouched.
         let pre = root["hooks"]["events"]["PreToolUse"].as_array().unwrap();
         assert!(
-            pre.iter().any(|g| g["matcher"] == serde_json::json!("Bash")),
+            pre.iter()
+                .any(|g| g["matcher"] == serde_json::json!("Bash")),
             "third-party matcher group must survive"
         );
         // The current ai-memory events are all installed.
