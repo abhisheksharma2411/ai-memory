@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+- `install-hooks --agent antigravity-cli` on native Windows now emits
+  an unquoted hook `command` (#611). The native-binary rendering wrapped
+  the executable, `--data-dir`, and `--server-url` in double quotes, but
+  Antigravity runs the string through `cmd /c "<string>"` without
+  stripping inner quotes, so `"C:\…\ai-memory.exe"` was "not
+  recognized", every hook failed, and the cp850 (non-UTF-8) error text
+  aborted the whole `agy` session. Antigravity's command is now rendered
+  bare; other Windows agents keep their quotes.
+
 ## [2.0.2] - 2026-09-03
 
 ### Fixed

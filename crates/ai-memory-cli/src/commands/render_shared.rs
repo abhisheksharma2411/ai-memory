@@ -1503,20 +1503,36 @@ fn hook_command(
                 .file_stem()
                 .and_then(|s| s.to_str())
                 .unwrap_or_default();
+            // Antigravity's executor wraps the whole command in `cmd /c "…"`
+            // and does not strip inner quotes, so it needs the bare form
+            // (#611); every other Windows agent keeps the double-quoted form.
+            let bare = windows_hook_command_is_bare(context.agent);
+            let quote = if bare {
+                NativeQuote::WindowsBare
+            } else {
+                NativeQuote::Windows
+            };
+            let quote_field = |s: &str| {
+                if bare {
+                    s.to_string()
+                } else {
+                    win_double_quote(s)
+                }
+            };
             let mut cmd = format!(
                 "{}{}{} hook --event {event} --agent {agent} --server-url {}",
                 powershell_call_operator(context.agent),
-                win_double_quote(&exe),
-                native_data_dir_arg(context.data_dir, NativeQuote::Windows),
-                win_double_quote(server_url),
+                quote_field(&exe),
+                native_data_dir_arg(context.data_dir, quote),
+                quote_field(server_url),
                 agent = context.agent,
             );
             if let Some(t) = auth_token {
-                cmd.push_str(&format!(" --auth-token {}", win_double_quote(t)));
+                cmd.push_str(&format!(" --auth-token {}", quote_field(t)));
             }
             cmd.push_str(&native_project_strategy_arg(
                 context.project_strategy,
-                NativeQuote::Windows,
+                quote,
             ));
             cmd.push_str(native_capture_assistant_arg(context, event));
             cmd
@@ -1624,6 +1640,23 @@ fn plain_windows_path_arg(path: &Path) -> String {
 enum NativeQuote {
     Posix,
     Windows,
+    /// Windows, but with NO surrounding double quotes. Antigravity's hook
+    /// executor runs the `command` string through `cmd /c "<string>"`, and
+    /// cmd does not strip the inner quotes, so a quoted `"C:\…\ai-memory.exe"`
+    /// is reported as "not recognized" and crashes the session (#611). The
+    /// whole-string wrapping means a bare path is what actually runs; a path
+    /// with a space in it is a known residual limitation (as it was before
+    /// the native-hook rendering added quotes).
+    WindowsBare,
+}
+
+/// Whether an agent's Windows hook executor needs the command rendered
+/// WITHOUT surrounding quotes (it wraps the whole string in `cmd /c "…"`
+/// and does not strip inner quotes). Antigravity CLI is the confirmed
+/// case (#611); other Windows JSON-hook agents run the command in a form
+/// where the double quotes are correct, so they keep them.
+fn windows_hook_command_is_bare(agent: &str) -> bool {
+    agent == "antigravity-cli"
 }
 
 fn native_data_dir_arg(data_dir: Option<&Path>, quote: NativeQuote) -> String {
@@ -1636,6 +1669,7 @@ fn native_data_dir_arg(data_dir: Option<&Path>, quote: NativeQuote) -> String {
     match quote {
         NativeQuote::Posix => format!(" --data-dir {}", shell_quote(&path)),
         NativeQuote::Windows => format!(" --data-dir {}", win_double_quote(&path)),
+        NativeQuote::WindowsBare => format!(" --data-dir {path}"),
     }
 }
 
@@ -1649,6 +1683,7 @@ fn native_project_strategy_arg(strategy: Option<&str>, quote: NativeQuote) -> St
     match quote {
         NativeQuote::Posix => format!(" --project-strategy {}", shell_quote(strategy)),
         NativeQuote::Windows => format!(" --project-strategy {}", win_double_quote(strategy)),
+        NativeQuote::WindowsBare => format!(" --project-strategy {strategy}"),
     }
 }
 
@@ -2680,6 +2715,62 @@ check(activeKeep.disposition === "keep" && activeKeep.protocol?.version === 1 &&
                 .pointer("/ai-memory/PreInvocation/0/args")
                 .is_none(),
             "Antigravity must retain command-string schema: {antigravity}"
+        );
+    }
+
+    /// #611: Antigravity runs its hook `command` string through
+    /// `cmd /c "<string>"` without stripping inner quotes, so a quoted
+    /// `"C:\…\ai-memory.exe"` is "not recognized" and crashes the session.
+    /// Its Windows command must render UNQUOTED, while other Windows agents
+    /// keep the double quotes.
+    #[test]
+    fn antigravity_windows_command_is_unquoted_but_others_keep_quotes() {
+        let ag = build_antigravity_payload_for_platform(
+            Path::new(r"C:\Users\me\.local\bin"),
+            "https://memory.example.com",
+            Some("tok"),
+            HookCommandPlatform::WindowsNative,
+            "antigravity-cli",
+            Some(Path::new(r"C:\Users\me\AppData\Local\ai-memory")),
+            None,
+        );
+        let cmd = ag
+            .pointer("/ai-memory/PreInvocation/0/command")
+            .and_then(|v| v.as_str())
+            .expect("antigravity command string");
+        assert!(
+            !cmd.contains('"'),
+            "antigravity Windows command must carry no double quotes: {cmd}"
+        );
+        assert!(
+            cmd.contains(r"ai-memory hook --event") || cmd.contains(r"ai-memory.exe hook"),
+            "unexpected antigravity command shape: {cmd}"
+        );
+        assert!(
+            cmd.contains("--data-dir C:\\Users\\me\\AppData\\Local\\ai-memory")
+                && cmd.contains("--server-url https://memory.example.com"),
+            "bare (unquoted) args expected: {cmd}"
+        );
+
+        // Same renderer, a non-antigravity agent identity: the double quotes
+        // stay, so the fix is scoped to antigravity and does not regress the
+        // other Windows JSON-hook agents.
+        let other = build_antigravity_payload_for_platform(
+            Path::new(r"C:\Users\me\.local\bin"),
+            "https://memory.example.com",
+            Some("tok"),
+            HookCommandPlatform::WindowsNative,
+            "grok",
+            Some(Path::new(r"C:\Users\me\AppData\Local\ai-memory")),
+            None,
+        );
+        let other_cmd = other
+            .pointer("/ai-memory/PreInvocation/0/command")
+            .and_then(|v| v.as_str())
+            .expect("command string");
+        assert!(
+            other_cmd.contains('"'),
+            "non-antigravity Windows agents keep their double quotes: {other_cmd}"
         );
     }
 
