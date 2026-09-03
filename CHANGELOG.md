@@ -106,6 +106,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 
 ### Security
+- Handoff and workstream-event content is now size-bounded at the store
+  boundary as defense in depth (data-layer audit follow-up, #607). The
+  MCP/hook callers already scrub and cap this prose, but the store is the
+  last gate before durable persistence, so it now bounds each handoff
+  field (16 KiB, matching the observation body) and list length, and a
+  workstream event's free-text content — a caller that ever forgot its
+  own cap can no longer write unbounded content to the DB.
 - Untrusted `relations:` frontmatter values (relation keys and targets)
   are now length-bounded before being echoed into warning logs. On a
   shared server one caller's page is parsed by a process whose logs
