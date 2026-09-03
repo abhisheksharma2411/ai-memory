@@ -78,6 +78,7 @@ The market has consolidated into recognizable camps:
 | Fact extractors | **Mem0**, LangMem, Supermemory | LLM extracts atomic facts per turn; lightweight personalization |
 | **File-first wiki memory** | **us**, basic-memory, OKF, Letta's filesystem result, mempalace (nominally) | Markdown source of truth, derived indexes, human-editable |
 | Code intelligence | DeusData/codebase-memory-mcp | Index the *codebase* (158 languages, static binary) rather than the *session* - adjacent, not competing: it remembers what the code is, not what you did |
+| Agent-harness OS | **ECC** (~247K stars), plus the skills/agents-pack ecosystem | Install a whole plan→test→implement→review→**remember**→improve loop into the agent; memory is one thin pillar ("optimize the context window, persist everything else"), deliberately kept as *context, not policy* - adjacent, not competing (see `research-ecc.md`) |
 
 **Closest architectural sibling: `doobidoo/mcp-memory-service`** (1.9K
 stars, 3.2K commits, active through August 2026). It is what we would be
