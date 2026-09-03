@@ -16,6 +16,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   recognized", every hook failed, and the cp850 (non-UTF-8) error text
   aborted the whole `agy` session. Antigravity's command is now rendered
   bare; other Windows agents keep their quotes.
+- The wiki watcher no longer logs a scope-resolution failure for every page
+  in a project directory the store has no row for, on every pass, forever
+  (#613). The OKF v0.2 migration seeded an `index.md` into orphan directories
+  (dirs with a valid-UUID name but no `projects` row — near-empty shells left
+  by older history), and the watcher then warned once per file per 30s
+  reconciliation pass indefinitely — hundreds of identical lines that buried
+  real warnings, including, on one host, a 22-hour `sqlite: disk I/O error`.
+  Reconcile now checks the project scope once per directory and skips an
+  unresolvable one wholesale at `debug`, rather than retrying its pages; if
+  the row later appears the directory indexes normally on the next pass.
+- The store error for an unknown project id now says "does not exist" instead
+  of "does not belong to workspace X" (#612). A dangling id names no
+  workspace mismatch to hunt for; the disambiguating lookup runs only on the
+  failure path, so the common case still pays a single query.
 
 ## [2.0.2] - 2026-09-03
 
