@@ -8,6 +8,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Fixed
+- Web UI: OKF bundle-index links (and any relative in-wiki link) no
+  longer 404 (#603). Relative markdown link targets are now rewritten to
+  project-scoped URLs — the same convention `[[wikilinks]]` use — instead
+  of resolving against the web mount's `<base href>`, and a namespace
+  (directory) path such as `.../p/_lint/` now lists the pages under it
+  rather than returning 404. External links, anchors, and dangerous
+  schemes are untouched by the rewrite.
 - Pages with an empty frontmatter `title` no longer read back titleless
   or trip a bogus duplicate-title lint (#599). Auto-improve could store
   `title: ""` while the page had a proper `# H1`; now `memory_read_page`
