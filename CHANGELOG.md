@@ -21,6 +21,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   so historical `as_of` is correct. Broad tags don't distort ranking
   (the entity stream is inverse-frequency weighted), and a store already
   written through the current path is a no-op. See `docs/temporal.md`.
+- The OKF v0.2 pre-migration backup walk now skips the `.serve.lock`
+  single-instance lock and its `.serve.lock.holder` sidecar. On Windows
+  the exclusive `LockFileEx` is mandatory, so the same `serve` process
+  that runs the migration also holds `.serve.lock` and could not read it
+  back while creating the backup — the walk aborted with `os error 33`
+  and the server crash-looped on every `2.0.x` upgrade from a 1.x store
+  (#593). Linux/macOS were immune because POSIX locks are advisory.
 - The Windows PowerShell wrapper (`ai-memory.ps1`) no longer crashes with
   `git.exe : fatal: not a git repository … NativeCommandError` when run
   outside a git repository — which broke `ai-memory status` and every
