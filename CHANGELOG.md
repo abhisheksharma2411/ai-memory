@@ -25,6 +25,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   snapshot.
 
 ### Fixed
+- Typed edges (`relations`) now actually work on OpenAI-family providers
+  (#630). `ConsolidatedPage.relations` was an open map
+  (`BTreeMap<String, Vec<String>>`), which the strict structured-output
+  normalizer closes to `additionalProperties: false` — OpenAI strict mode
+  cannot express arbitrary-key maps — so the model was structurally unable to
+  emit any `causes`/`fixes`/`contradicts` edge on `openai`, `openai-oauth`,
+  `copilot`, `opencode`, or `openai-compat`; the 2.0 typed-edges feature was
+  silently dead there. `relations` is now a fixed three-field object
+  (`causes`/`fixes`/`contradicts`), which strict mode expresses and which
+  serializes to the identical `relations:` frontmatter — no migration, no
+  downstream change. A schema guard pins the fixed shape.
 - `finalize-session --agent hermes` (and `claude-desktop`, `crush`, `other`)
   is accepted again (#623). These agents are captured and stored, but
   `finalize-session` reused the install-oriented agent enum — which is
