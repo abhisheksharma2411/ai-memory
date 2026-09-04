@@ -24,6 +24,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `ai-memory pending-writes list` / SQLite; the sidecar is a staging-time
   snapshot.
 
+### Added
+- `ai-memory status` and the pre-migration backup log now report the data
+  directory's **filesystem free space** (#629). The OKF-migration backup gate
+  proves the archive is writable but said nothing about disk headroom — an
+  operator whose 447 MB safety archive left 77 MB free had the store fail to
+  extend its WAL eight minutes later, unlogged, for hours. This is pure signal
+  (no threshold, no refusal): `status` shows `filesystem free:` beside the
+  storage figures, and the "pre-migration backup verified" line now carries
+  `dest_free_bytes`, so the same number is visible right before a migration.
+
 ### Fixed
 - Typed edges (`relations`) now actually work on OpenAI-family providers
   (#630). `ConsolidatedPage.relations` was an open map
