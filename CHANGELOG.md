@@ -8,6 +8,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Fixed
+- generated TypeScript integrations (`--agent open-code`, `omp`, `pi`,
+  `openclaw`) authenticate again under `install-hooks --apply`. Since #552
+  the bearer is deliberately omitted from the rendered file and persisted to
+  the 0600 `<data_dir>/auth-token` file, but only the native hook runtimes
+  learned to read it back: the generated TS adapters kept rendering
+  `TOKEN = null` with no runtime resolution, so every request they make
+  (hook capture, spool drain, handoff fetch) goes out unauthenticated and is
+  rejected by a Bearer-enabled server. The templates now render a
+  `resolveToken()` helper (static embed, then `AI_MEMORY_AUTH_TOKEN`, then
+  the auth-token file) used by `authHeaders()` and the spool writer.
+  `fetchHandoff()` in the same adapters also ignored `response.ok`, so a
+  401 error body could be injected into model context as if it were a
+  handoff; non-OK responses now return `undefined` like other failures.
 - `bootstrap` now retries a chunk's LLM call on a transient error before
   giving up, instead of letting one blip discard the whole multi-chunk run
   (#617). A provider `5xx`/`429` or a transport timeout/connect failure on
