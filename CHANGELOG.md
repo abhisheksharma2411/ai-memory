@@ -8,6 +8,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Changed
+- Release, Docker, and the `cargo install --git` snippet now build with
+  `--locked` (#628). Without it `cargo install` re-resolves dependencies and
+  ignores the committed `Cargo.lock`, so a source install could silently pull
+  a different `schemars` than the one tested — a plausible source of
+  build-to-build structured-output schema drift. A unit guard also asserts the
+  strict-schema normalizer keeps `required` equal to `properties` (and closes
+  open maps), catching that drift class at build time rather than in
+  production.
 - The `_pending/auto-improve/` sidecar no longer renders a `status:` line
   (#624). It was written once at staging and could never change from
   `pending` — no code path updates or garbage-collects the sidecar — so it
