@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+- The `_pending/auto-improve/` sidecar no longer renders a `status:` line
+  (#624). It was written once at staging and could never change from
+  `pending` — no code path updates or garbage-collects the sidecar — so it
+  contradicted design principle 14 (SQLite owns approval status) and misled a
+  human (or a second agent) reading the file. Status lives in
+  `ai-memory pending-writes list` / SQLite; the sidecar is a staging-time
+  snapshot.
+
 ### Fixed
 - `finalize-session --agent hermes` (and `claude-desktop`, `crush`, `other`)
   is accepted again (#623). These agents are captured and stored, but
