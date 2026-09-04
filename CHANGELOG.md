@@ -8,6 +8,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Fixed
+- `finalize-session --agent hermes` (and `claude-desktop`, `crush`, `other`)
+  is accepted again (#623). These agents are captured and stored, but
+  `finalize-session` reused the install-oriented agent enum — which is
+  deliberately limited to agents with a first-party installer — so it rejected
+  them at parse time and their sessions could never be closed, summarised, or
+  consolidated. `finalize-session` is agent-agnostic, so `--agent` now accepts
+  any agent the store recognises (a genuine typo is still rejected);
+  `install-hooks`/`setup-agent` stay limited. A drift guard keeps the two sets
+  from diverging again.
 - generated TypeScript integrations (`--agent open-code`, `omp`, `pi`,
   `openclaw`) authenticate again under `install-hooks --apply`. Since #552
   the bearer is deliberately omitted from the rendered file and persisted to
